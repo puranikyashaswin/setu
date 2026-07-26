@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, Mic, Plus, Settings2, Square, Trash2, Volume2, VolumeX, X } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
+import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
 
 type Language = "te" | "hi" | "en" | "mr" | "ta" | "kn" | "bn" | "gu" | "ml" | "pa" | "or";
@@ -51,6 +52,8 @@ type Session = {
   documentName?: string | null;
   corrections?: Correction[];
   turns: Turn[];
+  onboarded?: boolean;
+  summary?: string | null;
 };
 type AnswerSheet = AskResponse;
 
@@ -659,7 +662,9 @@ const LANGUAGE_CHANGE = new RegExp(
 const SILENCE_MS = 900;
 const MIN_RECORDING_MS = 1200;
 const MAX_RECORDING_MS = 15000;
-const NO_SPEECH_MS = 6000;
+const NO_SPEECH_MS = 4500;
+const VOICE_LANGUAGE_PROMPT =
+  "Welcome to Setu. Which language would you like to speak in? Say Telugu, Hindi, English, Tamil, Kannada, or any Indian language you prefer.";
 const SPEECH_LEVEL = 0.008;
 const AMBIENT_MS = 300;
 const CAPTURE_STREAK = 3;
@@ -857,7 +862,18 @@ function encodeWav(chunks: Float32Array[], sampleRate: number): Blob {
 
 function makeSession(language: Language): Session {
   const now = Date.now();
-  return { id: crypto.randomUUID(), title: "New chat", createdAt: now, updatedAt: now, language, docId: null, corrections: [], turns: [] };
+  return {
+    id: crypto.randomUUID(),
+    title: "New chat",
+    createdAt: now,
+    updatedAt: now,
+    language,
+    docId: null,
+    corrections: [],
+    turns: [],
+    onboarded: false,
+    summary: null,
+  };
 }
 
 function titleFromTurns(turns: Turn[]) {
@@ -1173,9 +1189,12 @@ export default function Home() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"voice" | "history">("voice");
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authStatus, setAuthStatus] = useState("");
   const [voices, setVoices] = useState<string[]>([]);
   const [speaker, setSpeaker] = useState("shubh");
   const [pace, setPace] = useState(1);
+  const userIdRef = useRef<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
@@ -1203,7 +1222,9 @@ export default function Home() {
   } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const startRecordingRef = useRef<(() => void) | null>(null);
+  const startRecordingRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
+  const orbStateRef = useRef<OrbState>("idle");
+  const isRecordingFlagRef = useRef(false);
   const previewCacheRef = useRef(new Map<string, string>());
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [sampleNames, setSampleNames] = useState<Record<string, string>>({});
@@ -1227,6 +1248,14 @@ export default function Home() {
   useEffect(() => {
     sessionsRef.current = sessions;
   }, [sessions]);
+
+  useEffect(() => {
+    orbStateRef.current = orbState;
+  }, [orbState]);
+
+  useEffect(() => {
+    isRecordingFlagRef.current = isRecording;
+  }, [isRecording]);
 
   useEffect(() => {
     sampleNamesRef.current = sampleNames;
@@ -1394,18 +1423,21 @@ export default function Home() {
     }
     setIsRecording(false);
     setMicLevel(0);
-    const session = makeSession(languageRef.current);
+    const session = makeSession("en");
     setSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id;
     setDocId(null);
     docIdRef.current = null;
+    setLanguage("en");
+    languageRef.current = "en";
+    languageLockedRef.current = false;
     setTranscript("");
     setAnswerSheet(null);
     setHasStarted(false);
     setOrbState("idle");
     setService(null);
-    setStatusText("Tap to speak");
+    setStatusText("Tap to start");
     setViewMode("voice");
     setSessionPickerOpen(false);
   }, []);
@@ -1431,14 +1463,16 @@ export default function Home() {
     docIdRef.current = session.docId;
     setLanguage(session.language);
     languageRef.current = session.language;
+    languageLockedRef.current = Boolean(session.onboarded || session.turns.length);
     setTranscript("");
     setAnswerSheet(null);
-    setHasStarted(false);
+    // Existing chats stay silent — no welcome speech; first tap continues recording.
+    setHasStarted(session.turns.length > 0 || Boolean(session.onboarded));
     setOrbState("idle");
     setService(null);
-    setStatusText("Tap to speak");
+    setStatusText(session.turns.length ? "Tap to continue" : "Tap to speak");
     setSessionPickerOpen(false);
-    setViewMode("history");
+    setViewMode(session.turns.length ? "history" : "voice");
     console.info("[Setu session] loaded", { id: session.id, docId: session.docId, turns: session.turns.length });
   }, []);
 
@@ -1483,29 +1517,43 @@ export default function Home() {
     recorder.silenceGain.disconnect();
     recorder.source.disconnect();
     recorder.stream.getTracks().forEach((track) => track.stop());
+    isRecordingFlagRef.current = false;
     setIsRecording(false);
     setAutoStopProgress(0);
     setMicLevel(0);
   }, []);
 
-  const playSpeech = useCallback(async (text: string, selectedLanguage: Language, continueListening = false, voice = speaker, cachedUrl?: string, onEnded?: () => void) => {
+  const resumeListening = useCallback(() => {
+    orbStateRef.current = "idle";
+    setOrbState("idle");
+    audioRef.current = null;
+    setStatusText("Listening…");
+    // Brief delay lets TTS audio release before getUserMedia reopens the mic.
+    window.setTimeout(() => {
+      startRecordingRef.current?.({ force: true });
+    }, 160);
+  }, []);
+
+  const playSpeech = useCallback(async (text: string, selectedLanguage: Language, continueListening = false, voice = speaker, cachedUrl?: string, onEnded?: () => void, maxSpokenChars = 200) => {
     stopActiveRecording();
     if (!cachedUrl && !text.trim()) {
+      // Nothing to say — never reopen the mic silently, or it interrupts the user.
+      orbStateRef.current = "idle";
       setOrbState("idle");
-      setStatusText("Tap to speak");
       setService(null);
       onEnded?.();
-      if (continueListening) startRecordingRef.current?.();
+      setStatusText("Tap to continue");
       return;
     }
     setService("BULBUL");
+    orbStateRef.current = "processing";
     setOrbState("processing");
     setStatusText("Preparing a response");
     try {
       let url = cachedUrl;
       if (!url) {
         const trimmed = text.trim();
-        const ttsText = spokenText(trimmed);
+        const ttsText = spokenText(trimmed, maxSpokenChars);
         const speakStarted = performance.now();
         const response = await fetch(`${API_URL}/speak`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: ttsText, language: selectedLanguage, speaker: voice, pace }) });
         const speakMs = Math.round(performance.now() - speakStarted);
@@ -1530,19 +1578,25 @@ export default function Home() {
       analyser.connect(context.destination);
       const data = new Uint8Array(analyser.frequencyBinCount);
       const animate = () => { analyser.getByteFrequencyData(data); const normal = (from: number, to: number) => data.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255; setAmplitude(data.reduce((sum, value) => sum + value, 0) / data.length / 255); setBands({ bass: normal(0, Math.floor(data.length * 0.18)), treble: normal(Math.floor(data.length * 0.62), data.length) }); setSpectrum(Array.from({ length: 8 }, (_, index) => normal(Math.floor(data.length * index / 8), Math.floor(data.length * (index + 1) / 8)))); if (!audio.paused && !audio.ended) requestAnimationFrame(animate); };
-      audio.onplay = () => { setOrbState("speaking"); setStatusText("Speaking"); animate(); };
+      audio.onplay = () => {
+        orbStateRef.current = "speaking";
+        setOrbState("speaking");
+        setStatusText("Speaking");
+        animate();
+      };
       audio.onended = () => {
         setAmplitude(0.2);
         setBands({ bass: 0, treble: 0 });
         setSpectrum(Array.from({ length: 8 }, () => 0));
         setPreviewingVoice(null);
         setService(null);
+        if (audioRef.current === audio) audioRef.current = null;
         if (!cachedUrl) URL.revokeObjectURL(url);
         onEnded?.();
         if (continueListening) {
-          setStatusText("Listening…");
-          startRecordingRef.current?.();
+          resumeListening();
         } else {
+          orbStateRef.current = "idle";
           setOrbState("idle");
           setStatusText("Tap to speak");
         }
@@ -1552,12 +1606,56 @@ export default function Home() {
     } catch (error) {
       console.error(`[speak] language=${selectedLanguage} speaker=${voice}`, error);
       setStatusText(error instanceof Error ? error.message : "Unable to play speech");
-      setOrbState("idle"); setService(null);
+      orbStateRef.current = "idle";
+      setOrbState("idle");
+      setService(null);
+      if (continueListening) resumeListening();
     }
-  }, [getAudioContext, pace, speaker, stopActiveRecording]);
+  }, [getAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
+
+  const syncSessionToServer = useCallback(async (session: Session) => {
+    const userId = userIdRef.current ?? getStoredUserId();
+    if (!userId) return;
+    try {
+      await fetch(`${API_URL}/sessions/${session.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({
+          id: session.id,
+          title: session.title,
+          language: session.language,
+          doc_id: session.docId,
+          document_name: session.documentName ?? null,
+          summary: session.summary ?? null,
+          onboarded: Boolean(session.onboarded),
+          created_at: session.createdAt,
+          turns: session.turns.map((turn) => ({
+            id: turn.id,
+            role: turn.role,
+            text: turn.text,
+            language: turn.language,
+            kind: turn.kind,
+            evidence: turn.evidence,
+            askMeta: turn.askMeta,
+            documentImage: turn.documentImage,
+            timestamp: turn.timestamp,
+          })),
+        }),
+      });
+    } catch (error) {
+      console.warn("[Setu sync] session upload failed", error);
+    }
+  }, []);
 
   const converse = useCallback(async (message: string, selectedLanguage: Language, hasDocument: boolean) => {
-    const payload = { message, language: selectedLanguage, has_document: hasDocument, history: getHistoryPayload() };
+    const payload = {
+      message,
+      language: selectedLanguage,
+      has_document: hasDocument,
+      history: getHistoryPayload(),
+      session_id: activeSessionIdRef.current,
+      user_id: userIdRef.current ?? getStoredUserId(),
+    };
     console.info("[Setu /converse]", payload);
     const converseStarted = performance.now();
     const response = await fetch(`${API_URL}/converse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -1580,6 +1678,7 @@ export default function Home() {
       question,
       answer_language: answerLanguage,
       session_id: activeSessionIdRef.current,
+      user_id: userIdRef.current ?? getStoredUserId(),
       history: getHistoryPayload(),
     };
     console.info("[Setu routing] /ask", payload);
@@ -1804,10 +1903,11 @@ export default function Home() {
     if (!recorder) return;
     recorderRef.current = null;
     cancelAnimationFrame(recorder.raf); recorder.processor.disconnect(); recorder.silenceGain.disconnect(); recorder.source.disconnect(); recorder.stream.getTracks().forEach((track) => track.stop());
+    isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
     if (cancelled || !recorder.heardSpeech) {
       setOrbState("idle");
-      setStatusText("Tap to speak");
+      setStatusText("Tap to continue");
       return;
     }
     playCue([660, 440], 0.12, 0.07);
@@ -1839,10 +1939,33 @@ export default function Home() {
       languageRef.current = resolvedLanguage;
       languageLockedRef.current = true;
       patchActiveSession({ language: resolvedLanguage });
-      if (isLanguageChangeOnly(heard, requestedLanguage)) {
+
+      const activeSession = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
+      if (activeSession && !activeSession.onboarded) {
+        setStatusText("Preparing Setu…");
+        const introResponse = await fetch(`${API_URL}/intro`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ language: resolvedLanguage }),
+        });
+        if (!introResponse.ok) throw new Error("Intro unavailable");
+        const introData = await introResponse.json() as { text: string };
+        const introText = introData.text.trim();
+        addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
+        patchActiveSession({ onboarded: true, language: resolvedLanguage });
+        setHasStarted(true);
+        await playSpeech(introText, resolvedLanguage, true, speaker, undefined, undefined, 320);
+        logTurnTiming(turnTimingRef.current);
+        return;
+      }
+
+      if (requestedLanguage && (isLanguageChangeOnly(heard, requestedLanguage) || LANGUAGE_CHANGE.test(heard))) {
         const reply = LANGUAGE_SWITCH_CONFIRMATION[resolvedLanguage];
         addTurn({ userText: heard, setuText: reply, language: resolvedLanguage, ...(docIdRef.current ? { docId: docIdRef.current } : {}) });
-        await playSpeech(reply, resolvedLanguage, true);
+        // Confirm the switch, then wait — do not auto-open the mic.
+        await playSpeech(reply, resolvedLanguage, false);
+        setOrbState("idle");
+        setStatusText("Tap to continue");
         logTurnTiming(turnTimingRef.current);
         return;
       }
@@ -1931,14 +2054,16 @@ export default function Home() {
 
       if (!loadedDocId && (chat.intent === "needs_document" || DOCUMENT_MENTION.test(heard))) {
         console.info("[Setu routing] branch=open-camera", { intent: chat.intent });
-        addTurn({ userText: heard, setuText: chat.reply, language: resolvedLanguage });
+        addTurn({ userText: heard, setuText: cameraText[resolvedLanguage].show, language: resolvedLanguage });
         await playSpeech(cameraText[resolvedLanguage].show, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true));
         logTurnTiming(turnTimingRef.current);
         return;
       }
 
-      addTurn({ userText: heard, setuText: chat.reply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-      await playSpeech(chat.reply, resolvedLanguage, true);
+      // An empty reply used to leave the loop silent and reopen the mic instantly.
+      const spokenReply = chat.reply.trim() || cameraText[resolvedLanguage].show;
+      addTurn({ userText: heard, setuText: spokenReply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
+      await playSpeech(spokenReply, resolvedLanguage, true);
       logTurnTiming(turnTimingRef.current);
     } catch (error) {
       setService(null);
@@ -1948,9 +2073,15 @@ export default function Home() {
     }
   }, [addTurn, askDocument, cameraText, converse, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, speaker]);
 
-  const startRecording = useCallback(async () => {
-    if (isRecording) { void finishRecording(); return; }
-    if (orbState === "speaking" || (audioRef.current && !audioRef.current.paused && !audioRef.current.ended)) return;
+  const startRecording = useCallback(async (options?: { force?: boolean }) => {
+    if (isRecordingFlagRef.current) { void finishRecording(); return; }
+    const audio = audioRef.current;
+    const audioStillPlaying = Boolean(audio && !audio.paused && !audio.ended);
+    if (!options?.force && (orbStateRef.current === "speaking" || audioStillPlaying)) return;
+    if (options?.force && audioStillPlaying) {
+      audio?.pause();
+      audioRef.current = null;
+    }
     try {
       const context = getAudioContext(); await context.resume();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1977,7 +2108,9 @@ export default function Home() {
       };
       recorderRef.current = recorder;
       setTranscript("");
+      isRecordingFlagRef.current = true;
       setIsRecording(true); playCue([440, 660], 0.12, 0.07);
+      orbStateRef.current = "listening";
       setOrbState("listening");
       setStatusText("I am listening…");
       setAutoStopProgress(0);
@@ -2048,40 +2181,39 @@ export default function Home() {
 
         if (!recorder.heardSpeech && elapsed >= NO_SPEECH_MS) void finishRecording(true);
       };
-    } catch (error) { setOrbState("idle"); setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone"); }
-  }, [finishRecording, getAudioContext, isRecording, orbState, playCue]);
+    } catch (error) {
+      isRecordingFlagRef.current = false;
+      orbStateRef.current = "idle";
+      setOrbState("idle");
+      setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
+    }
+  }, [finishRecording, getAudioContext, playCue]);
 
   useEffect(() => {
-    startRecordingRef.current = () => void startRecording();
+    startRecordingRef.current = (options?: { force?: boolean }) => void startRecording(options);
   }, [startRecording]);
 
   const beginOrStop = async () => {
     if (isRecording) { void finishRecording(); return; }
-    if (orbState === "speaking") { audioRef.current?.pause(); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setOrbState("idle"); setStatusText("Tap to begin"); setService(null); return; }
+    if (orbState === "speaking") { audioRef.current?.pause(); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setOrbState("idle"); setStatusText("Tap to speak"); setService(null); return; }
     setViewMode("voice");
-    if (hasStarted) { void startRecording(); return; }
-    setHasStarted(true); setOrbState("processing"); setStatusText("Welcome to Setu");
-    try {
-      await getAudioContext().resume();
-      const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
-      const sessionLanguage = session?.language ?? languageRef.current;
-      const hasDocument = Boolean(session?.docId);
-      const isResuming = (session?.turns.length ?? 0) > 0;
-      const greeting = await converse(
-        isResuming
-          ? "Please briefly welcome me back and continue from our previous conversation. Mention the most recent topic if useful."
-          : "hello",
-        sessionLanguage,
-        hasDocument,
-      );
-      const fallback = isResuming
-        ? "Welcome back. What would you like to continue with?"
-        : "Hello! I'm Setu. Which language would you like to speak in?";
-      const reply = greeting.reply.trim() || fallback;
-      if (!isResuming) addTurn({ userText: "Start conversation", setuText: reply, language: sessionLanguage });
-      await playSpeech(reply, sessionLanguage, true);
+    const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
+    if (!session?.onboarded && !(session?.turns.length)) {
+      setHasStarted(true);
+      setOrbState("processing");
+      setStatusText("Welcome to Setu");
+      try {
+        await getAudioContext().resume();
+        await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true);
+      } catch {
+        setOrbState("idle");
+        setStatusText("Tap to start");
+      }
+      return;
     }
-    catch { setOrbState("idle"); setStatusText("Tap to begin"); }
+    if (hasStarted) { void startRecording(); return; }
+    setHasStarted(true);
+    void startRecording();
   };
 
   const openSettings = async () => {
@@ -2110,6 +2242,22 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
     const restore = async () => {
+      try {
+        userIdRef.current = await ensureGuestUser();
+      } catch {
+        userIdRef.current = getStoredUserId() ?? crypto.randomUUID();
+      }
+      const params = new URLSearchParams(window.location.search);
+      const magic = params.get("magic");
+      if (magic) {
+        try {
+          userIdRef.current = await verifyMagicLink(magic);
+          setAuthStatus("Signed in");
+          window.history.replaceState({}, "", window.location.pathname);
+        } catch {
+          setAuthStatus("Sign-in link expired");
+        }
+      }
       let restored: Session[];
       let activeId: string;
       try {
@@ -2133,6 +2281,13 @@ export default function Home() {
         docIdRef.current = active.docId;
         setLanguage(active.language);
         languageRef.current = active.language;
+        languageLockedRef.current = Boolean(active.onboarded || active.turns.length);
+        setHasStarted(Boolean(active.onboarded || active.turns.length));
+        if (!active.onboarded && active.turns.length === 0) {
+          setStatusText("Tap to start");
+        } else {
+          setStatusText(active.turns.length ? "Tap to continue" : "Tap to speak");
+        }
       }
       setSessionsLoaded(true);
     };
@@ -2148,12 +2303,14 @@ export default function Home() {
           writeSessions(sessions),
           writeActiveSessionId(activeSessionId),
         ]);
+        const active = sessions.find((session) => session.id === activeSessionId);
+        if (active) await syncSessionToServer(active);
       } catch (error) {
         console.error("Setu could not save chat history locally", error);
         setStatusText("Could not save chat history");
       }
     })();
-  }, [sessions, activeSessionId, sessionsLoaded]);
+  }, [sessions, activeSessionId, sessionsLoaded, syncSessionToServer]);
 
   useEffect(() => () => { recorderRef.current?.stream.getTracks().forEach((track) => track.stop()); audioRef.current?.pause(); previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url)); }, []);
 
@@ -2480,9 +2637,41 @@ export default function Home() {
               <button onClick={() => setIsSettingsOpen(false)} aria-label="Close settings" className="icon-button"><X size={20} /></button>
             </div>
             <div className="mt-8">
+              <p className="text-xs font-semibold tracking-[0.14em] text-slate-400">ACCOUNT</p>
+              <p className="mt-2 text-sm text-slate-600">Guest works immediately. Email magic link syncs chats across devices.</p>
+              <div className="mt-3 flex gap-2">
+                <input
+                  type="email"
+                  value={authEmail}
+                  onChange={(event) => setAuthEmail(event.target.value)}
+                  placeholder="you@email.com"
+                  className="min-h-11 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none focus:border-[#ff6b00]"
+                />
+                <button
+                  type="button"
+                  className="rounded-xl bg-[#172033] px-3 text-sm font-medium text-white"
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        setAuthStatus("Sending link…");
+                        const result = await requestMagicLink(authEmail.trim());
+                        setAuthStatus(result.sent ? "Check your email" : (result.magic_link ? "Open the link below" : "Link ready"));
+                        if (result.magic_link) setAuthStatus(result.magic_link);
+                      } catch {
+                        setAuthStatus("Could not create sign-in link");
+                      }
+                    })();
+                  }}
+                >
+                  Send
+                </button>
+              </div>
+              {authStatus && <p className="mt-2 break-all text-xs text-slate-500">{authStatus}</p>}
+            </div>
+            <div className="mt-8">
               <p className="text-xs font-semibold tracking-[0.14em] text-slate-400">LANGUAGE</p>
               <p className="mt-2 text-lg font-medium text-slate-700">{LANGUAGE_LABELS[language]}</p>
-              <p className="mt-1 text-sm text-slate-400">Set by voice</p>
+              <p className="mt-1 text-sm text-slate-400">Set by voice — say &ldquo;speak in Hindi&rdquo; anytime</p>
             </div>
             <div className="mt-8">
               <div className="flex justify-between">

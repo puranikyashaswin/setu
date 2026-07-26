@@ -20,6 +20,9 @@ Thumbs.db
 # Python (api)
 api/.venv/
 api/cache/
+api/cache/setu.db
+api/cache/setu.db-*
+
 api/__pycache__/
 **/__pycache__/
 *.py[cod]

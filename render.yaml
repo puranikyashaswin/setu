@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: setu-api
+    runtime: python
+    rootDir: api
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: EXPOSE_MAGIC_LINK
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.12.8"

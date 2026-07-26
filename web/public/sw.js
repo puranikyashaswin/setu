@@ -1,4 +1,4 @@
-const CACHE_NAME = "setu-shell-v1";
+const CACHE_NAME = "setu-shell-v2";
 const APP_SHELL = ["/", "/logo.png", "/favicon.png", "/apple-touch-icon.png", "/bg-waves.png"];
 
 self.addEventListener("install", (event) => {
@@ -26,15 +26,25 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  const cachePut = (response) => {
+    if (!response.ok || response.type === "opaque") return response;
+    const copy = response.clone();
+    void caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+    return response;
+  };
+
+  // Navigations go to the network first so a new deploy is picked up immediately;
+  // the cache is only a fallback for offline.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
+        .then(cachePut)
+        .catch(() => caches.match(request).then((cached) => cached || caches.match("/"))),
+    );
+    return;
+  }
+
   event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-      return fetch(request).then((response) => {
-        if (!response.ok || response.type === "opaque") return response;
-        const copy = response.clone();
-        void caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
-        return response;
-      });
-    }),
+    caches.match(request).then((cached) => cached || fetch(request).then(cachePut)),
   );
 });

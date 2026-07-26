@@ -15,11 +15,13 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 import json
 import threading
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+import auth
+import db
 import sarvam
 
 logging.basicConfig(level=logging.INFO)
@@ -53,8 +55,26 @@ def _frontend_origins() -> list[str]:
     return origins
 
 
+def _memory_context(user_id: str | None, session_id: str | None = None) -> str | None:
+    if not user_id:
+        return None
+    recent = db.recent_session_summaries(user_id, exclude_session_id=session_id, limit=5)
+    if not recent:
+        return None
+    lines = []
+    for item in recent:
+        summary = (item.get("summary") or item.get("title") or "Chat").strip()
+        lines.append(f"- {summary}")
+    return "\n".join(lines)
+
+
+def _user_from_header(x_user_id: str | None) -> dict:
+    return auth.resolve_user(x_user_id)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    db.init_db()
     sarvam.load_ocr_cache()
     sarvam.load_session_corrections()
     if not os.getenv("SARVAM_API_KEY"):
@@ -116,6 +136,8 @@ class ConverseBody(BaseModel):
     language: str = "en"
     has_document: bool = False
     history: list[HistoryMessage] = Field(default_factory=list)
+    session_id: str | None = None
+    user_id: str | None = None
 
 
 class AskBody(BaseModel):
@@ -123,7 +145,37 @@ class AskBody(BaseModel):
     question: str
     answer_language: str = "en"
     session_id: str | None = None
+    user_id: str | None = None
     history: list[HistoryMessage] = Field(default_factory=list)
+
+
+class GuestBody(BaseModel):
+    user_id: str | None = None
+
+
+class MagicLinkBody(BaseModel):
+    email: str
+    user_id: str | None = None
+
+
+class MagicVerifyBody(BaseModel):
+    token: str
+
+
+class IntroBody(BaseModel):
+    language: str = "en"
+
+
+class SessionUpsertBody(BaseModel):
+    id: str | None = None
+    title: str = "New chat"
+    language: str = "en"
+    doc_id: str | None = None
+    document_name: str | None = None
+    summary: str | None = None
+    onboarded: bool = False
+    created_at: float | None = None
+    turns: list[dict] = Field(default_factory=list)
 
 
 class SummarizeBody(BaseModel):
@@ -141,6 +193,101 @@ class SpeakBody(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/auth/guest")
+def auth_guest(body: GuestBody):
+    user = auth.resolve_user(body.user_id)
+    return {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 1))}
+
+
+@app.post("/auth/magic-link")
+def auth_magic_link(body: MagicLinkBody):
+    try:
+        return auth.request_magic_link(body.email, body.user_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/auth/magic-verify")
+def auth_magic_verify(body: MagicVerifyBody):
+    user = auth.verify_magic_link(body.token)
+    if not user:
+        raise HTTPException(400, "Invalid or expired sign-in link")
+    return {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 0))}
+
+
+@app.post("/intro")
+def intro(body: IntroBody):
+    try:
+        text = sarvam.intro_for_language(body.language)
+        return {"text": text, "language": body.language}
+    except Exception as exc:
+        logger.exception("intro failed")
+        raise HTTPException(502, f"Intro failed: {exc}") from exc
+
+
+@app.get("/sessions")
+def sessions_list(x_user_id: str | None = Header(default=None)):
+    user = _user_from_header(x_user_id)
+    items = db.list_sessions(user["id"], limit=20)
+    return {
+        "user_id": user["id"],
+        "sessions": [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "language": item["language"],
+                "docId": item.get("doc_id"),
+                "documentName": item.get("document_name"),
+                "summary": item.get("summary"),
+                "onboarded": bool(item.get("onboarded")),
+                "createdAt": item["created_at"] * 1000,
+                "updatedAt": item["updated_at"] * 1000,
+            }
+            for item in items
+        ],
+    }
+
+
+@app.get("/sessions/{session_id}")
+def sessions_get(session_id: str, x_user_id: str | None = Header(default=None)):
+    user = _user_from_header(x_user_id)
+    session = db.get_session(session_id, user["id"])
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return {
+        "id": session["id"],
+        "title": session["title"],
+        "language": session["language"],
+        "docId": session.get("doc_id"),
+        "documentName": session.get("document_name"),
+        "summary": session.get("summary"),
+        "onboarded": bool(session.get("onboarded")),
+        "createdAt": session["created_at"] * 1000,
+        "updatedAt": session["updated_at"] * 1000,
+        "turns": session.get("turns") or [],
+        "corrections": [],
+    }
+
+
+@app.put("/sessions/{session_id}")
+def sessions_put(session_id: str, body: SessionUpsertBody, x_user_id: str | None = Header(default=None)):
+    user = _user_from_header(x_user_id)
+    payload = body.model_dump()
+    payload["id"] = session_id
+    payload["user_id"] = user["id"]
+    if payload.get("created_at") and payload["created_at"] > 10_000_000_000:
+        payload["created_at"] = payload["created_at"] / 1000
+    session = db.upsert_session(payload)
+    return {"ok": True, "id": session.get("id"), "user_id": user["id"]}
+
+
+@app.delete("/sessions/{session_id}")
+def sessions_delete(session_id: str, x_user_id: str | None = Header(default=None)):
+    user = _user_from_header(x_user_id)
+    db.delete_session(session_id, user["id"])
+    return {"ok": True}
 
 
 @app.get("/voices")
@@ -266,7 +413,9 @@ def converse(body: ConverseBody):
         raise HTTPException(400, "message required")
     t0 = time.perf_counter()
     try:
-        if not sarvam.is_converse_allowed(body.message):
+        # Only redirect to /ask when a document is actually loaded. With no document
+        # an empty reply leaves the voice loop silent, so always answer instead.
+        if body.has_document and not sarvam.is_converse_allowed(body.message):
             return {
                 "redirect": True,
                 "route_to": "ask",
@@ -278,6 +427,7 @@ def converse(body: ConverseBody):
             body.language,
             body.has_document,
             history=[m.model_dump() for m in body.history],
+            memory_context=_memory_context(body.user_id, body.session_id),
         )
         return {
             "redirect": False,

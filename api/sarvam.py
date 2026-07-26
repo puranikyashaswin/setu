@@ -287,7 +287,24 @@ def get_client() -> SarvamAI:
 
 
 def get_document(doc_id: str) -> dict | None:
-    return _cache.get(doc_id)
+    hit = _cache.get(doc_id)
+    if hit:
+        return hit
+    try:
+        import db as setu_db
+
+        row = setu_db.get_document_text(doc_id)
+        if row and row.get("ocr_text"):
+            entry = {
+                "text": row["ocr_text"],
+                "pages": row.get("pages") or 1,
+                "name": row.get("name"),
+            }
+            _cache[doc_id] = entry
+            return entry
+    except Exception:
+        logger.warning("document db lookup failed for %s", doc_id, exc_info=True)
+    return None
 
 
 def load_ocr_cache() -> None:
@@ -324,6 +341,17 @@ def _persist_ocr_cache() -> None:
 def _set_cached_document(doc_id: str, entry: dict) -> None:
     _cache[doc_id] = entry
     _persist_ocr_cache()
+    try:
+        import db as setu_db
+
+        setu_db.save_document(
+            doc_id,
+            entry.get("text") or "",
+            pages=int(entry.get("pages") or 1),
+            name=entry.get("name"),
+        )
+    except Exception:
+        logger.warning("document db persist failed for %s", doc_id, exc_info=True)
 
 
 def load_session_corrections() -> None:
@@ -631,11 +659,97 @@ def _log_messages(route: str, messages: list[dict]) -> None:
     logger.info("[messages] %s %s", route, payload)
 
 
+SETU_INTRO_EN = (
+    "I'm Setu. If you have an official paper you can't fully understand — a government "
+    "notice, a scheme letter, a court order, a hospital summary — show it to me and ask "
+    "me anything about it in your own language.\n\n"
+    "I only answer from what's written on that paper. If something isn't in it, I'll "
+    "tell you that instead of guessing.\n\n"
+    "When you're done, you can download a sheet with your deadline and the documents "
+    "you need, and carry it with you."
+)
+
+# Fixed native-script intros — instant and reliable (LLM translation kept returning English).
+SETU_INTRO_BY_LANG: dict[str, str] = {
+    "en": SETU_INTRO_EN,
+    "te": (
+        "నేను సేతు. ప్రభుత్వ నోటీసు, పథక లేఖ, కోర్టు ఆదేశం వంటి పత్రం అర్థం కాకపోతే, "
+        "నాకు చూపించి మీ భాషలో అడగండి. నేను పత్రంలో ఉన్నదే చెబుతాను — లేకపోతే ఊహించను. "
+        "పూర్తయిన తర్వాత గడువు మరియు అవసరమైన పత్రాలతో ఒక షీట్ డౌన్‌లోడ్ చేయవచ్చు."
+    ),
+    "hi": (
+        "मैं सेतु हूँ। सरकारी नोटिस, योजना पत्र, कोर्ट आदेश जैसा कोई कागज़ समझ न आए "
+        "तो मुझे दिखाइए और अपनी भाषा में पूछिए। मैं केवल कागज़ में लिखा बताता हूँ। "
+        "बाद में समय-सीमा और ज़रूरी कागज़ों की शीट डाउनलोड कर सकते हैं।"
+    ),
+    "mr": (
+        "मी सेतू आहे. सरकारी नोटीस, योजना पत्र किंवा कोर्ट आदेश समजत नसेल तर मला "
+        "दाखवा आणि तुमच्या भाषेत विचारा. मी फक्त कागदावर लिहिलेलेच सांगतो. "
+        "नंतर मुदत आणि कागदपत्रांची यादी असलेली शीट डाउनलोड करू शकता."
+    ),
+    "ta": (
+        "நான் சேது. அரசு அறிவிப்பு, திட்ட கடிதம், நீதிமன்ற உத்தரவு போன்ற ஆவணம் "
+        "புரியவில்லை என்றால், காட்டி உங்கள் மொழியில் கேளுங்கள். ஆவணத்தில் உள்ளதை "
+        "மட்டுமே சொல்வேன். பின்னர் காலக்கெடு மற்றும் ஆவணப் பட்டியலுடன் ஒரு தாளை "
+        "பதிவிறக்கலாம்."
+    ),
+    "kn": (
+        "ನಾನು ಸೇತು. ಸರ್ಕಾರಿ ನೋಟೀಸ್, ಯೋಜನೆ ಪತ್ರ, ನ್ಯಾಯಾಲಯ ಆದೇಶ ಇತ್ಯಾದಿ ದಾಖಲೆ "
+        "ಅರ್ಥವಾಗದಿದ್ದರೆ, ನನಗೆ ತೋರಿಸಿ ನಿಮ್ಮ ಭಾಷೆಯಲ್ಲಿ ಕೇಳಿ. ದಾಖಲೆಯಲ್ಲಿರುವುದನ್ನೇ "
+        "ಹೇಳುತ್ತೇನೆ. ನಂತರ ಗಡುವು ಮತ್ತು ದಾಖಲೆಗಳ ಪಟ್ಟಿಯೊಂದಿಗೆ ಶೀಟ್ ಡೌನ್‌ಲೋಡ್ "
+        "ಮಾಡಬಹುದು."
+    ),
+    "bn": (
+        "আমি সেতু। সরকারি নোটিশ, প্রকল্পের চিঠি, আদালতের আদেশ বোঝা না গেলে, "
+        "আমাকে দেখান এবং আপনার ভাষায় জিজ্ঞেস করুন। আমি শুধু কাগজে লেখা বলি। "
+        "শেষে সময়সীমা ও প্রয়োজনীয় কাগজের তালিকা সহ একটি শিট ডাউনলোড করতে পারবেন।"
+    ),
+    "gu": (
+        "હું સેતુ છું. સરકારી નોટિસ, યોજના પત્ર, કોર્ટ ઓર્ડર જેવું કાગળ સમજાય નહીં "
+        "તો મને બતાવો અને તમારી ભાષામાં પૂછો. હું ફક્ત કાગળ પર લખેલું જ કહું છું. "
+        "પછી મુદત અને જરૂરી કાગળોની યાદી સાથે શીટ ડાઉનલોડ કરી શકો."
+    ),
+    "ml": (
+        "ഞാൻ സേതു. സർക്കാർ നോട്ടീസ്, പദ്ധതി കത്ത്, കോടതി ഉത്തരവ് തുടങ്ങിയ "
+        "രേഖ മനസ്സിലാകുന്നില്ലെങ്കിൽ, കാണിച്ച് നിങ്ങളുടെ ഭാഷയിൽ ചോദിക്കുക. "
+        "രേഖയിൽ എഴുതിയിരിക്കുന്നത് മാത്രം പറയും. പിന്നീട് അവസാന തീയതിയും "
+        "ആവശ്യമായ രേഖകളുടെ പട്ടികയും ഉള്ള ഷീറ്റ് ഡൗൺലോഡ് ചെയ്യാം."
+    ),
+    "pa": (
+        "ਮੈਂ ਸੇਤੂ ਹਾਂ। ਸਰਕਾਰੀ ਨੋਟਿਸ, ਯੋਜਨਾ ਪੱਤਰ, ਕੋਰਟ ਆਦੇਸ਼ ਵਰਗਾ ਕਾਗਜ਼ "
+        "ਸਮਝ ਨ ਆਵੇ ਤਾਂ ਮੈਨੂੰ ਦਿਖਾਓ ਅਤੇ ਆਪਣੀ ਭਾਸ਼ਾ ਵਿੱਚ ਪੁੱਛੋ। ਮੈਂ ਸਿਰਫ਼ "
+        "ਕਾਗਜ਼ ਵਿੱਚ ਲਿਖਿਆ ਦੱਸਦਾ ਹਾਂ। ਬਾਅਦ ਵਿੱਚ ਮਿਆਦ ਅਤੇ ਕਾਗਜ਼ਾਂ ਦੀ ਸੂਚੀ "
+        "ਨਾਲ ਇੱਕ ਸ਼ੀਟ ਡਾਊਨਲੋਡ ਕਰ ਸਕਦੇ ਹੋ।"
+    ),
+    "or": (
+        "ମୁଁ ସେତୁ। ସରକାରୀ ନୋଟିସ, ଯୋଜନା ପତ୍ର, ଆଦାଲତ ଆଦେଶ ଭଳି କାଗଜ ବୁଝି "
+        "ନପାରିଲେ, ମୋତେ ଦେଖାନ୍ତୁ ଏବଂ ଆପଣଙ୍କ ଭାଷାରେ ପଚାରନ୍ତୁ। ମୁଁ କେବଳ "
+        "କାଗଜରେ ଲେଖା କହିବି। ଶେଷରେ ସମୟସୀମା ଓ ଆବଶ୍ୟକ କାଗଜର ତାଲିକା ସହ "
+        "ଏକ ଶିଟ୍ ଡାଉନଲୋଡ୍ କରିପାରିବେ।"
+    ),
+}
+
+
+def _is_mostly_latin(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    latin = sum(1 for c in letters if ord(c) < 128)
+    return latin / len(letters) > 0.55
+
+
+def intro_for_language(language: str) -> str:
+    """Return the fixed Setu intro in the requested language."""
+    base = _lang_base(language) or "en"
+    return SETU_INTRO_BY_LANG.get(base, SETU_INTRO_EN)
+
+
 def chat_reply(
     message: str,
     language: str,
     has_document: bool,
     history: list[dict] | None = None,
+    memory_context: str | None = None,
 ) -> dict:
     """Fast path: sarvam-30b, no document, no JSON schema. Target <1.5s."""
     language_name = _language_name(language)
@@ -649,11 +763,17 @@ def chat_reply(
             "No document is loaded. If the user asks about a document, ask them "
             "to show it to the camera — never say paste."
         )
+    memory_block = (
+        f" Persistent memory from earlier chats:\n{memory_context}\n"
+        if memory_context
+        else ""
+    )
     system = (
         f"CRITICAL: Your entire reply must be in {language_name} script only. "
         f"The user may write in any language or script — ignore that completely "
         f"and always answer in {language_name}. "
         f"You are Setu, a helpful voice assistant for India. {doc_rule} "
+        f"{memory_block}"
         "Use prior conversation turns for follow-ups. A language switch is not a new "
         "conversation: never greet the user again or restart the introduction after one. "
         "Reply in ONE short sentence. "
@@ -688,11 +808,36 @@ def chat_reply(
         )
 
     resp = _with_backoff(call)
-    content = resp.choices[0].message.content
+    content = (resp.choices[0].message.content or "").strip()
     if not content:
         raise RuntimeError("Empty model response")
+    # Sarvam sometimes replies in English even when Telugu/Hindi was requested — retry once.
+    if _lang_base(language) != "en" and _is_mostly_latin(content):
+        retry_messages = [
+            *messages,
+            {"role": "assistant", "content": content},
+            {
+                "role": "user",
+                "content": (
+                    f"Wrong language. Rewrite ONLY in {language_name} native script. "
+                    f"No English words at all."
+                ),
+            },
+        ]
+        retry = _with_backoff(
+            lambda: _client.chat.completions(
+                model="sarvam-30b",
+                messages=retry_messages,
+                reasoning_effort=None,
+                max_tokens=60,
+                temperature=0.1,
+            )
+        )
+        retry_content = (retry.choices[0].message.content or "").strip()
+        if retry_content and not _is_mostly_latin(retry_content):
+            content = retry_content
     return {
-        "reply": content.strip(),
+        "reply": content,
         "intent": _chat_intent(message, has_document),
     }
 
