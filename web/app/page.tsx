@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, Mic, Plus, Settings2, Square, Trash2, Volume2, VolumeX, X } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
+import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
 
 type Language = "te" | "hi" | "en" | "mr" | "ta" | "kn" | "bn" | "gu" | "ml" | "pa" | "or";
 type OrbState = "idle" | "listening" | "processing" | "speaking";
@@ -336,7 +337,12 @@ function collectAskExchanges(session: Session): AskExchange[] {
       index += 1;
       continue;
     }
-    if (session.docId && setu.evidence !== undefined && user.text !== "Start conversation") {
+    if (
+      session.docId
+      && setu.kind !== "summary"
+      && user.text !== "Start conversation"
+      && (setu.evidence?.length ?? 0) > 0
+    ) {
       exchanges.push({
         question: user.text,
         answer: setu.text,
@@ -681,8 +687,34 @@ const BRIEF_ACK: Record<Language, string> = {
   or: "ଠିକ୍ ଅଛି.",
 };
 
+const LANGUAGE_SWITCH_CONFIRMATION: Record<Language, string> = {
+  te: "సరే, ఇక నుంచి తెలుగులోనే కొనసాగిస్తాను.",
+  hi: "ठीक है, अब से मैं हिंदी में बात करूँगा।",
+  en: "Okay, I’ll continue in English.",
+  mr: "ठीक आहे, आता मी मराठीत पुढे बोलतो.",
+  ta: "சரி, இனிமேல் தமிழில் தொடர்கிறேன்.",
+  kn: "ಸರಿ, ಇನ್ನು ಮುಂದೆ ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ.",
+  bn: "ঠিক আছে, এখন থেকে বাংলায় কথা বলব।",
+  gu: "બરાબર, હવે હું ગુજરાતીમાં આગળ વાત કરીશ.",
+  ml: "ശരി, ഇനി മുതൽ മലയാളത്തിൽ തുടരും.",
+  pa: "ਠੀਕ ਹੈ, ਹੁਣ ਤੋਂ ਮੈਂ ਪੰਜਾਬੀ ਵਿੱਚ ਗੱਲ ਕਰਾਂਗਾ।",
+  or: "ଠିକ୍ ଅଛି, ଏବେ ଠାରୁ ମୁଁ ଓଡ଼ିଆରେ କଥା ହେବି।",
+};
+
 function explicitLanguage(transcript: string) {
   return EXPLICIT_LANGUAGE.find(([pattern]) => pattern.test(transcript))?.[1];
+}
+
+function isLanguageChangeOnly(transcript: string, language: Language | undefined) {
+  if (!language) return false;
+  const normalized = transcript
+    .toLowerCase()
+    .replace(/[.,!?]/g, " ")
+    .replace(/\b(speak|talk|reply|respond|in|language|please|switch|to)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const languageName = LANGUAGE_LABELS[language].toLowerCase();
+  return normalized === languageName;
 }
 
 function resolveLanguage(transcript: string, apiLanguage?: string): Language {
@@ -829,7 +861,11 @@ function makeSession(language: Language): Session {
 }
 
 function titleFromTurns(turns: Turn[]) {
-  const firstUser = turns.find((turn) => turn.role === "user");
+  const firstUser = turns.find((turn) => (
+    turn.role === "user"
+    && turn.text !== "Start conversation"
+    && turn.text !== "Scanned document"
+  ));
   if (!firstUser) return "New chat";
   const words = firstUser.text.trim().split(/\s+/).filter(Boolean).slice(0, 6);
   return words.join(" ") || "New chat";
@@ -924,6 +960,17 @@ function loadSessionsFromStorage(fallbackLanguage: Language): { sessions: Sessio
   return { sessions: [session], activeId: session.id };
 }
 
+function hydrateStoredSessions(parsed: Session[], activeId: string | null, fallbackLanguage: Language): { sessions: Session[]; activeId: string } {
+  if (parsed.length) {
+    const sessions = parsed.map(hydrateSessionCorrections);
+    const resolvedActiveId = activeId && sessions.some((session) => session.id === activeId)
+      ? activeId
+      : sessions[0].id;
+    return { sessions, activeId: resolvedActiveId };
+  }
+  return loadSessionsFromStorage(fallbackLanguage);
+}
+
 function SessionRow({
   session,
   active,
@@ -994,7 +1041,11 @@ function SessionRow({
         className={`relative z-[1] min-h-11 w-full border p-3 text-left transition ${active ? "border-[#ff6b00]/40 bg-[#fff7ed]" : "border-slate-200/70 bg-white/80 hover:border-[#ff6b00]/30"}`}
         style={{ transform: `translateX(${offset}px)` }}
       >
-        <p className="truncate text-sm font-medium text-slate-800">{session.title}</p>
+        <p className="truncate text-sm font-medium text-slate-800">
+          {session.title === "Start conversation" || session.title === "New chat"
+            ? titleFromTurns(session.turns)
+            : session.title}
+        </p>
         <p className="mt-1 text-[11px] text-slate-400">
           {relativeTime(session.updatedAt)}
           {session.docId ? " · document" : ""}
@@ -1331,6 +1382,18 @@ export default function Home() {
   }, []);
 
   const startNewChat = useCallback(() => {
+    audioRef.current?.pause();
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorderRef.current = null;
+      cancelAnimationFrame(recorder.raf);
+      recorder.processor.disconnect();
+      recorder.source.disconnect();
+      recorder.silenceGain.disconnect();
+      recorder.stream.getTracks().forEach((track) => track.stop());
+    }
+    setIsRecording(false);
+    setMicLevel(0);
     const session = makeSession(languageRef.current);
     setSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
@@ -1339,6 +1402,9 @@ export default function Home() {
     docIdRef.current = null;
     setTranscript("");
     setAnswerSheet(null);
+    setHasStarted(false);
+    setOrbState("idle");
+    setService(null);
     setStatusText("Tap to speak");
     setViewMode("voice");
     setSessionPickerOpen(false);
@@ -1347,6 +1413,18 @@ export default function Home() {
   const loadSession = useCallback((id: string) => {
     const session = sessionsRef.current.find((item) => item.id === id);
     if (!session) return;
+    audioRef.current?.pause();
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorderRef.current = null;
+      cancelAnimationFrame(recorder.raf);
+      recorder.processor.disconnect();
+      recorder.source.disconnect();
+      recorder.silenceGain.disconnect();
+      recorder.stream.getTracks().forEach((track) => track.stop());
+    }
+    setIsRecording(false);
+    setMicLevel(0);
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id;
     setDocId(session.docId);
@@ -1355,6 +1433,9 @@ export default function Home() {
     languageRef.current = session.language;
     setTranscript("");
     setAnswerSheet(null);
+    setHasStarted(false);
+    setOrbState("idle");
+    setService(null);
     setStatusText("Tap to speak");
     setSessionPickerOpen(false);
     setViewMode("history");
@@ -1450,7 +1531,22 @@ export default function Home() {
       const data = new Uint8Array(analyser.frequencyBinCount);
       const animate = () => { analyser.getByteFrequencyData(data); const normal = (from: number, to: number) => data.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255; setAmplitude(data.reduce((sum, value) => sum + value, 0) / data.length / 255); setBands({ bass: normal(0, Math.floor(data.length * 0.18)), treble: normal(Math.floor(data.length * 0.62), data.length) }); setSpectrum(Array.from({ length: 8 }, (_, index) => normal(Math.floor(data.length * index / 8), Math.floor(data.length * (index + 1) / 8)))); if (!audio.paused && !audio.ended) requestAnimationFrame(animate); };
       audio.onplay = () => { setOrbState("speaking"); setStatusText("Speaking"); animate(); };
-      audio.onended = () => { setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setSpectrum(Array.from({ length: 8 }, () => 0)); setPreviewingVoice(null); setOrbState("idle"); setStatusText("Tap to speak"); setService(null); if (!cachedUrl) URL.revokeObjectURL(url); onEnded?.(); if (continueListening) startRecordingRef.current?.(); };
+      audio.onended = () => {
+        setAmplitude(0.2);
+        setBands({ bass: 0, treble: 0 });
+        setSpectrum(Array.from({ length: 8 }, () => 0));
+        setPreviewingVoice(null);
+        setService(null);
+        if (!cachedUrl) URL.revokeObjectURL(url);
+        onEnded?.();
+        if (continueListening) {
+          setStatusText("Listening…");
+          startRecordingRef.current?.();
+        } else {
+          setOrbState("idle");
+          setStatusText("Tap to speak");
+        }
+      };
       await context.resume();
       await audio.play();
     } catch (error) {
@@ -1743,6 +1839,13 @@ export default function Home() {
       languageRef.current = resolvedLanguage;
       languageLockedRef.current = true;
       patchActiveSession({ language: resolvedLanguage });
+      if (isLanguageChangeOnly(heard, requestedLanguage)) {
+        const reply = LANGUAGE_SWITCH_CONFIRMATION[resolvedLanguage];
+        addTurn({ userText: heard, setuText: reply, language: resolvedLanguage, ...(docIdRef.current ? { docId: docIdRef.current } : {}) });
+        await playSpeech(reply, resolvedLanguage, true);
+        logTurnTiming(turnTimingRef.current);
+        return;
+      }
       setStatusText("Thinking");
       const loadedDocId = docIdRef.current;
       const hasDocument = Boolean(loadedDocId);
@@ -1960,10 +2063,23 @@ export default function Home() {
     setHasStarted(true); setOrbState("processing"); setStatusText("Welcome to Setu");
     try {
       await getAudioContext().resume();
-      const greeting = await converse("hello", "en", false);
-      const reply = greeting.reply.trim() || "Hello! I'm Setu. Which language would you like to speak in?";
-      addTurn({ userText: "Start conversation", setuText: reply, language: "en" });
-      await playSpeech(reply, "en", true);
+      const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
+      const sessionLanguage = session?.language ?? languageRef.current;
+      const hasDocument = Boolean(session?.docId);
+      const isResuming = (session?.turns.length ?? 0) > 0;
+      const greeting = await converse(
+        isResuming
+          ? "Please briefly welcome me back and continue from our previous conversation. Mention the most recent topic if useful."
+          : "hello",
+        sessionLanguage,
+        hasDocument,
+      );
+      const fallback = isResuming
+        ? "Welcome back. What would you like to continue with?"
+        : "Hello! I'm Setu. Which language would you like to speak in?";
+      const reply = greeting.reply.trim() || fallback;
+      if (!isResuming) addTurn({ userText: "Start conversation", setuText: reply, language: sessionLanguage });
+      await playSpeech(reply, sessionLanguage, true);
     }
     catch { setOrbState("idle"); setStatusText("Tap to begin"); }
   };
@@ -1992,8 +2108,21 @@ export default function Home() {
   };
 
   useEffect(() => {
-    const restore = window.setTimeout(() => {
-      const { sessions: restored, activeId } = loadSessionsFromStorage(languageRef.current);
+    let cancelled = false;
+    const restore = async () => {
+      let restored: Session[];
+      let activeId: string;
+      try {
+        const [storedSessions, storedActiveId] = await Promise.all([
+          readSessions<Session>(),
+          readActiveSessionId(),
+        ]);
+        ({ sessions: restored, activeId } = hydrateStoredSessions(storedSessions, storedActiveId, languageRef.current));
+      } catch (error) {
+        console.warn("Setu local database unavailable; using legacy storage", error);
+        ({ sessions: restored, activeId } = loadSessionsFromStorage(languageRef.current));
+      }
+      if (cancelled) return;
       setSessions(restored);
       setActiveSessionId(activeId);
       activeSessionIdRef.current = activeId;
@@ -2006,21 +2135,33 @@ export default function Home() {
         languageRef.current = active.language;
       }
       setSessionsLoaded(true);
-    }, 0);
-    return () => window.clearTimeout(restore);
+    };
+    void restore();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
     if (!sessionsLoaded) return;
-    localStorage.setItem("setu-sessions", JSON.stringify(sessions));
-    if (activeSessionId) localStorage.setItem("setu-active-session", activeSessionId);
+    void (async () => {
+      try {
+        await Promise.all([
+          writeSessions(sessions),
+          writeActiveSessionId(activeSessionId),
+        ]);
+      } catch (error) {
+        console.error("Setu could not save chat history locally", error);
+        setStatusText("Could not save chat history");
+      }
+    })();
   }, [sessions, activeSessionId, sessionsLoaded]);
 
   useEffect(() => () => { recorderRef.current?.stream.getTracks().forEach((track) => track.stop()); audioRef.current?.pause(); previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url)); }, []);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null;
   const activeCorrections = activeSession ? sessionCorrections(activeSession) : [];
-  const hasAskAnswers = activeSession ? collectAskExchanges(activeSession).length > 0 : false;
+  const hasActionableAskAnswers = activeSession
+    ? collectAskExchanges(activeSession).some((exchange) => !exchange.abstain && (exchange.evidence?.length ?? 0) > 0)
+    : false;
   const actionSheetLanguage = activeSession?.language ?? language;
   const actionSheetLabels = ACTION_SHEET_LABELS[actionSheetLanguage];
 
@@ -2034,7 +2175,7 @@ export default function Home() {
   const downloadActionSheet = useCallback(async () => {
     const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
     if (!session?.docId || isExportingActionSheet) return;
-    if (!collectAskExchanges(session).length) return;
+    if (!collectAskExchanges(session).some((exchange) => !exchange.abstain && (exchange.evidence?.length ?? 0) > 0)) return;
 
     const documentName =
       sampleNamesRef.current[session.docId] ??
@@ -2089,11 +2230,11 @@ export default function Home() {
             <>
               <button onClick={() => setViewMode("voice")} aria-label="Back to voice" className="icon-button"><ChevronLeft size={20} strokeWidth={1.8} /></button>
               <span className="text-sm font-semibold text-slate-700">Conversation</span>
-              <button onClick={() => setSessionPickerOpen(true)} aria-label="Open chats" className="icon-button"><Menu size={19} strokeWidth={1.8} /></button>
+              <span className="icon-button pointer-events-none opacity-0" aria-hidden><ChevronLeft size={20} /></span>
             </>
           ) : (
             <>
-              <button onClick={() => setViewMode("history")} aria-label="Open conversation history" className="icon-button"><Menu size={19} strokeWidth={1.8} /></button>
+              <button onClick={() => setSessionPickerOpen(true)} aria-label="Open chats" className="icon-button"><Menu size={19} strokeWidth={1.8} /></button>
               <div className="flex items-center gap-2" aria-label="Setu"><img src="/logo.png" alt="Setu" width={117} height={64} className="h-8 w-auto select-none" draggable={false} /><span className="font-display text-[26px] leading-none tracking-[-0.04em]">Setu</span></div>
               <button onClick={() => void openSettings()} aria-label="Open settings" className="icon-button"><Settings2 size={18} strokeWidth={1.8} /></button>
             </>
@@ -2161,7 +2302,7 @@ export default function Home() {
                 {isRecording ? <Square size={16} fill="currentColor" /> : <Mic size={20} strokeWidth={2} />}
               </button>
             </div>
-            {docId && hasAskAnswers && (
+            {docId && hasActionableAskAnswers && (
               <button
                 type="button"
                 onClick={() => void downloadActionSheet()}
@@ -2269,9 +2410,20 @@ export default function Home() {
       <AnimatePresence>{isSettingsOpen && <motion.button key="sound-toggle" initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 30 }} onClick={() => setSoundOn((enabled) => !enabled)} className="absolute right-8 top-[232px] z-[11] flex items-center gap-2 rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">{soundOn ? <Volume2 size={15} /> : <VolumeX size={15} />}{soundOn ? "Sound on" : "Muted"}</motion.button>}</AnimatePresence>
       <AnimatePresence>
         {sessionPickerOpen && (
+          <>
+          <motion.button
+            key="history-drawer-backdrop"
+            type="button"
+            aria-label="Close chats"
+            className="absolute inset-0 z-20 bg-black/20 backdrop-blur-[1px]"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setSessionPickerOpen(false)}
+          />
           <motion.aside
             key="history-drawer"
-            className="absolute inset-y-0 left-0 z-10 flex w-full max-w-none flex-col border-r border-slate-200/70 bg-white/90 p-6 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] shadow-[16px_0_48px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:w-[86%] sm:max-w-sm"
+            className="absolute inset-y-0 left-0 z-30 flex w-full max-w-none flex-col border-r border-slate-200/70 bg-white/95 p-6 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] shadow-[16px_0_48px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:w-[86%] sm:max-w-sm"
             initial={{ x: "-100%" }}
             animate={{ x: 0 }}
             exit={{ x: "-100%" }}
@@ -2310,6 +2462,7 @@ export default function Home() {
             </div>
             <button onClick={clearAllSessions} className="mt-4 min-h-11 w-full rounded-2xl border border-red-100 bg-red-50 py-3 text-sm font-medium text-red-600">Clear all</button>
           </motion.aside>
+          </>
         )}
       </AnimatePresence>
       <AnimatePresence>

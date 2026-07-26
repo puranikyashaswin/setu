@@ -41,4 +41,16 @@ Open http://localhost:3000.
 
 `npm run dev` uses **webpack** (stable on macOS). Turbopack is optional: `npm run dev:turbo`.
 
+## Deploy as a PWA
+
+Setu is installable after deployment over HTTPS. The service worker caches only the app shell and static assets; document scans, transcripts, answers, and audio always stay network-only.
+
+1. Deploy `web/` to Vercel (or any Next.js-compatible host).
+2. Deploy `api/` to a persistent Python host, such as Render, Railway, or Fly.io.
+3. In the frontend deployment environment, set `NEXT_PUBLIC_API_URL` to the public HTTPS URL of the API.
+4. In the API deployment environment, set `SARVAM_API_KEY` and `FRONTEND_ORIGIN` to the public frontend URL.
+5. Open the deployed site on a phone and use the browser's **Install app** / **Add to Home Screen** action.
+
+Microphone and camera access require HTTPS in production.
+
 

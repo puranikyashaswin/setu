@@ -598,20 +598,11 @@ def _cap_chat_history(
     history: list[dict] | None,
     *,
     requested_language: str | None = None,
-    max_turns: int = 6,
-    max_chars: int = 2000,
+    max_turns: int = 12,
+    max_chars: int = 6000,
 ) -> list[dict]:
-    """Normalize + trim prior turns. Drop all history on language switch."""
+    """Normalize and trim prior turns while retaining context across languages."""
     if not history:
-        return []
-    req = _lang_base(requested_language)
-    prev = _history_language(history)
-    if req and prev and req != prev:
-        logger.info(
-            "[history] dropped — language switch prev=%s requested=%s",
-            prev,
-            req,
-        )
         return []
     out: list[dict] = []
     for item in history[-max_turns:]:
@@ -663,7 +654,9 @@ def chat_reply(
         f"The user may write in any language or script — ignore that completely "
         f"and always answer in {language_name}. "
         f"You are Setu, a helpful voice assistant for India. {doc_rule} "
-        "Use prior conversation turns for follow-ups. Reply in ONE short sentence. "
+        "Use prior conversation turns for follow-ups. A language switch is not a new "
+        "conversation: never greet the user again or restart the introduction after one. "
+        "Reply in ONE short sentence. "
         f"CRITICAL: Your entire reply must be in {language_name} script only."
     )
     history_msgs = _cap_chat_history(history, requested_language=language)
