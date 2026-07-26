@@ -640,23 +640,53 @@ type ApiHistoryMessage = { role: string; content: string; language?: Language };
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 const LANGUAGE_LABELS: Record<Language, string> = { te: "Telugu", hi: "Hindi", en: "English", mr: "Marathi", ta: "Tamil", kn: "Kannada", bn: "Bengali", gu: "Gujarati", ml: "Malayalam", pa: "Punjabi", or: "Odia" };
 /** Match language names in English, native script, and common transliteration — anywhere in the transcript. */
-const EXPLICIT_LANGUAGE: [RegExp, Language][] = [
-  [/\b(telugu|telugulo)\b|తెలుగు/i, "te"],
-  [/\bhindi\b|हिंदी|हिन्दी/i, "hi"],
-  [/\bmarathi\b|मराठी/i, "mr"],
-  [/\btamil\b|தமிழ்/i, "ta"],
-  [/\bkannada\b|ಕನ್ನಡ/i, "kn"],
-  [/\b(bengali|bangla)\b|বাংলা/i, "bn"],
-  [/\bgujarati\b|ગુજરાતી/i, "gu"],
-  [/\bmalayalam\b|മലയാളം/i, "ml"],
-  [/\bpunjabi\b|ਪੰਜਾਬੀ/i, "pa"],
-  [/\b(odia|oriya|odisha)\b|ଓଡ଼ିଆ/i, "or"],
-  [/\b(english|angrezi)\b/i, "en"],
-];
-const LANGUAGE_NAME_TOKEN = "telugu|telugulo|hindi|marathi|tamil|kannada|bengali|bangla|gujarati|malayalam|punjabi|odia|oriya|odisha|english|angrezi|తెలుగు|हिंदी|हिन्दी|मराठी|தமிழ்|ಕನ್ನಡ|বাংলা|ગુજરાતી|മലയാളം|ਪੰਜਾਬੀ|ଓଡ଼ିଆ";
-// Short language-switch only — bare name or "speak/switch to X".
+/**
+ * A language name may arrive in ANY script: asking for Hindi while speaking Telugu
+ * transcribes as "హిందీ", not "हिंदी". Every spelling below must map to its language
+ * or the switch silently fails.
+ */
+const LANGUAGE_NAME_VARIANTS: Record<Language, string[]> = {
+  te: ["telugu", "telugulo", "telgu", "తెలుగు", "तेलुगु", "तेलगू", "ತೆಲುಗು", "தெலுங்கு", "তেলুগু", "ટેલુગુ", "തെലുങ്ക്", "ਤੇਲਗੂ", "ତେଲୁଗୁ"],
+  hi: ["hindi", "hindee", "हिंदी", "हिन्दी", "హిందీ", "ಹಿಂದಿ", "ஹிந்தி", "இந்தி", "হিন্দি", "હિન્દી", "ഹിന്ദി", "ਹਿੰਦੀ", "ହିନ୍ଦୀ"],
+  mr: ["marathi", "मराठी", "మరాఠీ", "ಮರಾಠಿ", "மராத்தி", "মারাঠি", "મરાઠી", "മറാത്തി", "ਮਰਾਠੀ", "ମରାଠୀ"],
+  ta: ["tamil", "தமிழ்", "तमिल", "तमिळ", "తమిళ", "ತಮಿಳು", "তামিল", "તમિલ", "തമിഴ്", "ਤਮਿਲ", "ତାମିଲ"],
+  kn: ["kannada", "ಕನ್ನಡ", "कन्नड", "कन्नड़", "కన్నడ", "கன்னடம்", "কন্নড়", "કન્નડ", "കന്നഡ", "ਕੰਨੜ", "କନ୍ନଡ"],
+  bn: ["bengali", "bangla", "বাংলা", "बंगाली", "बांग्ला", "బెంగాలీ", "ಬಂಗಾಳಿ", "வங்காளம்", "બંગાળી", "ബംഗാളി", "ਬੰਗਾਲੀ", "ବଙ୍ଗଳା"],
+  gu: ["gujarati", "ગુજરાતી", "गुजराती", "గుజరాతీ", "ಗುಜರಾತಿ", "குஜராத்தி", "গুজরাটি", "ഗുജറാത്തി", "ਗੁਜਰਾਤੀ", "ଗୁଜରାଟୀ"],
+  ml: ["malayalam", "മലയാളം", "मलयालम", "మలయాళం", "ಮಲಯಾಳಂ", "மலையாளம்", "মালয়ালম", "મલયાલમ", "ਮਲਿਆਲਮ", "ମାଲାୟାଲମ"],
+  pa: ["punjabi", "panjabi", "ਪੰਜਾਬੀ", "पंजाबी", "పంజాబీ", "ಪಂಜಾಬಿ", "பஞ்சாபி", "পাঞ্জাবি", "પંજાબી", "പഞ്ചാബി", "ପଞ୍ଜାବୀ"],
+  or: ["odia", "oriya", "odisha", "ଓଡ଼ିଆ", "ଓଡିଆ", "उड़िया", "ఒడియా", "ಒಡಿಯಾ", "ஒடியா", "ওড়িয়া", "ઓડિયા", "ഒഡിയ", "ਉੜੀਆ"],
+  en: ["english", "angrezi", "angreji", "इंग्लिश", "अंग्रेजी", "अंग्रेज़ी", "ఇంగ్లీష్", "ఆంగ్ల", "ಇಂಗ್ಲಿಷ್", "ஆங்கிலம்", "ইংরেজি", "અંગ્રેજી", "ഇംഗ്ലീഷ്", "ਅੰਗਰੇਜ਼ੀ", "ଇଂରାଜୀ"],
+};
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Latin names need word boundaries; native scripts must match bare (no \b support). */
+function languageVariantPattern(variants: string[]) {
+  const latin = variants.filter((name) => /^[a-z\s]+$/i.test(name)).map(escapeRegExp);
+  const native = variants.filter((name) => !/^[a-z\s]+$/i.test(name)).map(escapeRegExp);
+  const parts: string[] = [];
+  if (latin.length) parts.push(`\\b(?:${latin.join("|")})\\b`);
+  if (native.length) parts.push(`(?:${native.join("|")})`);
+  return parts.join("|");
+}
+
+const EXPLICIT_LANGUAGE: [RegExp, Language][] = (
+  Object.entries(LANGUAGE_NAME_VARIANTS) as [Language, string[]][]
+).map(([code, variants]) => [new RegExp(languageVariantPattern(variants), "i"), code]);
+
+const LANGUAGE_NAME_TOKEN = Object.values(LANGUAGE_NAME_VARIANTS)
+  .flat()
+  .map(escapeRegExp)
+  .join("|");
+/**
+ * Language-switch requests, including polite full sentences like
+ * "can you change the language to Hindi?" — filler words are stripped first.
+ */
 const LANGUAGE_CHANGE = new RegExp(
-  `^(please\\s+)?((speak|talk|switch|change|use)(\\s+to)?\\s+(in\\s+)?)?(${LANGUAGE_NAME_TOKEN})(\\s+please)?[.!?]*$`,
+  `^(?:${LANGUAGE_NAME_TOKEN})$|^(?:can|could|will|would|please|kya|kripya)?\\s*(?:you|we)?\\s*(?:please\\s+)?(?:speak|talk|say|reply|respond|answer|switch|change|use|set|convert|baat|bolo|maatlaadu)\\w*\\s+(?:the\\s+)?(?:language\\s+)?(?:it\\s+)?(?:in|into|to|me|mein|lo)?\\s*(?:${LANGUAGE_NAME_TOKEN})\\s*(?:language)?\\s*(?:please)?[.!?]*$`,
   "i",
 );
 const SILENCE_MS = 900;
@@ -665,8 +695,20 @@ const MAX_RECORDING_MS = 15000;
 const NO_SPEECH_MS = 4500;
 const VOICE_LANGUAGE_PROMPT =
   "Welcome to Setu. Which language would you like to speak in? Say Telugu, Hindi, English, Tamil, Kannada, or any Indian language you prefer.";
-const SPEECH_LEVEL = 0.008;
+const SPEECH_LEVEL = 0.018;
 const AMBIENT_MS = 300;
+/** Consecutive loud frames (~85ms each) before we believe it is real speech, not a tap or cough. */
+const SPEECH_FRAMES_TO_CONFIRM = 2;
+/**
+ * Total speech needed before a turn is sent to STT. Kept low: real one-word answers
+ * ("hello", "Telugu") are only ~300ms of voiced audio and must never be dropped.
+ */
+const MIN_SPEECH_MS = 200;
+/**
+ * Only transcription artifacts that appear on genuinely silent audio. Ordinary short
+ * words like "hello" or "bye" are real user speech and must NOT be listed here.
+ */
+const STT_NOISE_ONLY = /^(?:thanks\s+for\s+watching|please\s+subscribe|subtitles?\s+by.*|amara\.org.*|[.,!?…\-—\s]+)$/i;
 const CAPTURE_STREAK = 3;
 const CAPTURE_CELL_EDGE = 0.10; // local text density inside a grid cell
 const CAPTURE_PEAK_EDGE = 0.12; // strongest cell must look like text/print
@@ -715,11 +757,14 @@ function isLanguageChangeOnly(transcript: string, language: Language | undefined
   const normalized = transcript
     .toLowerCase()
     .replace(/[.,!?]/g, " ")
-    .replace(/\b(speak|talk|reply|respond|in|language|please|switch|to)\b/g, " ")
+    .replace(
+      /\b(can|could|would|will|shall|you|we|please|kindly|speak|talk|say|reply|respond|answer|switch|change|use|set|convert|the|language|in|into|to|me|mein|lo|kripya|kya|baat|karo|bolo|maatlaadu)\b/g,
+      " ",
+    )
     .replace(/\s+/g, " ")
     .trim();
-  const languageName = LANGUAGE_LABELS[language].toLowerCase();
-  return normalized === languageName;
+  const variants = LANGUAGE_NAME_VARIANTS[language].map((name) => name.toLowerCase());
+  return variants.includes(normalized) || normalized === LANGUAGE_LABELS[language].toLowerCase();
 }
 
 function resolveLanguage(transcript: string, apiLanguage?: string): Language {
@@ -1219,6 +1264,9 @@ export default function Home() {
     ambientCount: number;
     thresholdLocked: boolean;
     lastLogAt: number;
+    speechRunFrames: number;
+    speechFrames: number;
+    frameMs: number;
   } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -1235,6 +1283,8 @@ export default function Home() {
   const sampleNamesRef = useRef<Record<string, string>>({});
   const languageRef = useRef<Language>("en");
   const languageLockedRef = useRef(false);
+  /** Consecutive turns thrown away as noise — stops a hot re-listen loop in a loud room. */
+  const noiseDiscardsRef = useRef(0);
   const docIdRef = useRef<string | null>(null);
   const sessionsRef = useRef<Session[]>([]);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -1905,8 +1955,20 @@ export default function Home() {
     cancelAnimationFrame(recorder.raf); recorder.processor.disconnect(); recorder.silenceGain.disconnect(); recorder.source.disconnect(); recorder.stream.getTracks().forEach((track) => track.stop());
     isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
-    if (cancelled || !recorder.heardSpeech) {
+    const speechMs = recorder.speechFrames * recorder.frameMs;
+    const tooLittleSpeech = !cancelled && recorder.heardSpeech && speechMs < MIN_SPEECH_MS;
+    if (cancelled || !recorder.heardSpeech || tooLittleSpeech) {
+      orbStateRef.current = "idle";
       setOrbState("idle");
+      // Keep listening through short room noise instead of answering it.
+      if (tooLittleSpeech && noiseDiscardsRef.current < 3) {
+        noiseDiscardsRef.current += 1;
+        console.info("[Setu mic] ignored noise", { speechMs: Math.round(speechMs) });
+        setStatusText("Listening…");
+        window.setTimeout(() => startRecordingRef.current?.({ force: true }), 120);
+        return;
+      }
+      noiseDiscardsRef.current = 0;
       setStatusText("Tap to continue");
       return;
     }
@@ -1926,6 +1988,18 @@ export default function Home() {
       const heard = listenResult.transcript.trim();
       setService(null); setTranscript(heard);
       if (!heard) throw new Error("I could not understand that. Try again.");
+      // Short audio that transcribes to a stock filler is almost always invented by STT.
+      if (speechMs < 1100 && STT_NOISE_ONLY.test(heard) && noiseDiscardsRef.current < 3) {
+        noiseDiscardsRef.current += 1;
+        console.info("[Setu mic] ignored likely hallucination", { heard, speechMs: Math.round(speechMs) });
+        orbStateRef.current = "idle";
+        setOrbState("idle");
+        setTranscript("");
+        setStatusText("Listening…");
+        window.setTimeout(() => startRecordingRef.current?.({ force: true }), 120);
+        return;
+      }
+      noiseDiscardsRef.current = 0;
       const detected = listenResult.language_code?.toLowerCase().split("-", 1)[0] || "unknown";
       const requestedLanguage = explicitLanguage(heard);
       const activeLanguage = languageRef.current;
@@ -1962,10 +2036,8 @@ export default function Home() {
       if (requestedLanguage && (isLanguageChangeOnly(heard, requestedLanguage) || LANGUAGE_CHANGE.test(heard))) {
         const reply = LANGUAGE_SWITCH_CONFIRMATION[resolvedLanguage];
         addTurn({ userText: heard, setuText: reply, language: resolvedLanguage, ...(docIdRef.current ? { docId: docIdRef.current } : {}) });
-        // Confirm the switch, then wait — do not auto-open the mic.
-        await playSpeech(reply, resolvedLanguage, false);
-        setOrbState("idle");
-        setStatusText("Tap to continue");
+        // Confirm the switch and stay hands-free in the new language.
+        await playSpeech(reply, resolvedLanguage, true);
         logTurnTiming(turnTimingRef.current);
         return;
       }
@@ -2105,6 +2177,9 @@ export default function Home() {
         ambientCount: 0,
         thresholdLocked: false,
         lastLogAt: 0,
+        speechRunFrames: 0,
+        speechFrames: 0,
+        frameMs: (4096 / context.sampleRate) * 1000,
       };
       recorderRef.current = recorder;
       setTranscript("");
@@ -2157,14 +2232,22 @@ export default function Home() {
           return;
         }
         if (isSpeech) {
-          recorder.heardSpeech = true;
-          recorder.silentSince = null;
-          setAutoStopProgress(0);
-        } else if (recorder.heardSpeech && elapsed >= MIN_RECORDING_MS) {
-          recorder.silentSince ??= now;
-          const silentFor = now - recorder.silentSince;
-          setAutoStopProgress(Math.max(0, (silentFor - (SILENCE_MS - 300)) / 300));
-          if (silentFor >= SILENCE_MS) void finishRecording();
+          recorder.speechRunFrames += 1;
+          recorder.speechFrames += 1;
+          // A single spike is a tap or a door — only a sustained run counts as speech.
+          if (recorder.speechRunFrames >= SPEECH_FRAMES_TO_CONFIRM) {
+            recorder.heardSpeech = true;
+            recorder.silentSince = null;
+            setAutoStopProgress(0);
+          }
+        } else {
+          recorder.speechRunFrames = 0;
+          if (recorder.heardSpeech && elapsed >= MIN_RECORDING_MS) {
+            recorder.silentSince ??= now;
+            const silentFor = now - recorder.silentSince;
+            setAutoStopProgress(Math.max(0, (silentFor - (SILENCE_MS - 300)) / 300));
+            if (silentFor >= SILENCE_MS) void finishRecording();
+          }
         }
 
         if (now - recorder.lastLogAt >= 100) {

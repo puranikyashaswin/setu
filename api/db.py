@@ -172,7 +172,12 @@ def upsert_session(payload: dict) -> dict:
     now = time.time()
     session_id = payload.get("id") or str(uuid.uuid4())
     with _connect() as conn:
-        existing = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        existing = conn.execute(
+            "SELECT id, user_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if existing and existing["user_id"] != payload["user_id"]:
+            # A session id belongs to exactly one user; never let another user overwrite it.
+            raise PermissionError("Session belongs to a different user")
         if existing:
             conn.execute(
                 """
@@ -246,7 +251,7 @@ def recent_session_summaries(user_id: str, exclude_session_id: str | None = None
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, language, summary, updated_at
+            SELECT id, title, language, summary, document_name, updated_at
             FROM sessions
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -261,6 +266,49 @@ def recent_session_summaries(user_id: str, exclude_session_id: str | None = None
         out.append(dict(row))
         if len(out) >= limit:
             break
+    return out
+
+
+def recent_session_digests(
+    user_id: str,
+    exclude_session_id: str | None = None,
+    limit: int = 4,
+    turns_per_session: int = 6,
+) -> list[dict]:
+    """Recent chats with their last few turns, so Setu can recall actual content."""
+    sessions = recent_session_summaries(user_id, exclude_session_id, limit=limit)
+    if not sessions:
+        return []
+    out: list[dict] = []
+    with _connect() as conn:
+        for session in sessions:
+            rows = conn.execute(
+                """
+                SELECT role, text FROM turns
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (session["id"], turns_per_session),
+            ).fetchall()
+            turns = [
+                {"role": row["role"], "text": (row["text"] or "").strip()}
+                for row in reversed(rows)
+                if (row["text"] or "").strip()
+                and (row["text"] or "").strip() not in {"Start conversation", "Scanned document"}
+            ]
+            if not turns and not (session.get("summary") or "").strip():
+                continue
+            out.append(
+                {
+                    "id": session["id"],
+                    "title": session.get("title") or "Chat",
+                    "summary": (session.get("summary") or "").strip(),
+                    "document_name": session.get("document_name"),
+                    "updated_at": session.get("updated_at"),
+                    "turns": turns,
+                }
+            )
     return out
 
 

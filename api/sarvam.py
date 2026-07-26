@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 
 logger = logging.getLogger("setu")
@@ -226,12 +227,59 @@ def v3_speakers() -> list[str]:
     return sorted(_V3_SPEAKERS)
 
 
+_TTS_CACHE_DIR = _CACHE_DIR / "tts"
+_TTS_MEMORY: "OrderedDict[str, bytes]" = OrderedDict()
+_TTS_MEMORY_MAX = 64
+
+
+def _tts_cache_key(text: str, lang: str, voice: str, pace: float) -> str:
+    raw = f"{lang}|{voice}|{pace:.2f}|{text}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def _tts_cache_get(key: str) -> bytes | None:
+    hit = _TTS_MEMORY.get(key)
+    if hit is not None:
+        _TTS_MEMORY.move_to_end(key)
+        return hit
+    path = _TTS_CACHE_DIR / f"{key}.wav"
+    try:
+        if path.is_file():
+            data = path.read_bytes()
+            _TTS_MEMORY[key] = data
+            _TTS_MEMORY.move_to_end(key)
+            while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
+                _TTS_MEMORY.popitem(last=False)
+            return data
+    except OSError:
+        logger.warning("[speak] cache read failed key=%s", key, exc_info=True)
+    return None
+
+
+def _tts_cache_put(key: str, data: bytes) -> None:
+    _TTS_MEMORY[key] = data
+    _TTS_MEMORY.move_to_end(key)
+    while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
+        _TTS_MEMORY.popitem(last=False)
+    try:
+        _TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (_TTS_CACHE_DIR / f"{key}.wav").write_bytes(data)
+    except OSError:
+        logger.warning("[speak] cache write failed key=%s", key, exc_info=True)
+
+
 def speak(
     text: str, language: str, speaker: str = "shubh", pace: float = 1.0
 ) -> bytes:
     client = get_client()
     voice = resolve_speaker(speaker)
     lang = _lang_code(language)
+    # Intros and confirmations repeat constantly; synthesizing them again costs seconds.
+    key = _tts_cache_key(text, lang, voice, pace)
+    cached = _tts_cache_get(key)
+    if cached is not None:
+        logger.info("[speak] cache hit language=%s chars=%s", lang, len(text))
+        return cached
 
     def call():
         return client.text_to_speech.convert(
@@ -253,7 +301,9 @@ def speak(
             exc,
         )
         raise
-    return _tts_to_wav(resp)
+    audio = _tts_to_wav(resp)
+    _tts_cache_put(key, audio)
+    return audio
 
 
 def listen(audio_bytes: bytes, filename: str, language: str | None = None) -> dict:
@@ -764,7 +814,11 @@ def chat_reply(
             "to show it to the camera — never say paste."
         )
     memory_block = (
-        f" Persistent memory from earlier chats:\n{memory_context}\n"
+        "\nMEMORY — this user's earlier chats with you:\n"
+        f"{memory_context}\n"
+        "If the user refers to an earlier conversation (\"we spoke about\", \"last time\", "
+        "\"remember\"), confirm that you remember and state the specific detail from MEMORY. "
+        "Never claim you cannot remember when MEMORY contains the answer.\n"
         if memory_context
         else ""
     )
@@ -776,7 +830,7 @@ def chat_reply(
         f"{memory_block}"
         "Use prior conversation turns for follow-ups. A language switch is not a new "
         "conversation: never greet the user again or restart the introduction after one. "
-        "Reply in ONE short sentence. "
+        "Reply in ONE or TWO short sentences. "
         f"CRITICAL: Your entire reply must be in {language_name} script only."
     )
     history_msgs = _cap_chat_history(history, requested_language=language)
@@ -803,7 +857,7 @@ def chat_reply(
             model="sarvam-30b",
             messages=messages,
             reasoning_effort=None,  # required — thinking + low max_tokens → empty content
-            max_tokens=60,
+            max_tokens=140,
             temperature=0.2,
         )
 

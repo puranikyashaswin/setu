@@ -56,20 +56,56 @@ def _frontend_origins() -> list[str]:
 
 
 def _memory_context(user_id: str | None, session_id: str | None = None) -> str | None:
+    """Digest of the user's recent chats, including real turns so Setu can recall them."""
     if not user_id:
         return None
-    recent = db.recent_session_summaries(user_id, exclude_session_id=session_id, limit=5)
+    recent = db.recent_session_digests(user_id, exclude_session_id=session_id, limit=4)
     if not recent:
         return None
-    lines = []
-    for item in recent:
-        summary = (item.get("summary") or item.get("title") or "Chat").strip()
-        lines.append(f"- {summary}")
-    return "\n".join(lines)
+    blocks: list[str] = []
+    for index, item in enumerate(recent, start=1):
+        header = f"Earlier chat {index}: {item.get('title') or 'Chat'}"
+        if item.get("document_name"):
+            header += f" (document: {item['document_name']})"
+        lines = [header]
+        if item.get("summary"):
+            lines.append(f"  summary: {item['summary']}")
+        for turn in item.get("turns") or []:
+            speaker = "User" if turn["role"] == "user" else "Setu"
+            text = turn["text"]
+            if len(text) > 180:
+                text = text[:180].rstrip() + "…"
+            lines.append(f"  {speaker}: {text}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
 
 
 def _user_from_header(x_user_id: str | None) -> dict:
     return auth.resolve_user(x_user_id)
+
+
+# Onboarding languages judges are most likely to pick, warmed first.
+_INTRO_WARM_LANGUAGES = ["en", "hi", "te", "kn", "ta", "mr"]
+
+
+def _warm_intro_tts() -> None:
+    """Synthesize the fixed intros once so the first user never waits ~6s for TTS."""
+    for language in _INTRO_WARM_LANGUAGES:
+        try:
+            text = sarvam.intro_for_language(language)
+            t0 = time.perf_counter()
+            sarvam.speak(text, language)
+            logger.info(
+                "Warmed intro TTS language=%s in %.2fs", language, time.perf_counter() - t0
+            )
+        except Exception:
+            logger.warning("Intro TTS warm failed language=%s", language, exc_info=True)
+
+
+def _start_intro_tts_warm() -> None:
+    if not os.getenv("SARVAM_API_KEY"):
+        return
+    threading.Thread(target=_warm_intro_tts, name="intro-tts-warm", daemon=True).start()
 
 
 @asynccontextmanager
@@ -110,6 +146,7 @@ async def lifespan(_app: FastAPI):
             )
         except Exception:
             logger.exception("Failed to pre-cache sample %s", sample["file"])
+    _start_intro_tts_warm()
     yield
 
 
@@ -279,7 +316,10 @@ def sessions_put(session_id: str, body: SessionUpsertBody, x_user_id: str | None
     payload["user_id"] = user["id"]
     if payload.get("created_at") and payload["created_at"] > 10_000_000_000:
         payload["created_at"] = payload["created_at"] / 1000
-    session = db.upsert_session(payload)
+    try:
+        session = db.upsert_session(payload)
+    except PermissionError:
+        raise HTTPException(403, "Session belongs to a different user") from None
     return {"ok": True, "id": session.get("id"), "user_id": user["id"]}
 
 
