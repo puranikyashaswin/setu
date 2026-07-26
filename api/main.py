@@ -175,6 +175,9 @@ class ConverseBody(BaseModel):
     history: list[HistoryMessage] = Field(default_factory=list)
     session_id: str | None = None
     user_id: str | None = None
+    # The browser keeps every chat in IndexedDB. On a host with an ephemeral disk the
+    # server database can be empty, so the client's own digest is the reliable source.
+    memory: str | None = Field(default=None, max_length=6000)
 
 
 class AskBody(BaseModel):
@@ -462,12 +465,13 @@ def converse(body: ConverseBody):
                 "intent": "document_question",
                 "reply": "",
             }
+        client_memory = (body.memory or "").strip()
         result = sarvam.chat_reply(
             body.message,
             body.language,
             body.has_document,
             history=[m.model_dump() for m in body.history],
-            memory_context=_memory_context(body.user_id, body.session_id),
+            memory_context=client_memory or _memory_context(body.user_id, body.session_id),
         )
         return {
             "redirect": False,

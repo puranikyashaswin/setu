@@ -927,9 +927,17 @@ function titleFromTurns(turns: Turn[]) {
     && turn.text !== "Start conversation"
     && turn.text !== "Scanned document"
   ));
-  if (!firstUser) return "New chat";
-  const words = firstUser.text.trim().split(/\s+/).filter(Boolean).slice(0, 6);
-  return words.join(" ") || "New chat";
+  if (firstUser) {
+    const words = firstUser.text.trim().split(/\s+/).filter(Boolean).slice(0, 6);
+    if (words.length) return words.join(" ");
+  }
+  // A scan-only chat still deserves a real name, in the list and in cross-chat memory.
+  const summary = turns.find((turn) => turn.role === "setu" && turn.kind === "summary");
+  if (summary) {
+    const words = summary.text.trim().split(/\s+/).filter(Boolean).slice(0, 6);
+    if (words.length) return words.join(" ");
+  }
+  return "New chat";
 }
 
 function relativeTime(timestamp: number) {
@@ -1399,6 +1407,29 @@ export default function Home() {
     return historyForApi(session?.turns ?? []);
   }, []);
 
+  /**
+   * Digest of the user's other chats, built from local storage. Sent with every reply
+   * request so recall keeps working even when the server database has been reset.
+   */
+  const getMemoryPayload = useCallback(() => {
+    const others = sessionsRef.current
+      .filter((session) => session.id !== activeSessionIdRef.current && session.turns.length > 0)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 4);
+    if (!others.length) return null;
+    const blocks = others.map((session, index) => {
+      const lines = [`Earlier chat ${index + 1}: ${session.title || "Chat"}${session.documentName ? ` (document: ${session.documentName})` : ""}`];
+      for (const turn of session.turns.slice(-6)) {
+        if (turn.text === "Start conversation" || turn.text === "Scanned document") continue;
+        const speaker = turn.role === "user" ? "User" : "Setu";
+        const text = turn.text.length > 180 ? `${turn.text.slice(0, 180).trimEnd()}…` : turn.text;
+        lines.push(`  ${speaker}: ${text}`);
+      }
+      return lines.join("\n");
+    });
+    return blocks.join("\n").slice(0, 6000) || null;
+  }, []);
+
   const addTurn = useCallback((turn: {
     userText: string;
     setuText: string;
@@ -1705,6 +1736,7 @@ export default function Home() {
       history: getHistoryPayload(),
       session_id: activeSessionIdRef.current,
       user_id: userIdRef.current ?? getStoredUserId(),
+      memory: getMemoryPayload(),
     };
     console.info("[Setu /converse]", payload);
     const converseStarted = performance.now();
@@ -1714,7 +1746,7 @@ export default function Home() {
     turnTimingRef.current.converse += converseMs;
     if (!response.ok) throw new Error("Conversation service unavailable");
     return response.json() as Promise<{ reply: string; intent: "chat" | "needs_document" | "document_question" }>;
-  }, [getHistoryPayload]);
+  }, [getHistoryPayload, getMemoryPayload]);
 
   const clearDocument = useCallback(() => {
     setDocId(null);
@@ -2396,6 +2428,23 @@ export default function Home() {
   }, [sessions, activeSessionId, sessionsLoaded, syncSessionToServer]);
 
   useEffect(() => () => { recorderRef.current?.stream.getTracks().forEach((track) => track.stop()); audioRef.current?.pause(); previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url)); }, []);
+
+  // Hold a wake lock while the conversation is live so the phone cannot lock mid-answer.
+  useEffect(() => {
+    const conversationLive = orbState !== "idle" || isRecording;
+    let sentinel: WakeLockSentinel | null = null;
+    let released = false;
+    if (conversationLive && "wakeLock" in navigator) {
+      void navigator.wakeLock.request("screen").then((lock) => {
+        if (released) { void lock.release(); return; }
+        sentinel = lock;
+      }).catch(() => { /* denied or unsupported — conversation still works */ });
+    }
+    return () => {
+      released = true;
+      if (sentinel && !sentinel.released) void sentinel.release().catch(() => {});
+    };
+  }, [orbState, isRecording]);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null;
   const activeCorrections = activeSession ? sessionCorrections(activeSession) : [];

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 
-_DB_PATH = Path(__file__).resolve().parent / "cache" / "setu.db"
+# Set SETU_DB_PATH to a mounted disk (e.g. /var/data/setu.db on Render) so chat history
+# survives restarts; the default lives beside the code and is lost on ephemeral hosts.
+_DB_PATH = Path(
+    os.getenv("SETU_DB_PATH") or Path(__file__).resolve().parent / "cache" / "setu.db"
+)
 
 
 def _connect() -> sqlite3.Connection:

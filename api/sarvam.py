@@ -808,26 +808,24 @@ def chat_reply(
             "A document is already loaded. NEVER ask the user to paste, upload, "
             "show, or scan a document."
         )
+    elif memory_context:
+        # Without this, "what document did I show you?" hits the camera prompt and
+        # contradicts the memory Setu was just given.
+        doc_rule = (
+            "No document is loaded right now. Questions about a document you read in an "
+            "earlier chat must be answered from MEMORY. Only ask the user to show a "
+            "document to the camera when they want you to read a new one — never say paste."
+        )
     else:
         doc_rule = (
             "No document is loaded. If the user asks about a document, ask them "
             "to show it to the camera — never say paste."
         )
-    memory_block = (
-        "\nMEMORY — this user's earlier chats with you:\n"
-        f"{memory_context}\n"
-        "If the user refers to an earlier conversation (\"we spoke about\", \"last time\", "
-        "\"remember\"), confirm that you remember and state the specific detail from MEMORY. "
-        "Never claim you cannot remember when MEMORY contains the answer.\n"
-        if memory_context
-        else ""
-    )
     system = (
         f"CRITICAL: Your entire reply must be in {language_name} script only. "
         f"The user may write in any language or script — ignore that completely "
         f"and always answer in {language_name}. "
         f"You are Setu, a helpful voice assistant for India. {doc_rule} "
-        f"{memory_block}"
         "Use prior conversation turns for follow-ups. A language switch is not a new "
         "conversation: never greet the user again or restart the introduction after one. "
         "Reply in ONE or TWO short sentences. "
@@ -839,15 +837,43 @@ def chat_reply(
         f"Your entire next reply must be in {language_name} only "
         f"(native script for {language_name})."
     )
+    doc_state = (
+        "has_document=true"
+        if has_document
+        else "has_document=false (nothing in the camera now; earlier documents are in MEMORY)"
+        if memory_context
+        else "has_document=false"
+    )
     user_content = (
-        f"has_document={str(has_document).lower()}\n"
+        f"{doc_state}\n"
         f"User: {message}\n"
         f"(Reply in {language_name}.)"
+    )
+    # Memory sits next to the user turn rather than inside the long opening prompt:
+    # buried in the middle it got ignored and Setu claimed it had no record.
+    memory_msgs = (
+        [{
+            "role": "system",
+            "content": (
+                "MEMORY — real transcripts of this user's earlier chats with you. "
+                "These happened; treat them as your own recollection.\n"
+                f"{memory_context}\n"
+                "Whenever the user asks what you discussed, what you were doing, which "
+                "document they showed you, or anything else about the past, answer from "
+                "MEMORY and state the specific detail. A document named in MEMORY WAS "
+                "shown to you, so never reply that they have not shown you a document. "
+                "You are NEVER allowed to say you have no record, no access, or cannot "
+                "remember while MEMORY is present, and never ask the user to remind you."
+            ),
+        }]
+        if memory_context
+        else []
     )
     messages = [
         {"role": "system", "content": system},
         *history_msgs,
         {"role": "system", "content": lang_after},
+        *memory_msgs,
         {"role": "user", "content": user_content},
     ]
     _log_messages("/converse", messages)
