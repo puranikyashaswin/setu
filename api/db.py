@@ -109,9 +109,19 @@ def ensure_user(user_id: str | None = None, *, email: str | None = None, is_gues
                     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
                 return dict(row)
         new_id = user_id or str(uuid.uuid4())
+        # The client syncs a session on every state change, so two requests can reach
+        # this insert with the same new id at once; the loser must not 500.
         conn.execute(
-            "INSERT INTO users (id, email, is_guest, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
-            (new_id, email.lower() if email else None, 1 if is_guest and not email else 0, now, now),
+            "INSERT INTO users (id, email, is_guest, created_at, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_seen_at = ?",
+            (
+                new_id,
+                email.lower() if email else None,
+                1 if is_guest and not email else 0,
+                now,
+                now,
+                now,
+            ),
         )
         row = conn.execute("SELECT * FROM users WHERE id = ?", (new_id,)).fetchone()
         return dict(row)

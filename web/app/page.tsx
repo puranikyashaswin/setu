@@ -1275,6 +1275,8 @@ export default function Home() {
     speechRunFrames: number;
     speechFrames: number;
     frameMs: number;
+    framesSeen: number;
+    watchdog: number;
   } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -1353,6 +1355,32 @@ export default function Home() {
     if (!audioContextRef.current) audioContextRef.current = new AudioContextConstructor();
     return audioContextRef.current;
   }, []);
+
+  /**
+   * Resume the shared context, and rebuild it if the phone refuses. iOS will not resume a
+   * context outside a user gesture; while it stays suspended the meter gets no frames and
+   * TTS routed through it is silent. A fresh context starts running once audio is unlocked.
+   */
+  const ensureRunningAudioContext = useCallback(async () => {
+    let context = getAudioContext();
+    try {
+      await context.resume();
+    } catch { /* fall through to the rebuild below */ }
+    if (context.state === "running") return context;
+    console.warn("[Setu audio] context stuck suspended; rebuilding");
+    const AudioContextConstructor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextConstructor) return context;
+    try {
+      void context.close();
+    } catch { /* already closed */ }
+    audioSourceRef.current = null;
+    context = new AudioContextConstructor();
+    audioContextRef.current = context;
+    try {
+      await context.resume();
+    } catch { /* caller reports the failure through the mic watchdog */ }
+    return context;
+  }, [getAudioContext]);
 
   const playCue = useCallback((notes: number[], duration: number, volume = 0.08, noise = false) => {
     if (!soundOn) return;
@@ -1593,6 +1621,7 @@ export default function Home() {
     const recorder = recorderRef.current;
     if (!recorder) return;
     recorderRef.current = null;
+    window.clearInterval(recorder.watchdog);
     cancelAnimationFrame(recorder.raf);
     recorder.processor.disconnect();
     recorder.silenceGain.disconnect();
@@ -1650,7 +1679,9 @@ export default function Home() {
       const audio = new Audio(url);
       audioRef.current?.pause();
       audioRef.current = audio;
-      const context = getAudioContext();
+      // Playback is routed through the context for the orb meter, so a suspended context
+      // means total silence — repair it before wiring the graph, not after.
+      const context = await ensureRunningAudioContext();
       const analyser = context.createAnalyser();
       analyser.fftSize = 256;
       const source = context.createMediaElementSource(audio);
@@ -1682,7 +1713,6 @@ export default function Home() {
           setStatusText("Tap to speak");
         }
       };
-      await context.resume();
       await audio.play();
     } catch (error) {
       console.error(`[speak] language=${selectedLanguage} speaker=${voice}`, error);
@@ -1692,7 +1722,7 @@ export default function Home() {
       setService(null);
       if (continueListening) resumeListening();
     }
-  }, [getAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
+  }, [ensureRunningAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
 
   const syncSessionToServer = useCallback(async (session: Session) => {
     const userId = userIdRef.current ?? getStoredUserId();
@@ -1984,6 +2014,7 @@ export default function Home() {
     const recorder = recorderRef.current;
     if (!recorder) return;
     recorderRef.current = null;
+    window.clearInterval(recorder.watchdog);
     cancelAnimationFrame(recorder.raf); recorder.processor.disconnect(); recorder.silenceGain.disconnect(); recorder.source.disconnect(); recorder.stream.getTracks().forEach((track) => track.stop());
     isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
@@ -2187,7 +2218,7 @@ export default function Home() {
       audioRef.current = null;
     }
     try {
-      const context = getAudioContext(); await context.resume();
+      const context = await ensureRunningAudioContext();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const source = context.createMediaStreamSource(stream); const analyser = context.createAnalyser(); analyser.fftSize = 256;
       const processor = context.createScriptProcessor(4096, 1, 1); const silenceGain = context.createGain(); silenceGain.gain.value = 0;
@@ -2212,8 +2243,39 @@ export default function Home() {
         speechRunFrames: 0,
         speechFrames: 0,
         frameMs: (4096 / context.sampleRate) * 1000,
+        framesSeen: 0,
+        watchdog: 0,
       };
       recorderRef.current = recorder;
+      // Every stop rule below lives in processor.onaudioprocess. iOS Safari suspends the
+      // AudioContext outside a user gesture, so when the mic reopens by itself after Setu
+      // speaks that callback can never fire and the mic would stay open forever. This
+      // wall-clock timer is independent of the audio graph.
+      recorder.watchdog = window.setInterval(() => {
+        if (recorderRef.current !== recorder) {
+          window.clearInterval(recorder.watchdog);
+          return;
+        }
+        const elapsed = performance.now() - recorder.startedAt;
+        if (recorder.framesSeen === 0 && elapsed >= 1500) {
+          window.clearInterval(recorder.watchdog);
+          console.error("[Setu mic] no audio frames arrived", {
+            contextState: context.state,
+            elapsedMs: Math.round(elapsed),
+          });
+          void finishRecording(true);
+          setStatusText(
+            context.state === "running"
+              ? "Microphone gave no audio — tap to retry"
+              : "Microphone paused by the phone — tap to speak",
+          );
+          return;
+        }
+        if (elapsed >= MAX_RECORDING_MS + 1500) {
+          window.clearInterval(recorder.watchdog);
+          void finishRecording();
+        }
+      }, 250);
       setTranscript("");
       isRecordingFlagRef.current = true;
       setIsRecording(true); playCue([440, 660], 0.12, 0.07);
@@ -2236,6 +2298,7 @@ export default function Home() {
       processor.onaudioprocess = (event) => {
         const samples = new Float32Array(event.inputBuffer.getChannelData(0));
         recorder.chunks.push(samples);
+        recorder.framesSeen += 1;
         const rms = Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length);
         const now = performance.now();
         const elapsed = now - recorder.startedAt;
@@ -2302,7 +2365,7 @@ export default function Home() {
       setOrbState("idle");
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
     }
-  }, [finishRecording, getAudioContext, playCue]);
+  }, [ensureRunningAudioContext, finishRecording, playCue]);
 
   useEffect(() => {
     startRecordingRef.current = (options?: { force?: boolean }) => void startRecording(options);
