@@ -24,6 +24,11 @@ from sarvamai.core.api_error import ApiError
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 _cache: dict[str, dict] = {}
+_CACHE_DIR = Path(__file__).resolve().parent / "cache"
+_CACHE_FILE = _CACHE_DIR / "ocr_cache.json"
+_CORRECTIONS_FILE = _CACHE_DIR / "session_corrections.json"
+# session_id -> field -> {field, value, timestamp}
+_session_corrections: dict[str, dict[str, dict]] = {}
 _FORMAT_EXT = {"pdf": ".pdf", "png": ".png", "jpeg": ".jpg"}
 
 _LANG_NAMES = {
@@ -90,14 +95,26 @@ _V2_SPEAKERS = frozenset(
 # Rough signals that the user is asking about document content (route to /ask).
 _DOC_QUESTION_RE = re.compile(
     r"(eligib|last\s*date|deadline|due\s*date|how\s*much|amount|scheme|notice|"
-    r"form\b|page\s*\d|criteria|benefit|पात्र|तारीख|राशि|योजना|"
-    r"నోటీసు|తేదీ|ఎంత|పథకం|యోగ్య)",
+    r"form\b|page\s*\d|criteria|benefit|office|procedure|process|apply|"
+    r"document|fee|required|qualif|deadline|when\s+is|where\s+(do|can|is)|"
+    r"what\s+(is|does|are)\s+(the|this|my)|how\s+(do|can|much|many)|"
+    r"पात्र|तारीख|राशि|योजना|कार्यालय|प्रक्रिया|"
+    r"నోటీసు|తేదీ|ఎంత|పథకం|యోగ్య|కార్యాలయ)",
     re.I,
 )
 _NEEDS_DOC_RE = re.compile(
     r"(help\s*(me\s*)?(with\s*)?(this\s*)?(doc|document|paper|notice)|scan|"
     r"read\s*(this|my)|show\s*(you\s*)?(my\s*)?(doc|document|paper)|"
     r"दस्तावेज|काग[ज़ज]|नोटिस|స్కాన్)",
+    re.I,
+)
+# Only these may hit sarvam-30b via /converse. Everything else redirects to /ask.
+_CONVERSE_ALLOW_RE = re.compile(
+    r"(^\s*(hi+|hello|hey|namaste|namaskar|హలో|नमस्ते|नमस्कार)\b|"
+    r"\b(thanks|thank\s*you|thx|bye|goodbye|ok|okay|cool|great)\b|"
+    r"धन्यवाद|ధన్యవాద|"
+    r"who\s+are\s+you|what\s+(are|is)\s+(you|setu)|what\s+can\s+you\s+do|"
+    r"your\s+name|about\s+setu|how\s+do\s+you\s+work)",
     re.I,
 )
 
@@ -143,8 +160,9 @@ def _ask_system_prompt(answer_language: str) -> str:
     return f"""CRITICAL: Your entire answer must be in {language_name} only (native script). Never reply in English unless the answer language is English. Set the language field to "{answer_language.split("-", 1)[0]}".
 
 You answer questions about government documents using ONLY the document text provided.
+User-stated corrections (if provided) are personal facts from the user about themselves — NOT document content. Use them to personalize answers when relevant. NEVER put them in evidence quotes; evidence must stay verbatim from the document only.
 Rules:
-1. Use ONLY the document text. Never use outside knowledge.
+1. Use ONLY the document text for document facts. Never use outside knowledge. User-stated corrections may personalize the answer but are not document evidence.
 2. SUMMARY / OVERVIEW requests (what is this about, what does it say, explain this, tell me what's in it, "అదే దాని గురించే చెప్పు", and similar): ALWAYS answer from the document content with status="verified_document" and abstain=false. Never abstain on these — the document text is right there.
 3. Only abstain (status="not_found", abstain=true) when the user asks for a SPECIFIC FACT that is genuinely absent from the document — a date, an amount, a name, a deadline that does not appear in the text. Do NOT answer a related or adjacent fact instead. Example: if asked for a "last date" but the document only has a "start date", abstain — do not answer about the start date.
 4. When abstaining, answer must still be a natural sentence in {language_name} explaining what is missing and what IS available in the document.
@@ -272,6 +290,173 @@ def get_document(doc_id: str) -> dict | None:
     return _cache.get(doc_id)
 
 
+def load_ocr_cache() -> None:
+    """Load disk cache into _cache. Missing/corrupt → empty, never raise."""
+    try:
+        if not _CACHE_FILE.exists():
+            return
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            logger.warning("OCR cache root is not an object; starting empty")
+            return
+        loaded = 0
+        for doc_id, entry in data.items():
+            if isinstance(doc_id, str) and isinstance(entry, dict) and entry.get("text"):
+                _cache[doc_id] = entry
+                loaded += 1
+        logger.info("Loaded OCR cache entries=%s from %s", loaded, _CACHE_FILE)
+    except Exception:
+        logger.warning("OCR cache load failed; starting empty", exc_info=True)
+
+
+def _persist_ocr_cache() -> None:
+    """Write-through: dump full _cache to disk. Failures are logged, not raised."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _CACHE_FILE.write_text(
+            json.dumps(_cache, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("OCR cache persist failed", exc_info=True)
+
+
+def _set_cached_document(doc_id: str, entry: dict) -> None:
+    _cache[doc_id] = entry
+    _persist_ocr_cache()
+
+
+def load_session_corrections() -> None:
+    """Load session corrections from disk. Missing/corrupt → empty, never raise."""
+    global _session_corrections
+    try:
+        if not _CORRECTIONS_FILE.exists():
+            return
+        data = json.loads(_CORRECTIONS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            logger.warning("Corrections root is not an object; starting empty")
+            return
+        loaded_sessions = 0
+        for session_id, fields in data.items():
+            if not isinstance(session_id, str) or not isinstance(fields, dict):
+                continue
+            clean: dict[str, dict] = {}
+            for field, item in fields.items():
+                if not isinstance(field, str) or not isinstance(item, dict):
+                    continue
+                value = item.get("value")
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                clean[field] = {
+                    "field": field,
+                    "value": value.strip(),
+                    "timestamp": item.get("timestamp") or time.time(),
+                }
+            if clean:
+                _session_corrections[session_id] = clean
+                loaded_sessions += 1
+        logger.info(
+            "Loaded session corrections sessions=%s from %s",
+            loaded_sessions,
+            _CORRECTIONS_FILE,
+        )
+    except Exception:
+        logger.warning("Session corrections load failed; starting empty", exc_info=True)
+        _session_corrections = {}
+
+
+def _persist_session_corrections() -> None:
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _CORRECTIONS_FILE.write_text(
+            json.dumps(_session_corrections, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("Session corrections persist failed", exc_info=True)
+
+
+def get_session_corrections(session_id: str) -> list[dict]:
+    """Active corrections for a session as a list (one entry per field)."""
+    by_field = _session_corrections.get(session_id) or {}
+    return sorted(by_field.values(), key=lambda item: item.get("timestamp") or 0)
+
+
+def _slug_field(raw: str) -> str:
+    s = re.sub(r"\s+", "_", (raw or "").strip().lower())
+    s = re.sub(r"[^\w]+", "", s)
+    return (s[:64] or "note")
+
+
+def extract_corrections(utterance: str) -> list[dict]:
+    """Detect user-stated self-corrections. Returns [{field, value}] (no timestamp)."""
+    text = (utterance or "").strip()
+    if not text:
+        return []
+
+    # "my land is 2 acres not 3"
+    m = re.search(
+        r"\bmy\s+([a-zA-Z][\w\s/-]{0,40}?)\s+is\s+(.+?)\s*,?\s*not\b",
+        text,
+        re.I,
+    )
+    if m:
+        return [{"field": _slug_field(m.group(1)), "value": m.group(2).strip(" .,;:")}]
+
+    # "I'm in Warangal district not Karimnagar" / "I am in …"
+    m = re.search(
+        r"\bi(?:'m|\s+am)\s+in\s+(.+?)\s*,?\s*not\b",
+        text,
+        re.I,
+    )
+    if m:
+        value = m.group(1).strip(" .,;:")
+        field = "district" if re.search(r"\bdistrict\b", value, re.I) else "location"
+        return [{"field": field, "value": value}]
+
+    # "actually[,]? my land is 2 acres" / "correction: district is Warangal"
+    m = re.search(
+        r"\b(?:actually|correction|rather)[,:]?\s*(?:my\s+)?"
+        r"([a-zA-Z][\w\s/-]{0,40}?)\s+is\s+(.+)$",
+        text,
+        re.I,
+    )
+    if m:
+        value = m.group(2).strip(" .,;:")
+        # Drop trailing "not …" if present
+        value = re.split(r"\s+not\b", value, maxsplit=1, flags=re.I)[0].strip(" .,;:")
+        if value:
+            return [{"field": _slug_field(m.group(1)), "value": value}]
+
+    return []
+
+
+def upsert_corrections(session_id: str, items: list[dict]) -> list[dict]:
+    """Store corrections; same field supersedes. Returns active list."""
+    if not session_id or not items:
+        return get_session_corrections(session_id)
+    bucket = _session_corrections.setdefault(session_id, {})
+    now = time.time()
+    for item in items:
+        field = _slug_field(str(item.get("field") or ""))
+        value = str(item.get("value") or "").strip()
+        if not field or not value:
+            continue
+        bucket[field] = {"field": field, "value": value, "timestamp": now}
+    _persist_session_corrections()
+    return get_session_corrections(session_id)
+
+
+def ingest_corrections_from_utterance(session_id: str, utterance: str) -> list[dict]:
+    """Detect + persist corrections from an /ask utterance; return active list."""
+    if not session_id:
+        return []
+    extracted = extract_corrections(utterance)
+    if extracted:
+        return upsert_corrections(session_id, extracted)
+    return get_session_corrections(session_id)
+
+
 def _normalize_text(text: str) -> str:
     # Strip ALL whitespace — Vision mid-word newlines vs model rejoining
     # without spaces (quote "ab" must match doc "a\nb").
@@ -281,15 +466,30 @@ def _normalize_text(text: str) -> str:
     return text
 
 
-
 def verify_citations(evidence: list, doc_text: str) -> list:
+    """Per-evidence `verified` via string match on cached OCR text (not an LLM).
+
+    Normalizes quote + doc (strip all whitespace, strip ``\\d+.`` markers), then
+    checks whether the normalized quote is a substring of the normalized OCR.
+    Empty quotes are unverified.
+    """
     norm_doc = _normalize_text(doc_text)
     out = []
     for item in evidence:
         quote = item.get("quote", "")
         verified = bool(quote) and _normalize_text(quote) in norm_doc
-        out.append({**item, "verified": verified})
+        out.append({**item, "verified": bool(verified)})
     return out
+
+
+def is_converse_allowed(message: str) -> bool:
+    """True only for greetings / thanks / Setu-meta. Bias: redirect otherwise."""
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _DOC_QUESTION_RE.search(text) or _NEEDS_DOC_RE.search(text):
+        return False
+    return bool(_CONVERSE_ALLOW_RE.search(text))
 
 
 def _parse_answer_json(content: str) -> dict:
@@ -504,11 +704,33 @@ def chat_reply(
     }
 
 
+def _is_short_factual_question(question: str) -> bool:
+    """Fast /ask path: short, factual lookups — not summaries or open-ended explainers."""
+    text = (question or "").strip()
+    if not text:
+        return False
+    words = text.split()
+    if len(words) > 14:
+        return False
+    if re.search(
+        r"\b(about|explain|summarize|summary|overview|describe|tell me everything|"
+        r"what does it say|what is this document|అదే|గురించ|बताओ|वर्णन|"
+        r"explain this|what's in)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if _DOC_QUESTION_RE.search(text):
+        return True
+    return len(words) <= 8
+
+
 def ask_document(
     doc_text: str,
     question: str,
     answer_language: str,
     history: list[dict] | None = None,
+    corrections: list[dict] | None = None,
 ) -> dict:
     client = get_client()
     # Cap context — full docs on every /ask burn tokens and invite 429s.
@@ -520,9 +742,24 @@ def ask_document(
         f"The answer field MUST be in {lang_name} only "
         f"(native script). language field = \"{_lang_base(answer_language) or 'en'}\"."
     )
+    corr_block = ""
+    if corrections:
+        lines = [
+            f"- {item.get('field')}: {item.get('value')}"
+            for item in corrections
+            if item.get("field") and item.get("value")
+        ]
+        if lines:
+            corr_block = (
+                "User-stated corrections about themselves "
+                "(NOT from the document — never cite as evidence):\n"
+                + "\n".join(lines)
+                + "\n\n"
+            )
     user_content = (
         f"Answer language (mandatory): {answer_language} — write the answer in {lang_name} only.\n\n"
         f"Document text:\n\n{clipped}\n\n"
+        f"{corr_block}"
         f"Question: {question}\n"
         f"Answer language code: {answer_language}\n"
         f"(Reply in {lang_name}.)"
@@ -536,16 +773,19 @@ def ask_document(
     _log_messages("/ask", messages)
     stats = {"attempts": 0, "call_ms": 0}
     t_total = time.perf_counter()
+    use_fast = _is_short_factual_question(question)
+    model = "sarvam-30b" if use_fast else "sarvam-105b"
+    max_tokens = 768 if use_fast else 1536
 
     def call():
         stats["attempts"] += 1
         t0 = time.perf_counter()
         try:
             return client.chat.completions(
-                model="sarvam-105b",
+                model=model,
                 messages=messages,
                 reasoning_effort=None,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 request_options={
                     "additional_body_parameters": {
                         "response_format": {
@@ -563,7 +803,7 @@ def ask_document(
     finally:
         total_ms = int((time.perf_counter() - t_total) * 1000)
         print(
-            f"[ask] sarvam_call={stats['call_ms']}ms "
+            f"[ask] model={model} sarvam_call={stats['call_ms']}ms "
             f"attempts={stats['attempts']} total={total_ms}ms"
         )
     content = resp.choices[0].message.content
@@ -572,6 +812,54 @@ def ask_document(
     result = _parse_answer_json(content)
     result["answer"] = cap_answer_sentences(result.get("answer", ""), 2)
     return result
+
+
+def summarize_document(doc_text: str, answer_language: str) -> str:
+    """Fast post-scan overview — sarvam-30b, 2–3 sentences, no verification schema."""
+    client = get_client()
+    clipped = (doc_text or "")[:6000]
+    lang_name = _language_name(answer_language)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You summarize government documents for citizens. "
+                f"Reply in {lang_name} only (native script). "
+                "Write exactly 2–3 short sentences. No bullet points, no headers."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Summarize this document in 2–3 sentences:\n\n{clipped}",
+        },
+    ]
+    stats = {"attempts": 0, "call_ms": 0}
+    t_total = time.perf_counter()
+
+    def call():
+        stats["attempts"] += 1
+        t0 = time.perf_counter()
+        try:
+            return client.chat.completions(
+                model="sarvam-30b",
+                messages=messages,
+                reasoning_effort=None,
+                max_tokens=400,
+                temperature=0.2,
+            )
+        finally:
+            stats["call_ms"] += int((time.perf_counter() - t0) * 1000)
+
+    resp = _with_backoff(call)
+    total_ms = int((time.perf_counter() - t_total) * 1000)
+    print(
+        f"[summarize] model=sarvam-30b sarvam_call={stats['call_ms']}ms "
+        f"attempts={stats['attempts']} total={total_ms}ms"
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        raise RuntimeError("Empty summarize response")
+    return cap_answer_sentences(content, 3)
 
 
 def _detect_format(data: bytes) -> str | None:
@@ -807,5 +1095,5 @@ def extract_document(
             "status": "unclear_scan",
         }
     result = {"doc_id": doc_id, "text": text, "pages": pages, "cached": False}
-    _cache[doc_id] = {"doc_id": doc_id, "text": text, "pages": pages}
+    _set_cached_document(doc_id, {"doc_id": doc_id, "text": text, "pages": pages})
     return result

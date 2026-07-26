@@ -55,6 +55,8 @@ def _frontend_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    sarvam.load_ocr_cache()
+    sarvam.load_session_corrections()
     if not os.getenv("SARVAM_API_KEY"):
         logger.warning("SARVAM_API_KEY not set — API calls will fail")
     else:
@@ -120,7 +122,13 @@ class AskBody(BaseModel):
     doc_id: str
     question: str
     answer_language: str = "en"
+    session_id: str | None = None
     history: list[HistoryMessage] = Field(default_factory=list)
+
+
+class SummarizeBody(BaseModel):
+    doc_id: str
+    answer_language: str = "en"
 
 
 class SpeakBody(BaseModel):
@@ -258,13 +266,25 @@ def converse(body: ConverseBody):
         raise HTTPException(400, "message required")
     t0 = time.perf_counter()
     try:
+        if not sarvam.is_converse_allowed(body.message):
+            return {
+                "redirect": True,
+                "route_to": "ask",
+                "intent": "document_question",
+                "reply": "",
+            }
         result = sarvam.chat_reply(
             body.message,
             body.language,
             body.has_document,
             history=[m.model_dump() for m in body.history],
         )
-        return result
+        return {
+            "redirect": False,
+            "route_to": None,
+            "reply": result.get("reply", ""),
+            "intent": result.get("intent", "chat"),
+        }
     except Exception as exc:
         logger.exception("converse failed")
         raise HTTPException(502, f"Chat failed: {exc}") from exc
@@ -282,26 +302,60 @@ def ask(body: AskBody):
         logger.info("[timing] /ask %.3fs status=404", time.perf_counter() - t0)
         raise HTTPException(404, "Unknown doc_id — scan the document first")
     try:
+        session_id = (body.session_id or "").strip()
+        corrections = (
+            sarvam.ingest_corrections_from_utterance(session_id, body.question)
+            if session_id
+            else []
+        )
         result = sarvam.ask_document(
             doc["text"],
             body.question,
             body.answer_language,
             history=[m.model_dump() for m in body.history],
+            corrections=corrections,
         )
         evidence = sarvam.verify_citations(result.get("evidence") or [], doc["text"])
+        status = result.get("status", "not_found")
+        if any(not item.get("verified") for item in evidence):
+            if status == "verified_document":
+                status = "not_found"
+        all_verified = bool(evidence) and all(
+            item.get("verified") for item in evidence
+        ) and status == "verified_document"
         return {
             "answer": result.get("answer", ""),
             "language": result.get("language", body.answer_language),
-            "status": result.get("status", "not_found"),
+            "status": status,
             "action_items": result.get("action_items") or [],
             "evidence": evidence,
             "abstain": bool(result.get("abstain", False)),
+            "all_verified": all_verified,
+            # User-stated facts — never merge into evidence / verification.
+            "corrections": corrections,
         }
     except Exception as exc:
         logger.exception("ask failed")
         raise HTTPException(502, f"Ask failed: {exc}") from exc
     finally:
         logger.info("[timing] /ask %.3fs", time.perf_counter() - t0)
+
+
+@app.post("/summarize")
+def summarize(body: SummarizeBody):
+    t0 = time.perf_counter()
+    doc = sarvam.get_document(body.doc_id)
+    if not doc:
+        logger.info("[timing] /summarize %.3fs status=404", time.perf_counter() - t0)
+        raise HTTPException(404, "Unknown doc_id — scan the document first")
+    try:
+        summary = sarvam.summarize_document(doc["text"], body.answer_language)
+        return {"summary": summary}
+    except Exception as exc:
+        logger.exception("summarize failed")
+        raise HTTPException(502, f"Summarize failed: {exc}") from exc
+    finally:
+        logger.info("[timing] /summarize %.3fs", time.perf_counter() - t0)
 
 
 @app.post("/speak")

@@ -19,6 +19,7 @@ Thumbs.db
 
 # Python (api)
 api/.venv/
+api/cache/
 api/__pycache__/
 **/__pycache__/
 *.py[cod]
