@@ -1,0 +1,26 @@
+name: Keep API warm
+
+# Render's free tier stops the container after 15 minutes idle, and the next request
+# then waits 30-60s for a cold start — long enough to look broken during a demo.
+# Pinging every 10 minutes keeps it running.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "Set repository variable API_URL to your Render URL (e.g. https://setu-api.onrender.com)."
+            exit 1
+          fi
+          # A cold start can take ~60s, so allow generous time before failing.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 120 "$API_URL/health")
+          echo "GET $API_URL/health -> $code"
+          [ "$code" = "200" ]

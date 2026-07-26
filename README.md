@@ -95,6 +95,38 @@ Open the `https://….ngrok.io` URL on your phone → **Add to Home Screen** (iP
 
 Also expose the API: `ngrok http 8000` and set `NEXT_PUBLIC_API_URL` to that HTTPS URL before `npm run build`.
 
+### Installing on iPhone (exact steps)
+
+iOS only installs PWAs from **Safari**, and only over HTTPS — a `192.168.x.x` address
+will not offer install and will block the microphone.
+
+1. Open your Vercel URL in **Safari** (not Chrome).
+2. Tap the **Share** button (square with an arrow, bottom centre).
+3. Scroll down and tap **Add to Home Screen** → **Add**.
+4. Launch Setu from the home screen. It opens fullscreen with no Safari chrome.
+5. On the first tap of the orb, iOS asks for microphone permission → **Allow**.
+   Camera is requested separately, only when you ask Setu to read a document.
+
+Before demoing, set **Settings → Display & Brightness → Auto-Lock → Never**. Setu holds
+a screen wake lock while a conversation is live (iOS 16.4+), but Auto-Lock off is a
+guaranteed backstop.
+
+If you redeploy and the phone still shows the old version, close the app from the app
+switcher and reopen it. The service worker fetches navigations from the network first,
+so one relaunch is enough.
+
+### Keeping the API awake
+
+Render's free tier stops the container after 15 minutes idle; the next request then
+waits 30–60s. Two ways to avoid that mid-demo:
+
+- **Before a demo:** open `https://YOUR-API.onrender.com/health` and wait for
+  `{"status":"ok"}`. Do this ~2 minutes before you present.
+- **Continuously:** the `Keep API warm` GitHub Action pings `/health` every 10 minutes.
+  Enable it by adding a repository variable (Settings → Secrets and variables → Actions
+  → Variables) named `API_URL` set to your Render URL, then run it once manually from
+  the Actions tab to confirm it returns 200.
+
 ---
 
 ## Deploy to Vercel + Render (showcase / judges)
