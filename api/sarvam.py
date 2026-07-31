@@ -1,4 +1,4 @@
-"""Sarvam API helpers for Setu. Logic reused from sarvam_reference.py."""
+"""Setu voice/doc helpers — OpenRouter chat/TTS/STT + local OCR cache (legacy module name)."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ logger = logging.getLogger("setu")
 
 import httpx
 from dotenv import load_dotenv
-from sarvamai import SarvamAI
-from sarvamai.core.api_error import ApiError
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+import openrouter_ai
 
 _cache: dict[str, dict] = {}
 _CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -109,7 +109,7 @@ _NEEDS_DOC_RE = re.compile(
     r"दस्तावेज|काग[ज़ज]|नोटिस|స్కాన్)",
     re.I,
 )
-# Only these may hit sarvam-30b via /converse. Everything else redirects to /ask.
+# Only these may hit sarvam-105b via /converse. Everything else redirects to /ask.
 _CONVERSE_ALLOW_RE = re.compile(
     r"(^\s*(hi+|hello|hey|namaste|namaskar|హలో|नमस्ते|नमस्कार)\b|"
     r"\b(thanks|thank\s*you|thx|bye|goodbye|ok|okay|cool|great)\b|"
@@ -160,17 +160,17 @@ def _ask_system_prompt(answer_language: str) -> str:
     language_name = _language_name(answer_language)
     return f"""CRITICAL: Your entire answer must be in {language_name} only (native script). Never reply in English unless the answer language is English. Set the language field to "{answer_language.split("-", 1)[0]}".
 
-You answer questions about government documents using ONLY the document text provided.
-User-stated corrections (if provided) are personal facts from the user about themselves — NOT document content. Use them to personalize answers when relevant. NEVER put them in evidence quotes; evidence must stay verbatim from the document only.
+You are Setu, a fast voice assistant. Answer from the scanned text/image ONLY when the user asks about it.
+User-stated corrections (if provided) are personal facts from the user — NOT document content. Use them to personalize answers when relevant. NEVER put them in evidence quotes; evidence must stay verbatim from the scan only.
 Rules:
-1. Use ONLY the document text for document facts. Never use outside knowledge. User-stated corrections may personalize the answer but are not document evidence.
-2. SUMMARY / OVERVIEW requests (what is this about, what does it say, explain this, tell me what's in it, "అదే దాని గురించే చెప్పు", and similar): ALWAYS answer from the document content with status="verified_document" and abstain=false. Never abstain on these — the document text is right there.
-3. Only abstain (status="not_found", abstain=true) when the user asks for a SPECIFIC FACT that is genuinely absent from the document — a date, an amount, a name, a deadline that does not appear in the text. Do NOT answer a related or adjacent fact instead. Example: if asked for a "last date" but the document only has a "start date", abstain — do not answer about the start date.
-4. When abstaining, answer must still be a natural sentence in {language_name} explaining what is missing and what IS available in the document.
-5. Every evidence.quote must be copied verbatim from the document text.
-6. Keep answer to at most 2 short sentences — it will be spoken aloud.
+1. Use ONLY the scanned text for facts about it. Never invent. Do not label it as a government notice unless the text itself says that.
+2. For "what is this / summarize / explain" questions: answer briefly from the scan with status="verified_document" and abstain=false.
+3. Only abstain (status="not_found", abstain=true) when a SPECIFIC fact the user asked for is genuinely absent.
+4. When abstaining, say what is missing in one short sentence in {language_name}.
+5. Every evidence.quote must be copied verbatim from the scanned text.
+6. Keep answer to at most 2 short spoken sentences. Be direct — no long overviews.
 7. When status is verified_document, include 1–3 short verbatim evidence quotes with page numbers. When abstaining, evidence must be empty.
-8. action_items: only concrete citizen next-steps from the document; use [] if none.
+8. action_items: only if the user needs a concrete next step from the text; otherwise [].
 
 CRITICAL: The answer field MUST be in {language_name} only. Never English unless the answer language is English."""
 
@@ -215,16 +215,13 @@ def _tts_to_wav(resp) -> bytes:
 
 
 def resolve_speaker(speaker: str | None) -> str:
-    s = (speaker or "shubh").strip().lower()
-    if s in _V2_SPEAKERS or s not in _V3_SPEAKERS:
-        raise ValueError(
-            f"Invalid speaker '{speaker}'. Must be a bulbul:v3 speaker."
-        )
+    """Legacy speaker name — OpenRouter Fish TTS uses a single default voice."""
+    s = (speaker or "setu").strip().lower() or "setu"
     return s
 
 
 def v3_speakers() -> list[str]:
-    return sorted(_V3_SPEAKERS)
+    return ["setu"]
 
 
 _TTS_CACHE_DIR = _CACHE_DIR / "tts"
@@ -242,17 +239,18 @@ def _tts_cache_get(key: str) -> bytes | None:
     if hit is not None:
         _TTS_MEMORY.move_to_end(key)
         return hit
-    path = _TTS_CACHE_DIR / f"{key}.wav"
-    try:
-        if path.is_file():
-            data = path.read_bytes()
-            _TTS_MEMORY[key] = data
-            _TTS_MEMORY.move_to_end(key)
-            while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
-                _TTS_MEMORY.popitem(last=False)
-            return data
-    except OSError:
-        logger.warning("[speak] cache read failed key=%s", key, exc_info=True)
+    for ext in (".mp3", ".wav"):
+        path = _TTS_CACHE_DIR / f"{key}{ext}"
+        try:
+            if path.is_file():
+                data = path.read_bytes()
+                _TTS_MEMORY[key] = data
+                _TTS_MEMORY.move_to_end(key)
+                while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
+                    _TTS_MEMORY.popitem(last=False)
+                return data
+        except OSError:
+            logger.warning("[speak] cache read failed key=%s", key, exc_info=True)
     return None
 
 
@@ -263,77 +261,52 @@ def _tts_cache_put(key: str, data: bytes) -> None:
         _TTS_MEMORY.popitem(last=False)
     try:
         _TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (_TTS_CACHE_DIR / f"{key}.wav").write_bytes(data)
+        ext = ".mp3" if data[:3] == b"ID3" or data[:2] == b"\xff\xfb" else ".mp3"
+        (_TTS_CACHE_DIR / f"{key}{ext}").write_bytes(data)
     except OSError:
         logger.warning("[speak] cache write failed key=%s", key, exc_info=True)
 
 
 def speak(
-    text: str, language: str, speaker: str = "shubh", pace: float = 1.0
+    text: str, language: str, speaker: str = "setu", pace: float = 1.0
 ) -> bytes:
-    client = get_client()
+    """OpenRouter free Fish TTS (MP3) for Indian languages."""
     voice = resolve_speaker(speaker)
-    lang = _lang_code(language)
-    # Intros and confirmations repeat constantly; synthesizing them again costs seconds.
+    lang = _lang_base(language) or "en"
     key = _tts_cache_key(text, lang, voice, pace)
     cached = _tts_cache_get(key)
     if cached is not None:
         logger.info("[speak] cache hit language=%s chars=%s", lang, len(text))
         return cached
 
-    def call():
-        return client.text_to_speech.convert(
-            text=text,
-            target_language_code=lang,
-            model="bulbul:v3",
-            speaker=voice,
-            pace=pace,
-            # Do NOT pass pitch/loudness — v3 rejects those v2 params
-        )
-
     try:
-        resp = _with_backoff(call)
-    except Exception as exc:
-        logger.error(
-            "[speak] TTS failed language=%s speaker=%s: %s",
-            lang,
-            voice,
-            exc,
+        audio = _with_backoff(
+            lambda: openrouter_ai.speak_mp3(text, language=lang, pace=pace)
         )
+    except Exception as exc:
+        logger.error("[speak] TTS failed language=%s: %s", lang, exc)
         raise
-    audio = _tts_to_wav(resp)
     _tts_cache_put(key, audio)
     return audio
 
 
 def listen(audio_bytes: bytes, filename: str, language: str | None = None) -> dict:
-    client = get_client()
-
-    def call():
-        kwargs = {
-            "file": (filename, io.BytesIO(audio_bytes)),
-            "model": "saaras:v3",
-            "mode": "codemix",
-        }
-        if language:
-            kwargs["language_code"] = _lang_code(language)
-        return client.speech_to_text.transcribe(
-            **kwargs,
+    """OpenRouter STT (Whisper). Needs OpenRouter credits; browser STT is the free path."""
+    lang = _lang_base(language) if language else None
+    try:
+        return _with_backoff(
+            lambda: openrouter_ai.transcribe(
+                audio_bytes, filename=filename, language=lang
+            )
         )
-
-    resp = _with_backoff(call)
-    return {
-        "transcript": resp.transcript,
-        "language_code": resp.language_code or "",
-    }
+    except Exception as exc:
+        logger.error("[listen] STT failed: %s", exc)
+        raise
 
 
-# One client for the process — constructing SarvamAI() per call costs ~2s TLS.
-_client = SarvamAI(api_subscription_key=os.environ["SARVAM_API_KEY"])
-
-
-def get_client() -> SarvamAI:
-    return _client
+def get_client():
+    """Deprecated Sarvam client accessor — kept so old imports do not crash."""
+    raise RuntimeError("Sarvam client removed — Setu uses OpenRouter now")
 
 
 def get_document(doc_id: str) -> dict | None:
@@ -709,89 +682,140 @@ def _log_messages(route: str, messages: list[dict]) -> None:
     logger.info("[messages] %s %s", route, payload)
 
 
-SETU_INTRO_EN = (
-    "I'm Setu. If you have an official paper you can't fully understand — a government "
-    "notice, a scheme letter, a court order, a hospital summary — show it to me and ask "
-    "me anything about it in your own language.\n\n"
-    "I only answer from what's written on that paper. If something isn't in it, I'll "
-    "tell you that instead of guessing.\n\n"
-    "When you're done, you can download a sheet with your deadline and the documents "
-    "you need, and carry it with you."
-)
+SETU_INTRO_EN = "Great. I'm Setu. How can I help you?"
 
-# Fixed native-script intros — instant and reliable (LLM translation kept returning English).
+# After language pick — warm confirm in that language, then keep chatting.
 SETU_INTRO_BY_LANG: dict[str, str] = {
-    "en": SETU_INTRO_EN,
-    "te": (
-        "నేను సేతు. ప్రభుత్వ నోటీసు, పథక లేఖ, కోర్టు ఆదేశం వంటి పత్రం అర్థం కాకపోతే, "
-        "నాకు చూపించి మీ భాషలో అడగండి. నేను పత్రంలో ఉన్నదే చెబుతాను — లేకపోతే ఊహించను. "
-        "పూర్తయిన తర్వాత గడువు మరియు అవసరమైన పత్రాలతో ఒక షీట్ డౌన్‌లోడ్ చేయవచ్చు."
-    ),
-    "hi": (
-        "मैं सेतु हूँ। सरकारी नोटिस, योजना पत्र, कोर्ट आदेश जैसा कोई कागज़ समझ न आए "
-        "तो मुझे दिखाइए और अपनी भाषा में पूछिए। मैं केवल कागज़ में लिखा बताता हूँ। "
-        "बाद में समय-सीमा और ज़रूरी कागज़ों की शीट डाउनलोड कर सकते हैं।"
-    ),
-    "mr": (
-        "मी सेतू आहे. सरकारी नोटीस, योजना पत्र किंवा कोर्ट आदेश समजत नसेल तर मला "
-        "दाखवा आणि तुमच्या भाषेत विचारा. मी फक्त कागदावर लिहिलेलेच सांगतो. "
-        "नंतर मुदत आणि कागदपत्रांची यादी असलेली शीट डाउनलोड करू शकता."
-    ),
-    "ta": (
-        "நான் சேது. அரசு அறிவிப்பு, திட்ட கடிதம், நீதிமன்ற உத்தரவு போன்ற ஆவணம் "
-        "புரியவில்லை என்றால், காட்டி உங்கள் மொழியில் கேளுங்கள். ஆவணத்தில் உள்ளதை "
-        "மட்டுமே சொல்வேன். பின்னர் காலக்கெடு மற்றும் ஆவணப் பட்டியலுடன் ஒரு தாளை "
-        "பதிவிறக்கலாம்."
-    ),
-    "kn": (
-        "ನಾನು ಸೇತು. ಸರ್ಕಾರಿ ನೋಟೀಸ್, ಯೋಜನೆ ಪತ್ರ, ನ್ಯಾಯಾಲಯ ಆದೇಶ ಇತ್ಯಾದಿ ದಾಖಲೆ "
-        "ಅರ್ಥವಾಗದಿದ್ದರೆ, ನನಗೆ ತೋರಿಸಿ ನಿಮ್ಮ ಭಾಷೆಯಲ್ಲಿ ಕೇಳಿ. ದಾಖಲೆಯಲ್ಲಿರುವುದನ್ನೇ "
-        "ಹೇಳುತ್ತೇನೆ. ನಂತರ ಗಡುವು ಮತ್ತು ದಾಖಲೆಗಳ ಪಟ್ಟಿಯೊಂದಿಗೆ ಶೀಟ್ ಡೌನ್‌ಲೋಡ್ "
-        "ಮಾಡಬಹುದು."
-    ),
-    "bn": (
-        "আমি সেতু। সরকারি নোটিশ, প্রকল্পের চিঠি, আদালতের আদেশ বোঝা না গেলে, "
-        "আমাকে দেখান এবং আপনার ভাষায় জিজ্ঞেস করুন। আমি শুধু কাগজে লেখা বলি। "
-        "শেষে সময়সীমা ও প্রয়োজনীয় কাগজের তালিকা সহ একটি শিট ডাউনলোড করতে পারবেন।"
-    ),
-    "gu": (
-        "હું સેતુ છું. સરકારી નોટિસ, યોજના પત્ર, કોર્ટ ઓર્ડર જેવું કાગળ સમજાય નહીં "
-        "તો મને બતાવો અને તમારી ભાષામાં પૂછો. હું ફક્ત કાગળ પર લખેલું જ કહું છું. "
-        "પછી મુદત અને જરૂરી કાગળોની યાદી સાથે શીટ ડાઉનલોડ કરી શકો."
-    ),
-    "ml": (
-        "ഞാൻ സേതു. സർക്കാർ നോട്ടീസ്, പദ്ധതി കത്ത്, കോടതി ഉത്തരവ് തുടങ്ങിയ "
-        "രേഖ മനസ്സിലാകുന്നില്ലെങ്കിൽ, കാണിച്ച് നിങ്ങളുടെ ഭാഷയിൽ ചോദിക്കുക. "
-        "രേഖയിൽ എഴുതിയിരിക്കുന്നത് മാത്രം പറയും. പിന്നീട് അവസാന തീയതിയും "
-        "ആവശ്യമായ രേഖകളുടെ പട്ടികയും ഉള്ള ഷീറ്റ് ഡൗൺലോഡ് ചെയ്യാം."
-    ),
-    "pa": (
-        "ਮੈਂ ਸੇਤੂ ਹਾਂ। ਸਰਕਾਰੀ ਨੋਟਿਸ, ਯੋਜਨਾ ਪੱਤਰ, ਕੋਰਟ ਆਦੇਸ਼ ਵਰਗਾ ਕਾਗਜ਼ "
-        "ਸਮਝ ਨ ਆਵੇ ਤਾਂ ਮੈਨੂੰ ਦਿਖਾਓ ਅਤੇ ਆਪਣੀ ਭਾਸ਼ਾ ਵਿੱਚ ਪੁੱਛੋ। ਮੈਂ ਸਿਰਫ਼ "
-        "ਕਾਗਜ਼ ਵਿੱਚ ਲਿਖਿਆ ਦੱਸਦਾ ਹਾਂ। ਬਾਅਦ ਵਿੱਚ ਮਿਆਦ ਅਤੇ ਕਾਗਜ਼ਾਂ ਦੀ ਸੂਚੀ "
-        "ਨਾਲ ਇੱਕ ਸ਼ੀਟ ਡਾਊਨਲੋਡ ਕਰ ਸਕਦੇ ਹੋ।"
-    ),
-    "or": (
-        "ମୁଁ ସେତୁ। ସରକାରୀ ନୋଟିସ, ଯୋଜନା ପତ୍ର, ଆଦାଲତ ଆଦେଶ ଭଳି କାଗଜ ବୁଝି "
-        "ନପାରିଲେ, ମୋତେ ଦେଖାନ୍ତୁ ଏବଂ ଆପଣଙ୍କ ଭାଷାରେ ପଚାରନ୍ତୁ। ମୁଁ କେବଳ "
-        "କାଗଜରେ ଲେଖା କହିବି। ଶେଷରେ ସମୟସୀମା ଓ ଆବଶ୍ୟକ କାଗଜର ତାଲିକା ସହ "
-        "ଏକ ଶିଟ୍ ଡାଉନଲୋଡ୍ କରିପାରିବେ।"
-    ),
+    "en": "Great. I'm Setu. How can I help you?",
+    "te": "సరే. నేను సేతు. మీకు ఎలా సహాయం చేయగలను?",
+    "hi": "ठीक है. मैं सेतु हूँ. मैं आपकी कैसे मदद करूँ?",
+    "mr": "छान. मी सेतू आहे. मी तुम्हाला कशी मदत करू?",
+    "ta": "சரி. நான் சேது. நான் உங்களுக்கு எப்படி உதவட்டும்?",
+    "kn": "ಸರಿ. ನಾನು ಸೇತು. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?",
+    "bn": "ঠিক আছে. আমি সেতু. আমি কীভাবে সাহায্য করতে পারি?",
+    "gu": "સારું. હું સેતુ છું. હું તમારી કેવી રીતે મદદ કરું?",
+    "ml": "ശരി. ഞാൻ സേതു. ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "pa": "ਠੀਕ ਹੈ. ਮੈਂ ਸੇਤੂ ਹਾਂ. ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
+    "or": "ଠିକ୍ ଅଛି. ମୁଁ ସେତୁ. ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
 }
 
 
-def _is_mostly_latin(text: str) -> bool:
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return True
-    latin = sum(1 for c in letters if ord(c) < 128)
-    return latin / len(letters) > 0.55
-
-
 def intro_for_language(language: str) -> str:
-    """Return the fixed Setu intro in the requested language."""
+    """Warm spoken intro after the user picks a language."""
     base = _lang_base(language) or "en"
     return SETU_INTRO_BY_LANG.get(base, SETU_INTRO_EN)
+
+
+VOICE_LANGUAGE_PROMPT = "Hi, welcome to Setu. Which language do you prefer?"
+
+BRIEF_ACK_BY_LANG: dict[str, str] = {
+    "te": "సరే.",
+    "hi": "ठीक है.",
+    "en": "Okay.",
+    "mr": "ठीक आहे.",
+    "ta": "சரி.",
+    "kn": "ಸರಿ.",
+    "bn": "ঠিক আছে.",
+    "gu": "બરાબર.",
+    "ml": "ശരി.",
+    "pa": "ਠੀਕ ਹੈ.",
+    "or": "ଠିକ୍ ଅଛି.",
+}
+
+LANGUAGE_SWITCH_BY_LANG: dict[str, str] = {
+    "te": "అవును.",
+    "hi": "हाँ.",
+    "en": "Yes.",
+    "mr": "होय.",
+    "ta": "ஆம்.",
+    "kn": "ಹೌದು.",
+    "bn": "হ্যাঁ.",
+    "gu": "હા.",
+    "ml": "അതെ.",
+    "pa": "ਹਾਂ.",
+    "or": "ହଁ.",
+}
+
+CAMERA_PHRASES_BY_LANG: dict[str, dict[str, str]] = {
+    "en": {
+        "show": "Show me",
+        "ready": "Ready.",
+        "unclear": "Could not read that clearly",
+        "reading": "Reading",
+    },
+    "te": {
+        "show": "చూపించండి",
+        "ready": "సరే.",
+        "unclear": "స్పష్టంగా చదవలేకపోయాను",
+        "reading": "చదువుతున్నాను",
+    },
+    "hi": {
+        "show": "दिखाइए",
+        "ready": "हाँ.",
+        "unclear": "साफ़ नहीं पढ़ सका",
+        "reading": "पढ़ रहा हूँ",
+    },
+    "mr": {
+        "show": "दाखवा",
+        "ready": "होय.",
+        "unclear": "स्पष्ट वाचता आले नाही",
+        "reading": "वाचत आहे",
+    },
+    "ta": {
+        "show": "காட்டுங்கள்",
+        "ready": "ஆம்.",
+        "unclear": "தெளிவாகப் படிக்க முடியவில்லை",
+        "reading": "படிக்கிறேன்",
+    },
+    "kn": {
+        "show": "ತೋರಿಸಿ",
+        "ready": "ಹೌದು.",
+        "unclear": "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ",
+        "reading": "ಓದುತ್ತಿದ್ದೇನೆ",
+    },
+}
+
+
+def brief_ack_for_language(language: str) -> str:
+    base = _lang_base(language) or "en"
+    return BRIEF_ACK_BY_LANG.get(base, BRIEF_ACK_BY_LANG["en"])
+
+
+def language_switch_for_language(language: str) -> str:
+    base = _lang_base(language) or "en"
+    return LANGUAGE_SWITCH_BY_LANG.get(base, LANGUAGE_SWITCH_BY_LANG["en"])
+
+
+def camera_phrase(language: str, key: str) -> str:
+    base = _lang_base(language) or "en"
+    phrases = CAMERA_PHRASES_BY_LANG.get(base) or CAMERA_PHRASES_BY_LANG["en"]
+    return phrases.get(key) or CAMERA_PHRASES_BY_LANG["en"].get(key, "")
+
+
+def spoken_text(text: str, max_chars: int = 200) -> str:
+    """Frontend-compatible spoken truncation for TTS."""
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return ""
+    capped = cap_answer_sentences(trimmed, 2)
+    if len(capped) <= max_chars:
+        return capped
+    cut = capped[:max_chars].rsplit(" ", 1)[0].strip()
+    return cut or capped[:max_chars].strip()
+
+
+def fixed_warm_phrases() -> list[tuple[str, str]]:
+    """(text, language) pairs to pre-synthesize for demo snappiness."""
+    pairs: list[tuple[str, str]] = [(VOICE_LANGUAGE_PROMPT, "en")]
+    for lang in ("en", "hi", "te", "kn", "ta", "mr"):
+        pairs.append((intro_for_language(lang), lang))
+        pairs.append((brief_ack_for_language(lang), lang))
+        pairs.append((language_switch_for_language(lang), lang))
+        for key in ("show", "ready", "unclear"):
+            text = camera_phrase(lang, key)
+            if text:
+                pairs.append((text, lang))
+    return pairs
 
 
 def chat_reply(
@@ -801,7 +825,7 @@ def chat_reply(
     history: list[dict] | None = None,
     memory_context: str | None = None,
 ) -> dict:
-    """Fast path: sarvam-30b, no document, no JSON schema. Target <1.5s."""
+    """Fast chat path via OpenRouter — no document, no JSON schema."""
     language_name = _language_name(language)
     if has_document:
         doc_rule = (
@@ -825,7 +849,9 @@ def chat_reply(
         f"CRITICAL: Your entire reply must be in {language_name} script only. "
         f"The user may write in any language or script — ignore that completely "
         f"and always answer in {language_name}. "
-        f"You are Setu, a helpful voice assistant for India. {doc_rule} "
+        f"You are Setu, a capable voice agent for Indian languages. "
+        f"You can chat, remember earlier chats, help with documents via camera, "
+        f"and answer follow-ups naturally. {doc_rule} "
         "Use prior conversation turns for follow-ups. A language switch is not a new "
         "conversation: never greet the user again or restart the introduction after one. "
         "Reply in ONE or TWO short sentences. "
@@ -879,19 +905,15 @@ def chat_reply(
     _log_messages("/converse", messages)
 
     def call():
-        return _client.chat.completions(
-            model="sarvam-30b",
-            messages=messages,
-            reasoning_effort=None,  # required — thinking + low max_tokens → empty content
-            max_tokens=140,
-            temperature=0.2,
+        return openrouter_ai.chat_completions(
+            messages, max_tokens=140, temperature=0.2
         )
 
     resp = _with_backoff(call)
-    content = (resp.choices[0].message.content or "").strip()
+    content = openrouter_ai.message_text(resp)
     if not content:
         raise RuntimeError("Empty model response")
-    # Sarvam sometimes replies in English even when Telugu/Hindi was requested — retry once.
+    # Models sometimes reply in English even when Indic was requested — retry once.
     if _lang_base(language) != "en" and _is_mostly_latin(content):
         retry_messages = [
             *messages,
@@ -905,42 +927,51 @@ def chat_reply(
             },
         ]
         retry = _with_backoff(
-            lambda: _client.chat.completions(
-                model="sarvam-30b",
-                messages=retry_messages,
-                reasoning_effort=None,
-                max_tokens=60,
-                temperature=0.1,
+            lambda: openrouter_ai.chat_completions(
+                retry_messages, max_tokens=80, temperature=0.1
             )
         )
-        retry_content = (retry.choices[0].message.content or "").strip()
+        retry_content = openrouter_ai.message_text(retry)
         if retry_content and not _is_mostly_latin(retry_content):
             content = retry_content
     return {
         "reply": content,
         "intent": _chat_intent(message, has_document),
+        "model_used": openrouter_ai.chat_model(),
     }
 
 
 def _is_short_factual_question(question: str) -> bool:
-    """Fast /ask path: short, factual lookups — not summaries or open-ended explainers."""
+    """Fast /ask path: prefer 30b for most lookups; 105b only for long/open explainers."""
     text = (question or "").strip()
     if not text:
         return False
     words = text.split()
-    if len(words) > 14:
+    # Long multi-part questions stay on 105b.
+    if len(words) > 28:
         return False
     if re.search(
-        r"\b(about|explain|summarize|summary|overview|describe|tell me everything|"
-        r"what does it say|what is this document|అదే|గురించ|बताओ|वर्णन|"
-        r"explain this|what's in)\b",
+        r"\b(explain in detail|summarize|summary|overview|describe in detail|"
+        r"tell me everything|what does (this|the) (document|notice|paper) say|"
+        r"what is this (document|notice|paper) about|explain this document|"
+        r"what's in (this|the) document|"
+        r"అదే దాని గురించ|पूरी तरह बताओ|विस्तार से वर्णन)\b",
         text,
         re.I,
     ):
         return False
+    # Deadlines, fees, eligibility, dates, amounts → always fast.
+    if re.search(
+        r"\b(deadline|last date|due date|fee|fees|amount|eligible|eligibility|"
+        r"when|where|how much|how many|who|which|required|documents? needed|"
+        r"तारीख|राशि|पात्र|शुल्क|యోగ్య|తేదీ|ఎంత|கட்டணம்|ಕಡ್ಡಾಯ)\b",
+        text,
+        re.I,
+    ):
+        return True
     if _DOC_QUESTION_RE.search(text):
         return True
-    return len(words) <= 8
+    return len(words) <= 18
 
 
 def ask_document(
@@ -950,8 +981,6 @@ def ask_document(
     history: list[dict] | None = None,
     corrections: list[dict] | None = None,
 ) -> dict:
-    client = get_client()
-    # Cap context — full docs on every /ask burn tokens and invite 429s.
     clipped = (doc_text or "")[:6000]
     lang_name = _language_name(answer_language)
     history_msgs = _cap_chat_history(history, requested_language=answer_language)
@@ -974,13 +1003,19 @@ def ask_document(
                 + "\n".join(lines)
                 + "\n\n"
             )
+    schema_hint = (
+        "Return ONLY valid JSON matching this shape: "
+        '{"answer":"string","language":"te|hi|en|...","status":"verified_document|not_found|unclear_scan",'
+        '"action_items":["..."],"evidence":[{"page":1,"quote":"..."}],"abstain":false}'
+    )
     user_content = (
         f"Answer language (mandatory): {answer_language} — write the answer in {lang_name} only.\n\n"
         f"Document text:\n\n{clipped}\n\n"
         f"{corr_block}"
         f"Question: {question}\n"
         f"Answer language code: {answer_language}\n"
-        f"(Reply in {lang_name}.)"
+        f"{schema_hint}\n"
+        f"(Reply in {lang_name} JSON only.)"
     )
     messages = [
         {"role": "system", "content": _ask_system_prompt(answer_language)},
@@ -991,27 +1026,18 @@ def ask_document(
     _log_messages("/ask", messages)
     stats = {"attempts": 0, "call_ms": 0}
     t_total = time.perf_counter()
-    use_fast = _is_short_factual_question(question)
-    model = "sarvam-30b" if use_fast else "sarvam-105b"
-    max_tokens = 768 if use_fast else 1536
+    model = openrouter_ai.chat_model()
+    max_tokens = 768 if _is_short_factual_question(question) else 1200
 
     def call():
         stats["attempts"] += 1
         t0 = time.perf_counter()
         try:
-            return client.chat.completions(
-                model=model,
-                messages=messages,
-                reasoning_effort=None,
+            return openrouter_ai.chat_completions(
+                messages,
                 max_tokens=max_tokens,
-                request_options={
-                    "additional_body_parameters": {
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": _ANSWER_SCHEMA,
-                        }
-                    }
-                },
+                temperature=0.1,
+                response_format={"type": "json_object"},
             )
         finally:
             stats["call_ms"] += int((time.perf_counter() - t0) * 1000)
@@ -1021,63 +1047,48 @@ def ask_document(
     finally:
         total_ms = int((time.perf_counter() - t_total) * 1000)
         print(
-            f"[ask] model={model} sarvam_call={stats['call_ms']}ms "
+            f"[ask] model={model} call={stats['call_ms']}ms "
             f"attempts={stats['attempts']} total={total_ms}ms"
         )
-    content = resp.choices[0].message.content
+    content = openrouter_ai.message_text(resp)
     if not content:
         raise RuntimeError("Empty model response")
     result = _parse_answer_json(content)
     result["answer"] = cap_answer_sentences(result.get("answer", ""), 2)
+    result["model_used"] = model
     return result
 
 
 def summarize_document(doc_text: str, answer_language: str) -> str:
-    """Fast post-scan overview — sarvam-30b, 2–3 sentences, no verification schema."""
-    client = get_client()
+    """Fast post-scan overview — OpenRouter free chat, 1–2 spoken sentences."""
     clipped = (doc_text or "")[:6000]
     lang_name = _language_name(answer_language)
     messages = [
         {
             "role": "system",
             "content": (
-                f"You summarize government documents for citizens. "
+                f"You briefly describe scanned text for a voice assistant. "
                 f"Reply in {lang_name} only (native script). "
-                "Write exactly 2–3 short sentences. No bullet points, no headers."
+                "Write exactly ONE short sentence. Do not call it a government document unless the text says so. No bullet points."
             ),
         },
         {
             "role": "user",
-            "content": f"Summarize this document in 2–3 sentences:\n\n{clipped}",
+            "content": f"Summarize this document in one short sentence:\n\n{clipped}",
         },
     ]
-    stats = {"attempts": 0, "call_ms": 0}
     t_total = time.perf_counter()
-
-    def call():
-        stats["attempts"] += 1
-        t0 = time.perf_counter()
-        try:
-            return client.chat.completions(
-                model="sarvam-30b",
-                messages=messages,
-                reasoning_effort=None,
-                max_tokens=400,
-                temperature=0.2,
-            )
-        finally:
-            stats["call_ms"] += int((time.perf_counter() - t0) * 1000)
-
-    resp = _with_backoff(call)
-    total_ms = int((time.perf_counter() - t_total) * 1000)
-    print(
-        f"[summarize] model=sarvam-30b sarvam_call={stats['call_ms']}ms "
-        f"attempts={stats['attempts']} total={total_ms}ms"
+    resp = _with_backoff(
+        lambda: openrouter_ai.chat_completions(messages, max_tokens=120, temperature=0.2)
     )
-    content = (resp.choices[0].message.content or "").strip()
+    print(
+        f"[summarize] model={openrouter_ai.chat_model()} "
+        f"total={int((time.perf_counter() - t_total) * 1000)}ms"
+    )
+    content = openrouter_ai.message_text(resp)
     if not content:
         raise RuntimeError("Empty summarize response")
-    return cap_answer_sentences(content, 3)
+    return cap_answer_sentences(content, 2)
 
 
 def _detect_format(data: bytes) -> str | None:
@@ -1096,23 +1107,44 @@ def _correct_filename(filename: str, actual: str) -> str:
 
 
 def _retryable(exc: BaseException) -> bool:
-    if isinstance(exc, ApiError):
-        return exc.status_code in (429, 503)
+    """Retry rate limits and transient network / DNS failures."""
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (429, 503)
+    msg_lower = str(exc).lower()
+    if "429" in msg_lower or "rate limit" in msg_lower or "503" in msg_lower:
+        return True
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+            httpx.NetworkError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ),
+    ):
+        # Includes socket.gaierror / Errno 8 "nodename nor servname…"
+        return True
+    # Some SDKs wrap DNS failures in generic Exception strings.
+    msg = str(exc).lower()
+    if "nodename nor servname" in msg or "name or service not known" in msg:
+        return True
+    if "failed to resolve" in msg or "name resolution" in msg:
+        return True
     return False
 
 
 def _error_status(exc: BaseException) -> object:
-    if isinstance(exc, ApiError):
-        return exc.status_code
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return type(exc).__name__
 
 
-def _with_backoff(fn, *, max_retries: int = 2):
-    delay = 0.5
+def _with_backoff(fn, *, max_retries: int = 4):
+    delay = 0.6
     last: BaseException | None = None
     for attempt in range(max_retries):
         try:
@@ -1124,8 +1156,24 @@ def _with_backoff(fn, *, max_retries: int = 2):
             if not _retryable(exc) or attempt == max_retries - 1:
                 raise
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, 6.0)
     raise last  # ponytail: unreachable unless max_retries==0
+
+
+def _friendly_vision_error(exc: BaseException) -> str:
+    msg = str(exc)
+    lower = msg.lower()
+    if (
+        "nodename nor servname" in lower
+        or "name or service not known" in lower
+        or "failed to resolve" in lower
+        or isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, OSError))
+    ):
+        return (
+            "Could not reach the document reader (network/DNS). "
+            "Check your connection and try again."
+        )
+    return f"Vision failed: {exc}"
 
 
 _VISION_MAX_PAGES = 10
@@ -1153,49 +1201,9 @@ def _pdf_slice(file_bytes: bytes, start: int, end: int) -> bytes:
 
 
 def _run_vision(file_bytes: bytes, filename: str, language: str = "te-IN") -> tuple[str, int]:
-    actual = _detect_format(file_bytes)
-    if actual not in _FORMAT_EXT:
-        raise ValueError("Unsupported file format; accepts PDF, PNG, JPG")
-
-    upload_name = _correct_filename(filename, actual)
-    client = get_client()
-    lang = language or "te-IN"
-
-    def create_job():
-        return client.document_intelligence.create_job(language=lang, output_format="md")
-
-    job = _with_backoff(create_job)
-
-    with tempfile.NamedTemporaryFile(suffix=Path(upload_name).suffix, delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
-    try:
-        _with_backoff(lambda: job.upload_file(tmp_path))
-        _with_backoff(job.start)
-        status = _with_backoff(job.wait_until_complete)
-        if status.job_state == "Failed":
-            raise RuntimeError(f"Vision job failed: {status.job_state}")
-
-        out_fd, out_path = tempfile.mkstemp(suffix=".md")
-        os.close(out_fd)
-        try:
-            _with_backoff(lambda: job.download_output(out_path))
-            raw = Path(out_path).read_bytes()
-            if raw[:2] == b"PK":
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    md = next(n for n in zf.namelist() if n.endswith(".md"))
-                    text = zf.read(md).decode("utf-8")
-            else:
-                text = raw.decode("utf-8")
-        finally:
-            os.unlink(out_path)
-
-        metrics = job.get_page_metrics()
-        pages = int(metrics["total_pages"]) if metrics and metrics.get("total_pages") else 1
-        return text, pages
-    finally:
-        os.unlink(tmp_path)
+    raise RuntimeError(
+        "Sarvam Vision removed — set OPENROUTER_API_KEY for OCR (see api/ocr.py)"
+    )
 
 
 # Vision sometimes describes a photo/scene instead of reading document text.

@@ -1,10 +1,12 @@
-"""Setu FastAPI backend — Vision at upload, fast /converse, verified /ask."""
+"""Setu FastAPI backend — Vision at upload, fast /converse, verified /ask, one-shot /voice."""
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,14 +17,18 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 import json
 import threading
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+import agent
 import auth
 import db
+import ocr
+import rate_limit
 import sarvam
+import voice_ws
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("setu")
@@ -84,52 +90,61 @@ def _user_from_header(x_user_id: str | None) -> dict:
     return auth.resolve_user(x_user_id)
 
 
-# Onboarding languages judges are most likely to pick, warmed first.
-_INTRO_WARM_LANGUAGES = ["en", "hi", "te", "kn", "ta", "mr"]
+def _require_ai_user(user_id: str = Depends(rate_limit.require_user_id)) -> str:
+    rate_limit.check_rate_limit(user_id, bucket="ai", limit=45, window_s=60.0)
+    return user_id
 
 
-def _warm_intro_tts() -> None:
-    """Synthesize the fixed intros once so the first user never waits ~6s for TTS."""
-    for language in _INTRO_WARM_LANGUAGES:
-        try:
-            text = sarvam.intro_for_language(language)
-            t0 = time.perf_counter()
-            sarvam.speak(text, language)
-            logger.info(
-                "Warmed intro TTS language=%s in %.2fs", language, time.perf_counter() - t0
-            )
-        except Exception:
-            logger.warning("Intro TTS warm failed language=%s", language, exc_info=True)
+def _warm_fixed_tts() -> None:
+    """Synthesize fixed phrases in parallel so first turns never wait on cold TTS."""
+    phrases = sarvam.fixed_warm_phrases()
+    # Deduplicate while preserving order.
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, str]] = []
+    for text, language in phrases:
+        key = (text, language)
+        if key in seen or not text.strip():
+            continue
+        seen.add(key)
+        unique.append(key)
+
+    def _one(item: tuple[str, str]) -> None:
+        text, language = item
+        t0 = time.perf_counter()
+        sarvam.speak(text, language)
+        logger.info(
+            "Warmed TTS language=%s chars=%s in %.2fs",
+            language,
+            len(text),
+            time.perf_counter() - t0,
+        )
+
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="tts-warm") as pool:
+        futures = [pool.submit(_one, item) for item in unique]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception:
+                logger.warning("TTS warm item failed", exc_info=True)
 
 
-def _start_intro_tts_warm() -> None:
-    if not os.getenv("SARVAM_API_KEY"):
-        return
-    threading.Thread(target=_warm_intro_tts, name="intro-tts-warm", daemon=True).start()
+def _warm_client() -> None:
+    try:
+        t0 = time.perf_counter()
+        sarvam.chat_reply("hi", "en", False)
+        logger.info("Warmed /converse client in %.3fs", time.perf_counter() - t0)
+    except Exception:
+        logger.exception("Client warm-up failed")
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    db.init_db()
-    sarvam.load_ocr_cache()
-    sarvam.load_session_corrections()
-    if not os.getenv("SARVAM_API_KEY"):
-        logger.warning("SARVAM_API_KEY not set — API calls will fail")
-    else:
-        # Warm TLS/HTTP so the first /converse is not ~2s cold.
-        try:
-            t0 = time.perf_counter()
-            sarvam.chat_reply("hi", "en", False)
-            logger.info("Warmed /converse client in %.3fs", time.perf_counter() - t0)
-        except Exception:
-            logger.exception("Client warm-up failed")
+def _warm_samples() -> None:
     for sample in _SAMPLE_DEFS:
         path = SAMPLES_DIR / sample["file"]
         if not path.exists():
             logger.warning("Sample missing: %s", path)
             continue
         try:
-            result = sarvam.extract_document(
+            result = ocr.extract_document(
                 path.read_bytes(),
                 sample["file"],
                 language=sample["language"],
@@ -146,7 +161,45 @@ async def lifespan(_app: FastAPI):
             )
         except Exception:
             logger.exception("Failed to pre-cache sample %s", sample["file"])
-    _start_intro_tts_warm()
+
+
+def _start_background_warms() -> None:
+    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return
+    threading.Thread(target=_warm_client, name="client-warm", daemon=True).start()
+    threading.Thread(target=_warm_samples, name="sample-warm", daemon=True).start()
+    threading.Thread(target=_warm_fixed_tts, name="tts-warm", daemon=True).start()
+
+
+def _hydrate_sample_ids_from_cache() -> None:
+    """Instant sample doc_ids from OCR disk cache — no Vision wait on boot."""
+    import hashlib
+
+    for sample in _SAMPLE_DEFS:
+        path = SAMPLES_DIR / sample["file"]
+        if not path.exists():
+            continue
+        try:
+            file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            lang = sample["language"]
+            doc_id = hashlib.sha256(f"{file_hash}:{lang}".encode()).hexdigest()
+            if sarvam.get_document(doc_id):
+                sample["doc_id"] = doc_id
+                logger.info("Hydrated sample %s from cache -> %s", sample["file"], doc_id[:12])
+        except Exception:
+            logger.warning("Sample cache hydrate failed for %s", sample["file"], exc_info=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_db()
+    sarvam.load_ocr_cache()
+    sarvam.load_session_corrections()
+    _hydrate_sample_ids_from_cache()
+    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        logger.warning("OPENROUTER_API_KEY not set — OCR / chat / TTS will fail")
+    else:
+        _start_background_warms()
     yield
 
 
@@ -160,6 +213,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(voice_ws.router)
 
 
 class HistoryMessage(BaseModel):
@@ -226,13 +281,31 @@ class SummarizeBody(BaseModel):
 class SpeakBody(BaseModel):
     text: str
     language: str = "en"
-    speaker: str = Field(default="shubh")
+    speaker: str = Field(default="setu")
     pace: float = Field(default=1.0, ge=0.5, le=2.0)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "ocr_provider": ocr.resolve_ocr_provider(),
+        "openrouter_configured": bool((os.getenv("OPENROUTER_API_KEY") or "").strip()),
+        "stack": "openrouter",
+    }
+
+
+@app.get("/warm")
+def warm():
+    """Keep-alive that touches OpenRouter TTS so TLS + cache stay hot."""
+    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return {"status": "ok", "warmed": False}
+    try:
+        sarvam.speak(sarvam.brief_ack_for_language("en"), "en")
+        return {"status": "ok", "warmed": True}
+    except Exception:
+        logger.warning("warm ping failed", exc_info=True)
+        return {"status": "ok", "warmed": False}
 
 
 @app.post("/auth/guest")
@@ -355,14 +428,17 @@ def samples():
 async def scan(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
+    user_id: str = Depends(_require_ai_user),
 ):
     """NDJSON stream: progress events, then a final done / unclear_scan / error line."""
     t0 = time.perf_counter()
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file")
+    rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_SCAN_BYTES, label="document")
     filename = file.filename or "document.jpg"
     lang = language or "te-IN"
+    _ = user_id
 
     def event_stream():
         vision_s = 0.0
@@ -374,7 +450,7 @@ async def scan(
 
         def run():
             try:
-                result_holder["value"] = sarvam.extract_document(
+                result_holder["value"] = ocr.extract_document(
                     data,
                     filename,
                     language=lang,
@@ -402,8 +478,8 @@ async def scan(
                 if isinstance(exc, ValueError):
                     status, detail = 400, str(exc)
                 else:
-                    logger.exception("scan failed")
-                    status, detail = 502, f"Vision failed: {exc}"
+                    logger.error("scan failed: %s", exc, exc_info=exc)
+                    status, detail = 502, sarvam._friendly_vision_error(exc)
                 yield json.dumps({"type": "error", "detail": detail, "status": status}) + "\n"
                 return
 
@@ -412,12 +488,15 @@ async def scan(
             if result.get("status") == "unclear_scan":
                 yield json.dumps({"type": "unclear_scan", "status": "unclear_scan"}) + "\n"
                 return
+            preview = (result.get("preview") or (result.get("text") or "")[:500]).strip()
             yield json.dumps(
                 {
                     "type": "done",
                     "doc_id": result["doc_id"],
                     "pages": result["pages"],
                     "cached": result["cached"],
+                    "provider": result.get("provider") or ocr.resolve_ocr_provider(),
+                    "preview": preview,
                 }
             ) + "\n"
         finally:
@@ -434,13 +513,17 @@ async def scan(
 
 @app.post("/listen")
 async def listen(
-    file: UploadFile = File(...), language: str | None = Form(default=None)
+    file: UploadFile = File(...),
+    language: str | None = Form(default=None),
+    user_id: str = Depends(_require_ai_user),
 ):
     t0 = time.perf_counter()
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty audio")
+    rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
     filename = file.filename or "audio.wav"
+    _ = user_id
     try:
         return sarvam.listen(data, filename, language=language)
     except Exception as exc:
@@ -450,11 +533,116 @@ async def listen(
         logger.info("[timing] /listen %.3fs", time.perf_counter() - t0)
 
 
+@app.post("/voice")
+async def voice(
+    file: UploadFile = File(...),
+    language: str = Form(default="en"),
+    has_document: bool = Form(default=False),
+    doc_id: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+    history: str = Form(default="[]"),
+    memory: str | None = Form(default=None),
+    onboarded: bool = Form(default=False),
+    speaker: str = Form(default="setu"),
+    pace: float = Form(default=1.0),
+    force_route: str | None = Form(default=None),
+    transcript: str | None = Form(default=None),
+    user_id: str = Depends(_require_ai_user),
+):
+    """STT → route → LLM → TTS. Prefer client `transcript` (browser Indic STT); else Whisper."""
+    t0 = time.perf_counter()
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty audio")
+    rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
+    filename = file.filename or "audio.wav"
+
+    try:
+        history_msgs = json.loads(history) if history else []
+        if not isinstance(history_msgs, list):
+            history_msgs = []
+    except json.JSONDecodeError:
+        history_msgs = []
+
+    client_transcript = (transcript or "").strip()
+    stt: dict = {"transcript": client_transcript, "language_code": language}
+    if client_transcript:
+        logger.info("[voice] using browser transcript chars=%s", len(client_transcript))
+    else:
+        try:
+            stt = sarvam.listen(data, filename, language=None)
+        except Exception as exc:
+            logger.exception("voice STT failed")
+            raise HTTPException(
+                502,
+                f"STT failed: {exc}. Use Chrome browser speech, or add OpenRouter credits.",
+            ) from exc
+
+    transcript_text = (stt.get("transcript") or "").strip()
+    if not transcript_text:
+        raise HTTPException(400, "I could not understand that. Try again.")
+
+    result: agent.AgentResult | None = None
+    spoken = ""
+    wav = b""
+    try:
+        result = agent.run_agent_turn(
+            transcript_text,
+            language=language,
+            has_document=has_document,
+            doc_id=doc_id,
+            history=history_msgs,
+            memory=(memory or "").strip() or _memory_context(user_id, session_id),
+            session_id=session_id,
+            onboarded=onboarded,
+            force_route=force_route,
+            use_tools=True,
+        )
+        if not (result.reply or "").strip():
+            result.reply = sarvam.camera_phrase(result.language, "show")
+        spoken = sarvam.spoken_text(result.reply, result.max_spoken)
+        # Demo: one consistent voice — ignore client speaker switches.
+        wav, _parts = agent.synthesize_turn_audio(result, pace=pace)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("voice pipeline failed")
+        raise HTTPException(502, f"Voice turn failed: {exc}") from exc
+    finally:
+        logger.info(
+            "[timing] /voice %.3fs route=%s model=%s tools=%s",
+            time.perf_counter() - t0,
+            result.route if result else None,
+            result.model_used if result else None,
+            result.tools_used if result else None,
+        )
+
+    assert result is not None
+    return {
+        "transcript": transcript_text,
+        "language_code": stt.get("language_code"),
+        "language": result.language,
+        "route": result.route,
+        "intent": result.intent,
+        "reply": result.reply,
+        "spoken": spoken,
+        "open_camera": result.open_camera,
+        "continue_listening": result.continue_listening,
+        "model_used": result.model_used,
+        "ask": result.ask,
+        "tools_used": result.tools_used,
+        "audio_base64": base64.b64encode(wav).decode("ascii"),
+        "audio_mime": "audio/mpeg",
+        "user_id": user_id,
+    }
+
+
 @app.post("/converse")
-def converse(body: ConverseBody):
+def converse(body: ConverseBody, user_id: str = Depends(_require_ai_user)):
     if not body.message.strip():
         raise HTTPException(400, "message required")
     t0 = time.perf_counter()
+    effective_user = body.user_id or user_id
     try:
         # Only redirect to /ask when a document is actually loaded. With no document
         # an empty reply leaves the voice loop silent, so always answer instead.
@@ -471,13 +659,14 @@ def converse(body: ConverseBody):
             body.language,
             body.has_document,
             history=[m.model_dump() for m in body.history],
-            memory_context=client_memory or _memory_context(body.user_id, body.session_id),
+            memory_context=client_memory or _memory_context(effective_user, body.session_id),
         )
         return {
             "redirect": False,
             "route_to": None,
             "reply": result.get("reply", ""),
             "intent": result.get("intent", "chat"),
+            "model_used": result.get("model_used") or "openrouter",
         }
     except Exception as exc:
         logger.exception("converse failed")
@@ -487,10 +676,11 @@ def converse(body: ConverseBody):
 
 
 @app.post("/ask")
-def ask(body: AskBody):
+def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
     if not body.question.strip():
         raise HTTPException(400, "question required")
     t0 = time.perf_counter()
+    _ = user_id
     doc = sarvam.get_document(body.doc_id)
     if not doc:
         logger.info("[timing] /ask %.3fs status=404", time.perf_counter() - t0)
@@ -502,8 +692,11 @@ def ask(body: AskBody):
             if session_id
             else []
         )
+        from doc_retrieve import retrieve_chunks
+
+        context = retrieve_chunks(doc["text"], body.question)
         result = sarvam.ask_document(
-            doc["text"],
+            context or doc["text"],
             body.question,
             body.answer_language,
             history=[m.model_dump() for m in body.history],
@@ -525,8 +718,8 @@ def ask(body: AskBody):
             "evidence": evidence,
             "abstain": bool(result.get("abstain", False)),
             "all_verified": all_verified,
-            # User-stated facts — never merge into evidence / verification.
             "corrections": corrections,
+            "model_used": result.get("model_used"),
         }
     except Exception as exc:
         logger.exception("ask failed")
@@ -536,15 +729,16 @@ def ask(body: AskBody):
 
 
 @app.post("/summarize")
-def summarize(body: SummarizeBody):
+def summarize(body: SummarizeBody, user_id: str = Depends(_require_ai_user)):
     t0 = time.perf_counter()
+    _ = user_id
     doc = sarvam.get_document(body.doc_id)
     if not doc:
         logger.info("[timing] /summarize %.3fs status=404", time.perf_counter() - t0)
         raise HTTPException(404, "Unknown doc_id — scan the document first")
     try:
         summary = sarvam.summarize_document(doc["text"], body.answer_language)
-        return {"summary": summary}
+        return {"summary": summary, "model_used": "openrouter"}
     except Exception as exc:
         logger.exception("summarize failed")
         raise HTTPException(502, f"Summarize failed: {exc}") from exc
@@ -553,10 +747,11 @@ def summarize(body: SummarizeBody):
 
 
 @app.post("/speak")
-def speak(body: SpeakBody):
+def speak(body: SpeakBody, user_id: str = Depends(_require_ai_user)):
     if not body.text.strip():
         raise HTTPException(400, "text required")
     t0 = time.perf_counter()
+    _ = user_id
     try:
         wav = sarvam.speak(
             body.text, body.language, speaker=body.speaker, pace=body.pace
@@ -569,4 +764,4 @@ def speak(body: SpeakBody):
         raise HTTPException(502, f"TTS failed for {body.language}/{body.speaker}: {exc}") from exc
     finally:
         logger.info("[timing] /speak %.3fs language=%s", time.perf_counter() - t0, body.language)
-    return Response(content=wav, media_type="audio/wav")
+    return Response(content=wav, media_type="audio/mpeg")

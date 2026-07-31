@@ -1,11 +1,11 @@
 # Setu
 
-Setu is a voice-first document assistant. Scan a notice or upload a file, ask questions in your language, and hear answers spoken back to you. The stack uses Sarvam for vision, speech-to-text, language models, and text-to-speech.
+Setu is a voice-first document assistant. Scan a notice or upload a file, ask questions in your language, and hear answers spoken back to you. The stack uses OpenRouter for vision OCR, chat, and Indic TTS, with Chrome browser speech recognition for free Indian-language STT.
 
 ## Features
 
 - Voice conversations in Indian languages (Telugu, Hindi, English, and more)
-- Document scanning and OCR via Sarvam Vision
+- Document scanning with OpenRouter free vision OCR
 - Hands-free Q&A after the first tap
 - Progressive Web App (PWA) installable on desktop and mobile
 - Guest mode with optional email magic-link sign-in
@@ -26,8 +26,8 @@ setu/
 
 - Python 3.12+
 - Node.js 18+
-- A [Sarvam API key](https://sarvam.ai)
-- Chrome (recommended for local development and PWA install on desktop)
+- An [OpenRouter API key](https://openrouter.ai/keys)
+- Chrome (required for browser Indic STT; also recommended for PWA install)
 
 ## Local development
 
@@ -39,10 +39,11 @@ From the repository root:
 cp .env.example .env
 ```
 
-Edit `.env` and set your Sarvam key:
+Edit `.env` and set your OpenRouter key:
 
 ```
-SARVAM_API_KEY=your_sarvam_api_key_here
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OCR_PROVIDER=openrouter
 ```
 
 For the frontend:
@@ -104,7 +105,8 @@ Verify the API is running: [http://localhost:8000/health](http://localhost:8000/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SARVAM_API_KEY` | Yes | Sarvam API subscription key |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter key for OCR, chat, and Indic TTS |
+| `OCR_PROVIDER` | No | `openrouter` (default when key is set) |
 | `FRONTEND_ORIGIN` | For production | Deployed frontend URL, used for CORS and magic links |
 | `RESEND_API_KEY` | No | Resend API key for email magic links |
 | `RESEND_FROM` | No | Sender address for magic-link emails |
@@ -193,7 +195,7 @@ git push origin main
 
    | Key | Value |
    |-----|-------|
-   | `SARVAM_API_KEY` | Your Sarvam key |
+   | `OPENROUTER_API_KEY` | Your OpenRouter key |
    | `FRONTEND_ORIGIN` | Your Vercel URL (set after frontend deploy) |
    | `EXPOSE_MAGIC_LINK` | `1` (optional, for demo login links) |
 
@@ -249,6 +251,7 @@ Render's free tier stops the container after 15 minutes idle. To avoid cold star
 
 - **Guest mode:** A device ID is created automatically. No sign-up required.
 - **Magic link:** Open Settings, enter your email, and tap Send. If Resend is not configured, the link appears in the UI for demo use.
+- **AI routes** (`/voice`, `/listen`, `/ask`, `/speak`, `/scan`, `/converse`, `/summarize`) require the `X-User-Id` header from `/auth/guest`.
 
 ## Data and memory
 
@@ -272,8 +275,11 @@ Render's free tier stops the container after 15 minutes idle. To avoid cold star
 | GET | `/voices` | List available TTS voices |
 | GET | `/samples` | List demo documents |
 | POST | `/scan` | OCR a document image or PDF |
+| POST | `/voice` | One-shot STT → agent tools → LLM → TTS (HTTP fallback) |
+| WS | `/ws/voice` | Persistent voice session (progressive TTS, cancel/barge-in) |
 | POST | `/listen` | Speech-to-text from audio |
 | POST | `/converse` | Multi-turn voice conversation |
 | POST | `/ask` | Ask a question about a document |
 | POST | `/summarize` | Summarize document content |
 | POST | `/speak` | Text-to-speech |
+| GET | `/warm` | Keep-alive that touches TTS cache |

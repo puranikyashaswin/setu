@@ -5,57 +5,42 @@ import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, M
 import { AnimatePresence, motion } from "framer-motion";
 import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
-
-type Language = "te" | "hi" | "en" | "mr" | "ta" | "kn" | "bn" | "gu" | "ml" | "pa" | "or";
-type OrbState = "idle" | "listening" | "processing" | "speaking";
-type StackService = "VISION" | "105B" | "BULBUL" | "SAARAS";
-type ChatRole = "user" | "setu";
-type EvidenceItem = { page: number; quote: string; verified: boolean };
-type Correction = { field: string; value: string; timestamp: number };
-type AskStatus = "verified_document" | "not_found" | "unclear_scan";
-type AskResponse = {
-  answer: string;
-  status: AskStatus;
-  abstain: boolean;
-  all_verified: boolean;
-  evidence: EvidenceItem[];
-  corrections: Correction[];
-  action_items: string[];
-};
-type AskTurnMeta = {
-  fromAsk: true;
-  status: AskStatus;
-  abstain: boolean;
-  allVerified: boolean;
-  actionItems: string[];
-  corrections: Correction[];
-};
-type TurnKind = "summary" | "answer";
-type Turn = {
-  id: string;
-  role: ChatRole;
-  text: string;
-  language: Language;
-  evidence?: EvidenceItem[];
-  askMeta?: AskTurnMeta;
-  kind?: TurnKind;
-  documentImage?: string;
-  timestamp: number;
-};
-type Session = {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  language: Language;
-  docId: string | null;
-  documentName?: string | null;
-  corrections?: Correction[];
-  turns: Turn[];
-  onboarded?: boolean;
-  summary?: string | null;
-};
-type AnswerSheet = AskResponse;
+import { API_URL, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
+import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
+import { base64ToArrayBuffer, playDecodedBuffersSequential, type PlaybackHandles } from "@/lib/audio/playback";
+import {
+  MAX_RECORDING_MS,
+  MIN_SPEECH_MS,
+  POST_TTS_RESUME_MS,
+  SPEECH_LEVEL,
+  recorderToWav,
+  speechMs,
+  startVoiceRecorder,
+  teardownRecorder,
+  type RecorderSession,
+} from "@/lib/audio/recorder";
+import { startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
+import { debugLog, isDebugAudio } from "@/lib/debug";
+import { getVoiceSession } from "@/lib/voice-session";
+import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
+import { SetuOrb } from "@/components/SetuOrb";
+import type {
+  AnswerSheet,
+  ApiHistoryMessage,
+  AskResponse,
+  AskStatus,
+  AskTurnMeta,
+  ChatRole,
+  Correction,
+  EvidenceItem,
+  Language,
+  OrbState,
+  Session,
+  StackService,
+  Turn,
+  TurnKind,
+} from "@/lib/types";
+import { LANGUAGE_LABELS } from "@/lib/types";
 
 function answerSheetHeader(sheet: AnswerSheet): { label: string; tone: "verified" | "abstain" | "caution" | "partial" } {
   if (sheet.status === "not_found" || sheet.abstain) {
@@ -635,10 +620,6 @@ async function documentThumbnailDataUrl(blob: Blob): Promise<string> {
   bitmap.close();
   return canvas.toDataURL("image/jpeg", 0.82);
 }
-type ApiHistoryMessage = { role: string; content: string; language?: Language };
-
-const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
-const LANGUAGE_LABELS: Record<Language, string> = { te: "Telugu", hi: "Hindi", en: "English", mr: "Marathi", ta: "Tamil", kn: "Kannada", bn: "Bengali", gu: "Gujarati", ml: "Malayalam", pa: "Punjabi", or: "Odia" };
 /** Match language names in English, native script, and common transliteration — anywhere in the transcript. */
 /**
  * A language name may arrive in ANY script: asking for Hindi while speaking Telugu
@@ -677,94 +658,15 @@ const EXPLICIT_LANGUAGE: [RegExp, Language][] = (
   Object.entries(LANGUAGE_NAME_VARIANTS) as [Language, string[]][]
 ).map(([code, variants]) => [new RegExp(languageVariantPattern(variants), "i"), code]);
 
-const LANGUAGE_NAME_TOKEN = Object.values(LANGUAGE_NAME_VARIANTS)
-  .flat()
-  .map(escapeRegExp)
-  .join("|");
-/**
- * Language-switch requests, including polite full sentences like
- * "can you change the language to Hindi?" — filler words are stripped first.
- */
-const LANGUAGE_CHANGE = new RegExp(
-  `^(?:${LANGUAGE_NAME_TOKEN})$|^(?:can|could|will|would|please|kya|kripya)?\\s*(?:you|we)?\\s*(?:please\\s+)?(?:speak|talk|say|reply|respond|answer|switch|change|use|set|convert|baat|bolo|maatlaadu)\\w*\\s+(?:the\\s+)?(?:language\\s+)?(?:it\\s+)?(?:in|into|to|me|mein|lo)?\\s*(?:${LANGUAGE_NAME_TOKEN})\\s*(?:language)?\\s*(?:please)?[.!?]*$`,
-  "i",
-);
-const SILENCE_MS = 900;
-const MIN_RECORDING_MS = 1200;
-const MAX_RECORDING_MS = 15000;
-const NO_SPEECH_MS = 4500;
-const VOICE_LANGUAGE_PROMPT =
-  "Welcome to Setu. Which language would you like to speak in? Say Telugu, Hindi, English, Tamil, Kannada, or any Indian language you prefer.";
-const SPEECH_LEVEL = 0.018;
-const AMBIENT_MS = 300;
-/** Consecutive loud frames (~85ms each) before we believe it is real speech, not a tap or cough. */
-const SPEECH_FRAMES_TO_CONFIRM = 2;
-/**
- * Total speech needed before a turn is sent to STT. Kept low: real one-word answers
- * ("hello", "Telugu") are only ~300ms of voiced audio and must never be dropped.
- */
-const MIN_SPEECH_MS = 200;
-/**
- * Only transcription artifacts that appear on genuinely silent audio. Ordinary short
- * words like "hello" or "bye" are real user speech and must NOT be listed here.
- */
 const STT_NOISE_ONLY = /^(?:thanks\s+for\s+watching|please\s+subscribe|subtitles?\s+by.*|amara\.org.*|[.,!?…\-—\s]+)$/i;
 const CAPTURE_STREAK = 3;
-const CAPTURE_CELL_EDGE = 0.10; // local text density inside a grid cell
-const CAPTURE_PEAK_EDGE = 0.12; // strongest cell must look like text/print
-const CAPTURE_GLOBAL_EDGE = 0.045; // whole frame can be mostly person + room
-const DOCUMENT_MENTION = /(document|notice|paper|form|scan|read this|दस्तावेज|काग[ज़ज]|नोटिस|పత్రం|నోటీసు|ದಾಖಲೆ|ஆவணம்|নথি|દસ્તાવેજ|രേഖ|ਦਸਤਾਵੇਜ਼|ଦଲିଲ)/i;
-/** User wants to present/scan a document — open camera, do not call /ask. */
-const WANTS_TO_SHOW_DOCUMENT = /(i have (a |the )?document|show (you )?(my |the )?document|scan (this |my |the )?(document|paper|notice)|document ఉంది|నా దగ్గర|చూపించ|दस्तावेज (दिखा|है)|कागद दाखव)/i;
-const SMALL_TALK = /^(hi|hello|hey|thanks|thank you|thankyou|bye|goodbye|good morning|good evening|నమస్కారం|ధన్యవాదాలు|नमस्ते|धन्यवाद|வணக்கம்|ನಮಸ್ಕಾರ|नमस्कार|নমস্কার)\b/i;
-const ACKNOWLEDGMENT = /^(okay|ok|k|hmm+|hm+|uh+h?|um+|yes|yeah|yep|yup|no|nope|nah|thanks|thank you|thankyou|thx|right|correct|got it|gotcha|sure|fine|alright|all right|achha|accha|haan|han|ha|ji|theek|thik|sari|seri|aam|ho|barobar|సరే|అవును|అలాగే|हाँ|हां|ठीक|अच्छा|சரி|होय|बरोबर|ঠিক|હા|അതെ|ਹਾਂ|ହଁ)[.!?\s]*$/i;
-const QUESTION_WORD = /\?|\b(what|when|where|who|why|how|which|can|could|should|would|is|are|do|does|did|will|shall|kya|kaun|kab|kahan|kaise|kitna|kitni|kyun|kaha|em|eppudu|ekkada|evaru|ela|entha|yaar|epadi|eng|evvalavu|en|eppo|enge|yaar|eppadi|yaru|hege|yake|yaake|ken|eppozhum|entha|yaar|kay|kadhi|kuth|kon|kas|kiti|ki|kobe|kothay|kivabe|koto)\b|(?:ఏమ|ఎప్ప|ఎక్క|ఎవర|ఎలా|ఎంత|क्या|कौन|कब|कहाँ|कैसे|कितन|என்|எப்ப|எங்க|யார்|எப்படி|ಏನು|ಎಂದು| ಎಲ್ಲಿ|ಯಾರ|ಹೇಗ|কি|কখ|কোথ|কীভ|काय|कध|कुठ|कोण|कस)/i;
-
-const BRIEF_ACK: Record<Language, string> = {
-  te: "సరే.",
-  hi: "ठीक है.",
-  en: "Okay.",
-  mr: "ठीक आहे.",
-  ta: "சரி.",
-  kn: "ಸರಿ.",
-  bn: "ঠিক আছে.",
-  gu: "બરાબર.",
-  ml: "ശരി.",
-  pa: "ਠੀਕ ਹੈ.",
-  or: "ଠିକ୍ ଅଛି.",
-};
-
-const LANGUAGE_SWITCH_CONFIRMATION: Record<Language, string> = {
-  te: "సరే, ఇక నుంచి తెలుగులోనే కొనసాగిస్తాను.",
-  hi: "ठीक है, अब से मैं हिंदी में बात करूँगा।",
-  en: "Okay, I’ll continue in English.",
-  mr: "ठीक आहे, आता मी मराठीत पुढे बोलतो.",
-  ta: "சரி, இனிமேல் தமிழில் தொடர்கிறேன்.",
-  kn: "ಸರಿ, ಇನ್ನು ಮುಂದೆ ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ.",
-  bn: "ঠিক আছে, এখন থেকে বাংলায় কথা বলব।",
-  gu: "બરાબર, હવે હું ગુજરાતીમાં આગળ વાત કરીશ.",
-  ml: "ശരി, ഇനി മുതൽ മലയാളത്തിൽ തുടരും.",
-  pa: "ਠੀਕ ਹੈ, ਹੁਣ ਤੋਂ ਮੈਂ ਪੰਜਾਬੀ ਵਿੱਚ ਗੱਲ ਕਰਾਂਗਾ।",
-  or: "ଠିକ୍ ଅଛି, ଏବେ ଠାରୁ ମୁଁ ଓଡ଼ିଆରେ କଥା ହେବି।",
-};
-
+const CAPTURE_MIN_WAIT_MS = 1200; // let the camera focus / user settle the page
+const CAPTURE_CELL_EDGE = 0.07; // local text density inside a grid cell
+const CAPTURE_PEAK_EDGE = 0.09; // strongest cell must look like text/print
+const CAPTURE_GLOBAL_EDGE = 0.03; // whole frame can be mostly person + room
+const CAPTURE_STABILITY = 0.012; // edge-density must stay steady across frames
 function explicitLanguage(transcript: string) {
   return EXPLICIT_LANGUAGE.find(([pattern]) => pattern.test(transcript))?.[1];
-}
-
-function isLanguageChangeOnly(transcript: string, language: Language | undefined) {
-  if (!language) return false;
-  const normalized = transcript
-    .toLowerCase()
-    .replace(/[.,!?]/g, " ")
-    .replace(
-      /\b(can|could|would|will|shall|you|we|please|kindly|speak|talk|say|reply|respond|answer|switch|change|use|set|convert|the|language|in|into|to|me|mein|lo|kripya|kya|baat|karo|bolo|maatlaadu)\b/g,
-      " ",
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-  const variants = LANGUAGE_NAME_VARIANTS[language].map((name) => name.toLowerCase());
-  return variants.includes(normalized) || normalized === LANGUAGE_LABELS[language].toLowerCase();
 }
 
 function resolveLanguage(transcript: string, apiLanguage?: string): Language {
@@ -772,40 +674,6 @@ function resolveLanguage(transcript: string, apiLanguage?: string): Language {
   if (explicit) return explicit;
   const code = apiLanguage?.toLowerCase().split("-", 1)[0] as Language | undefined;
   return code && code in LANGUAGE_LABELS ? code : "en";
-}
-
-/** Greetings / thanks / language switch — not document questions. */
-function isClearSmallTalk(transcript: string) {
-  const text = transcript.trim();
-  return SMALL_TALK.test(text) || LANGUAGE_CHANGE.test(text);
-}
-
-function hasQuestionWord(transcript: string) {
-  return QUESTION_WORD.test(transcript.trim());
-}
-
-function isAcknowledgmentOrFiller(transcript: string) {
-  const text = transcript.trim().replace(/[.!?]+$/g, "").trim();
-  if (!text) return true;
-  if (ACKNOWLEDGMENT.test(text)) return true;
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length < 3 && !hasQuestionWord(text)) return true;
-  return false;
-}
-
-/** Only real questions reach /ask — never acknowledgments, fillers, or bare fragments. */
-function isSubstantiveQuestion(transcript: string) {
-  if (isClearSmallTalk(transcript)) return false;
-  if (isAcknowledgmentOrFiller(transcript)) return false;
-  return true;
-}
-
-function acknowledgmentReason(transcript: string) {
-  const text = transcript.trim();
-  if (ACKNOWLEDGMENT.test(text.replace(/[.!?]+$/g, "").trim())) return "acknowledgment or filler";
-  if (text.split(/\s+/).filter(Boolean).length < 3 && !hasQuestionWord(text)) return "short utterance without question word";
-  if (isClearSmallTalk(text)) return "small talk";
-  return "non-substantive utterance";
 }
 
 type TimingStage = "scan" | "listen" | "converse" | "ask" | "speak";
@@ -826,84 +694,6 @@ function logTurnTiming(timing: TurnTiming) {
   );
 }
 
-function SetuOrb({ orbState, amplitude = 0.2, bass = 0, treble = 0, spectrum, autoStopProgress = 0, onClick }: { orbState: OrbState; amplitude?: number; bass?: number; treble?: number; spectrum: number[]; autoStopProgress?: number; onClick: () => void }) {
-  const energy = 1 + amplitude * 0.1;
-  const targets = useRef(Array.from({ length: 8 }, () => 0));
-  const smooth = useRef(Array.from({ length: 8 }, () => 0));
-  const [blobPath, setBlobPath] = useState("");
-
-  useEffect(() => {
-    targets.current = spectrum.length === 8 ? spectrum : targets.current;
-  }, [spectrum]);
-
-  useEffect(() => {
-    let frame = 0;
-    const draw = (time: number) => {
-      const center = 150;
-      const base = orbState === "processing" ? 102 : 108;
-      const audioStrength = orbState === "idle" ? 5 : orbState === "processing" ? 4 : 27;
-      const points = Array.from({ length: 8 }, (_, index) => {
-        smooth.current[index] += (targets.current[index] - smooth.current[index]) * 0.2;
-        const drift = orbState === "idle" ? Math.sin(time / 1100 + index * 1.7) * 2.8 : 0;
-        const radius = base + smooth.current[index] * audioStrength + drift;
-        const angle = (Math.PI * 2 * index) / 8 + time / 10000;
-        return { x: center + Math.cos(angle) * radius, y: center + Math.sin(angle) * radius };
-      });
-      const midpoint = (a: typeof points[number], b: typeof points[number]) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-      const start = midpoint(points[7], points[0]);
-      const path = points.reduce((value, point, index) => {
-        const next = midpoint(point, points[(index + 1) % points.length]);
-        return `${value} Q ${point.x.toFixed(1)} ${point.y.toFixed(1)} ${next.x.toFixed(1)} ${next.y.toFixed(1)}`;
-      }, `M ${start.x.toFixed(1)} ${start.y.toFixed(1)}`) + " Z";
-      setBlobPath(path);
-      frame = requestAnimationFrame(draw);
-    };
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
-  }, [orbState]);
-
-  return (
-    <button onClick={onClick} aria-label="Start or stop voice recording" className="relative grid w-[min(60vw,45vh)] max-h-[45vh] max-w-[300px] aspect-square place-items-center rounded-full focus:outline-none focus-visible:ring-4 focus-visible:ring-[#4f46e5]/30">
-      <AnimatePresence>
-        {orbState === "listening" && <>
-          <motion.span className="absolute inset-[-17%] rounded-full border border-[#4f46e5]/20" animate={{ scale: 1 + treble * 0.56, opacity: 0.16 + treble * 0.62 }} transition={{ type: "spring", stiffness: 520, damping: 18 }} />
-          <motion.span className="absolute inset-[-9%] rounded-full border-2 border-[#ff6b00]/30" animate={{ scale: 1 + bass * 0.42, opacity: 0.24 + bass * 0.7 }} transition={{ type: "spring", stiffness: 600, damping: 16 }} />
-          <motion.span className="absolute inset-[-3%] rounded-full border border-[#fff7ed]/90" animate={{ scale: 1 + amplitude * 0.2, opacity: 0.4 + amplitude * 0.55 }} transition={{ type: "spring", stiffness: 700, damping: 14 }} />
-          {amplitude > 0.12 && <motion.span key={`peak-${Math.round(amplitude * 20)}`} className="absolute inset-[-11%] rounded-full border border-[#ff6b00]/50" initial={{ scale: 0.92, opacity: 0.7 }} animate={{ scale: 1.48 + amplitude * 0.3, opacity: 0 }} transition={{ duration: 0.62, ease: "easeOut" }} />}
-          {autoStopProgress > 0 && <motion.span className="absolute inset-[-13%] rounded-full border-2 border-[#ff6b00]" animate={{ opacity: autoStopProgress, scale: 1 + autoStopProgress * 0.25 }} transition={{ type: "tween", duration: 0.08 }} />}
-        </>}
-      </AnimatePresence>
-      {orbState === "processing" && <motion.span className="absolute inset-[-3px] rounded-full bg-[conic-gradient(from_0deg,#ff6b00,#f7c986,#4f46e5,#ff6b00)] p-[2px]" animate={{ rotate: 360 }} transition={{ duration: 1.15, repeat: Infinity, ease: "linear" }}><span className="block h-full w-full rounded-full bg-[#fafafa]" /></motion.span>}
-      {orbState === "processing" && [0, 1, 2].map((particle) => <motion.span key={particle} className="absolute left-1/2 top-1/2 h-2 w-2 rounded-full bg-[#ff6b00]/70" animate={{ x: [Math.cos(particle * 2.1) * 118, Math.cos(particle * 2.1 + Math.PI * 2) * 118], y: [Math.sin(particle * 2.1) * 118, Math.sin(particle * 2.1 + Math.PI * 2) * 118], opacity: [0.3, 0.9] }} transition={{ type: "tween", duration: 3.2 + particle * 0.35, repeat: Infinity, repeatType: "reverse", ease: "linear" }} />)}
-      <motion.svg viewBox="0 0 300 300" className="pointer-events-none absolute inset-0 h-full w-full" animate={{ rotate: orbState === "processing" ? 0 : 2 }} transition={{ type: "spring", stiffness: 40, damping: 14 }}>
-        <defs><radialGradient id="setu-blob" cx="34%" cy="26%"><stop offset="0" stopColor="#fff7ed" /><stop offset="0.28" stopColor="#ffc99a" /><stop offset="0.6" stopColor="#ff6b00" /><stop offset="1" stopColor="#5f58d5" /></radialGradient></defs>
-        <motion.path d={blobPath} fill="url(#setu-blob)" animate={{ opacity: orbState === "processing" ? 0.8 : 1, filter: orbState === "speaking" ? `drop-shadow(0 0 ${18 + amplitude * 34}px rgba(255,107,0,0.72))` : "drop-shadow(0 14px 28px rgba(79,70,229,0.34))" }} transition={{ type: "tween", duration: 0.12 }} />
-      </motion.svg>
-      <motion.span className="h-full w-full" animate={{ y: orbState === "processing" ? -2 : 0, scale: orbState === "processing" ? 0.94 : 1 }} transition={{ type: "spring", stiffness: 180, damping: 18 }}>
-        <motion.span
-          className="relative block h-full w-full rounded-full bg-[radial-gradient(circle_at_32%_26%,#fff7ed_0%,#ffc99a_20%,#ff6b00_48%,#8b83e6_82%,#4f46e5_100%)] shadow-[0_28px_70px_-18px_rgba(79,70,229,0.46)]"
-          animate={orbState === "idle" ? { scale: [1, 1.05] } : orbState === "listening" ? { scale: [1, energy], borderRadius: ["50%", "46% 54% 50% 50%"] } : orbState === "speaking" ? { scale: [1, 1.04 + amplitude * 0.12], borderRadius: ["50%", "45% 55% 52% 48%"], boxShadow: ["0 28px 70px -18px rgba(79,70,229,0.46)", `0 22px ${82 + amplitude * 28}px -10px rgba(255,107,0,${0.42 + amplitude * 0.44})`] } : { scale: 1 }}
-          transition={orbState === "processing" ? { type: "spring", stiffness: 180, damping: 18 } : { type: "tween", ease: "easeInOut", repeat: Infinity, repeatType: "reverse", duration: orbState === "idle" ? 3 : 1.2 }}
-        >
-          <motion.span className="absolute inset-[13%] rounded-full bg-[radial-gradient(circle_at_35%_25%,rgba(255,255,255,0.92),rgba(255,255,255,0.08)_43%,transparent_66%)]" animate={orbState === "processing" ? { rotate: 360 } : { opacity: [0.65, 1] }} transition={orbState === "processing" ? { type: "tween", duration: 2, repeat: Infinity, ease: "linear" } : { type: "tween", duration: 3, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" }} />
-        </motion.span>
-      </motion.span>
-    </button>
-  );
-}
-
-function encodeWav(chunks: Float32Array[], sampleRate: number): Blob {
-  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
-  const buffer = new ArrayBuffer(44 + length * 2);
-  const view = new DataView(buffer);
-  const write = (offset: number, text: string) => [...text].forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
-  write(0, "RIFF"); view.setUint32(4, 36 + length * 2, true); write(8, "WAVE"); write(12, "fmt ");
-  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, length * 2, true);
-  let offset = 44;
-  chunks.forEach((chunk) => chunk.forEach((sample) => { view.setInt16(offset, Math.max(-1, Math.min(1, sample)) * 0x7fff, true); offset += 2; }));
-  return new Blob([buffer], { type: "audio/wav" });
-}
 
 function makeSession(language: Language): Session {
   const now = Date.now();
@@ -1245,7 +1035,7 @@ export default function Home() {
   const [authEmail, setAuthEmail] = useState("");
   const [authStatus, setAuthStatus] = useState("");
   const [voices, setVoices] = useState<string[]>([]);
-  const [speaker, setSpeaker] = useState("shubh");
+  const [speaker, setSpeaker] = useState("setu");
   const [pace, setPace] = useState(1);
   const userIdRef = useRef<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -1255,31 +1045,17 @@ export default function Home() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraReadiness, setCameraReadiness] = useState(0);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const recorderRef = useRef<{
-    stream: MediaStream;
-    source: MediaStreamAudioSourceNode;
-    analyser: AnalyserNode;
-    processor: ScriptProcessorNode;
-    silenceGain: GainNode;
-    chunks: Float32Array[];
-    sampleRate: number;
-    startedAt: number;
-    heardSpeech: boolean;
-    silentSince: number | null;
-    raf: number;
-    speechThreshold: number;
-    ambientSum: number;
-    ambientCount: number;
-    thresholdLocked: boolean;
-    lastLogAt: number;
-    speechRunFrames: number;
-    speechFrames: number;
-    frameMs: number;
-    framesSeen: number;
-    watchdog: number;
-  } | null>(null);
+  const recorderRef = useRef<RecorderSession | null>(null);
+  const browserSttRef = useRef<BrowserSttSession | null>(null);
+  const playbackRef = useRef<PlaybackHandles | null>(null);
+  const bargeInRef = useRef<BargeInMonitor | null>(null);
+  const stopBargeIn = () => {
+    const monitor = bargeInRef.current;
+    bargeInRef.current = null;
+    monitor?.stop();
+  };
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const voiceSessionRef = useRef(getVoiceSession());
   const startRecordingRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
   const isRecordingFlagRef = useRef(false);
@@ -1336,17 +1112,17 @@ export default function Home() {
   }, [activeSessionId]);
 
   const cameraText = useState<Record<Language, { hold: string; show: string; reading: string; ready: string; unclear: string }>>({
-    en: { hold: "Hold the document steady — fill more of the frame if you can", show: "Show me the document", reading: "Reading your document", ready: "What would you like to know?", unclear: "I could not read that clearly, hold it flat in good light" },
-    te: { hold: "పత్రాన్ని కెమెరా ముందు ఉంచండి", show: "పత్రాన్ని చూపించండి", reading: "మీ పత్రాన్ని చదువుతున్నాను", ready: "మీకు ఏమి తెలుసుకోవాలి?", unclear: "ఇది స్పష్టంగా చదవలేకపోయాను, మంచి వెలుతురులో నిటారుగా పట్టుకోండి" },
-    hi: { hold: "दस्तावेज़ को कैमरे के सामने रखें", show: "मुझे दस्तावेज़ दिखाइए", reading: "मैं आपका दस्तावेज़ पढ़ रहा हूँ", ready: "आप क्या जानना चाहते हैं?", unclear: "मैं इसे साफ़ नहीं पढ़ सका, अच्छी रोशनी में सीधा रखें" },
-    mr: { hold: "कागद कॅमेऱ्यासमोर धरा", show: "मला कागद दाखवा", reading: "तुमचा कागद वाचत आहे", ready: "मी वाचले आहे. तुम्हाला काय जाणून घ्यायचे आहे?", unclear: "हे स्पष्ट वाचता आले नाही, चांगल्या प्रकाशात सरळ धरा" },
-    ta: { hold: "ஆவணத்தை கேமரா முன் பிடியுங்கள்", show: "ஆவணத்தைக் காட்டுங்கள்", reading: "உங்கள் ஆவணத்தைப் படிக்கிறேன்", ready: "நான் படித்துவிட்டேன். என்ன தெரிந்துகொள்ள வேண்டும்?", unclear: "தெளிவாகப் படிக்க முடியவில்லை, நல்ல வெளிச்சத்தில் நேராகப் பிடியுங்கள்" },
-    kn: { hold: "ದಾಖಲೆಯನ್ನು ಕ್ಯಾಮೆರಾ ಮುಂದೆ ಹಿಡಿಯಿರಿ", show: "ನನಗೆ ದಾಖಲೆಯನ್ನು ತೋರಿಸಿ", reading: "ನಿಮ್ಮ ದಾಖಲೆಯನ್ನು ಓದುತ್ತಿದ್ದೇನೆ", ready: "ನಾನು ಓದಿದ್ದೇನೆ. ನಿಮಗೆ ಏನು ತಿಳಿಯಬೇಕು?", unclear: "ಇದನ್ನು ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ, ಉತ್ತಮ ಬೆಳಕಿನಲ್ಲಿ ನೇರವಾಗಿ ಹಿಡಿಯಿರಿ" },
-    bn: { hold: "নথিটি ক্যামেরার সামনে ধরুন", show: "আমাকে নথিটি দেখান", reading: "আপনার নথিটি পড়ছি", ready: "আমি পড়েছি। আপনি কী জানতে চান?", unclear: "এটি স্পষ্ট পড়তে পারিনি, ভালো আলোতে সোজা করে ধরুন" },
-    gu: { hold: "દસ્તાવેજ કેમેરા સામે રાખો", show: "મને દસ્તાવેજ બતાવો", reading: "હું તમારો દસ્તાવેજ વાંચી રહ્યો છું", ready: "મેં વાંચી લીધું છે. તમે શું જાણવા માંગો છો?", unclear: "હું આ સ્પષ્ટ વાંચી શક્યો નહીં, સારા પ્રકાશમાં સીધું રાખો" },
-    ml: { hold: "രേഖ ക്യാമറയ്ക്ക് മുന്നിൽ പിടിക്കുക", show: "എനിക്ക് രേഖ കാണിക്കുക", reading: "നിങ്ങളുടെ രേഖ വായിക്കുന്നു", ready: "ഞാൻ വായിച്ചു. നിങ്ങൾക്ക് എന്താണ് അറിയേണ്ടത്?", unclear: "ഇത് വ്യക്തമായി വായിക്കാനായില്ല, നല്ല വെളിച്ചത്തിൽ നേരെ പിടിക്കുക" },
-    pa: { hold: "ਦਸਤਾਵੇਜ਼ ਕੈਮਰੇ ਸਾਹਮਣੇ ਰੱਖੋ", show: "ਮੈਨੂੰ ਦਸਤਾਵੇਜ਼ ਦਿਖਾਓ", reading: "ਮੈਂ ਤੁਹਾਡਾ ਦਸਤਾਵੇਜ਼ ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਮੈਂ ਪੜ੍ਹ ਲਿਆ ਹੈ। ਤੁਸੀਂ ਕੀ ਜਾਣਨਾ ਚਾਹੁੰਦੇ ਹੋ?", unclear: "ਮੈਂ ਇਸਨੂੰ ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ, ਚੰਗੀ ਰੌਸ਼ਨੀ ਵਿੱਚ ਸਿੱਧਾ ਰੱਖੋ" },
-    or: { hold: "ଦଲିଲକୁ କ୍ୟାମେରା ସାମ୍ନାରେ ଧରନ୍ତୁ", show: "ମୋତେ ଦଲିଲ ଦେଖାନ୍ତୁ", reading: "ଆପଣଙ୍କ ଦଲିଲ ପଢୁଛି", ready: "ମୁଁ ପଢିଛି। ଆପଣ କଣ ଜାଣିବାକୁ ଚାହୁଁଛନ୍ତି?", unclear: "ମୁଁ ଏହା ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ, ଭଲ ଆଲୋକରେ ସିଧା ଧରନ୍ତୁ" },
+    en: { hold: "Hold it steady", show: "Show me", reading: "Reading", ready: "Ready.", unclear: "Couldn’t read that — hold it flat in good light" },
+    te: { hold: "స్థిరంగా పట్టుకోండి", show: "చూపించండి", reading: "చదువుతున్నాను", ready: "సరే.", unclear: "స్పష్టంగా చదవలేకపోయాను" },
+    hi: { hold: "सीधा रखें", show: "दिखाइए", reading: "पढ़ रहा हूँ", ready: "हाँ.", unclear: "साफ़ नहीं पढ़ सका" },
+    mr: { hold: "स्थिर धरा", show: "दाखवा", reading: "वाचत आहे", ready: "होय.", unclear: "स्पष्ट वाचता आले नाही" },
+    ta: { hold: "நிலையாகப் பிடியுங்கள்", show: "காட்டுங்கள்", reading: "படிக்கிறேன்", ready: "ஆம்.", unclear: "தெளிவாகப் படிக்க முடியவில்லை" },
+    kn: { hold: "ಸ್ಥಿರವಾಗಿ ಹಿಡಿಯಿರಿ", show: "ತೋರಿಸಿ", reading: "ಓದುತ್ತಿದ್ದೇನೆ", ready: "ಹೌದು.", unclear: "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ" },
+    bn: { hold: "স্থির করে ধরুন", show: "দেখান", reading: "পড়ছি", ready: "হ্যাঁ.", unclear: "স্পষ্ট পড়তে পারিনি" },
+    gu: { hold: "સ્થિર રાખો", show: "બતાવો", reading: "વાંચું છું", ready: "હા.", unclear: "સ્પષ્ટ વાંચી શક્યો નહીં" },
+    ml: { hold: "സ്ഥിരമായി പിടിക്കുക", show: "കാണിക്കുക", reading: "വായിക്കുന്നു", ready: "അതെ.", unclear: "വ്യക്തമായി വായിക്കാനായില്ല" },
+    pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਦਿਖਾਓ", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ" },
+    or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦେଖାନ୍ତୁ", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ" },
   })[0];
 
   const getAudioContext = useCallback(() => {
@@ -1373,7 +1149,8 @@ export default function Home() {
     try {
       void context.close();
     } catch { /* already closed */ }
-    audioSourceRef.current = null;
+    playbackRef.current?.stop();
+    playbackRef.current = null;
     context = new AudioContextConstructor();
     audioContextRef.current = context;
     try {
@@ -1521,15 +1298,13 @@ export default function Home() {
 
   const startNewChat = useCallback(() => {
     audioRef.current?.pause();
+    stopBargeIn();
+    playbackRef.current?.stop();
+    playbackRef.current = null;
+    voiceSessionRef.current.cancel();
     const recorder = recorderRef.current;
-    if (recorder) {
-      recorderRef.current = null;
-      cancelAnimationFrame(recorder.raf);
-      recorder.processor.disconnect();
-      recorder.source.disconnect();
-      recorder.silenceGain.disconnect();
-      recorder.stream.getTracks().forEach((track) => track.stop());
-    }
+    recorderRef.current = null;
+    teardownRecorder(recorder);
     setIsRecording(false);
     setMicLevel(0);
     const session = makeSession("en");
@@ -1555,15 +1330,13 @@ export default function Home() {
     const session = sessionsRef.current.find((item) => item.id === id);
     if (!session) return;
     audioRef.current?.pause();
+    stopBargeIn();
+    playbackRef.current?.stop();
+    playbackRef.current = null;
+    voiceSessionRef.current.cancel();
     const recorder = recorderRef.current;
-    if (recorder) {
-      recorderRef.current = null;
-      cancelAnimationFrame(recorder.raf);
-      recorder.processor.disconnect();
-      recorder.source.disconnect();
-      recorder.silenceGain.disconnect();
-      recorder.stream.getTracks().forEach((track) => track.stop());
-    }
+    recorderRef.current = null;
+    teardownRecorder(recorder);
     setIsRecording(false);
     setMicLevel(0);
     setActiveSessionId(session.id);
@@ -1582,7 +1355,7 @@ export default function Home() {
     setStatusText(session.turns.length ? "Tap to continue" : "Tap to speak");
     setSessionPickerOpen(false);
     setViewMode(session.turns.length ? "history" : "voice");
-    console.info("[Setu session] loaded", { id: session.id, docId: session.docId, turns: session.turns.length });
+    debugLog("[Setu session] loaded", { id: session.id, docId: session.docId, turns: session.turns.length });
   }, []);
 
   const deleteSession = useCallback((id: string) => {
@@ -1621,12 +1394,7 @@ export default function Home() {
     const recorder = recorderRef.current;
     if (!recorder) return;
     recorderRef.current = null;
-    window.clearInterval(recorder.watchdog);
-    cancelAnimationFrame(recorder.raf);
-    recorder.processor.disconnect();
-    recorder.silenceGain.disconnect();
-    recorder.source.disconnect();
-    recorder.stream.getTracks().forEach((track) => track.stop());
+    teardownRecorder(recorder);
     isRecordingFlagRef.current = false;
     setIsRecording(false);
     setAutoStopProgress(0);
@@ -1638,16 +1406,28 @@ export default function Home() {
     setOrbState("idle");
     audioRef.current = null;
     setStatusText("Listening…");
-    // Brief delay lets TTS audio release before getUserMedia reopens the mic.
     window.setTimeout(() => {
       startRecordingRef.current?.({ force: true });
-    }, 160);
+    }, POST_TTS_RESUME_MS);
   }, []);
 
-  const playSpeech = useCallback(async (text: string, selectedLanguage: Language, continueListening = false, voice = speaker, cachedUrl?: string, onEnded?: () => void, maxSpokenChars = 200) => {
+  const playSpeech = useCallback(async (
+    text: string,
+    selectedLanguage: Language,
+    continueListening = false,
+    voice = speaker,
+    cachedUrl?: string,
+    onEnded?: () => void,
+    maxSpokenChars = 200,
+    prefetchedAudio?: ArrayBuffer,
+    prefetchedParts?: ArrayBuffer[],
+    allowBargeIn = true,
+  ) => {
     stopActiveRecording();
-    if (!cachedUrl && !text.trim()) {
-      // Nothing to say — never reopen the mic silently, or it interrupts the user.
+    stopBargeIn();
+    playbackRef.current?.stop();
+    playbackRef.current = null;
+    if (!cachedUrl && !prefetchedAudio && !(prefetchedParts && prefetchedParts.length) && !text.trim()) {
       orbStateRef.current = "idle";
       setOrbState("idle");
       setService(null);
@@ -1655,72 +1435,112 @@ export default function Home() {
       setStatusText("Tap to continue");
       return;
     }
-    setService("BULBUL");
+    setService("VOICE");
     orbStateRef.current = "processing";
     setOrbState("processing");
     setStatusText("Preparing a response");
+    let bargedIn = false;
+    // Barge-in opens a second mic stream — skip during onboarding so welcome TTS
+    // and the first listen aren't killed by speaker echo.
+    const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
+    const bargeInEnabled = Boolean(allowBargeIn && continueListening && session?.onboarded);
     try {
-      let url = cachedUrl;
-      if (!url) {
-        const trimmed = text.trim();
-        const ttsText = spokenText(trimmed, maxSpokenChars);
-        const speakStarted = performance.now();
-        const response = await fetch(`${API_URL}/speak`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: ttsText, language: selectedLanguage, speaker: voice, pace }) });
-        const speakMs = Math.round(performance.now() - speakStarted);
-        logStageTiming("speak", speakMs);
-        turnTimingRef.current.speak += speakMs;
-        if (!response.ok) {
-          const detail = await response.text().catch(() => "");
-          console.error(`[speak] failed language=${selectedLanguage} speaker=${voice} status=${response.status} ${detail}`);
-          throw new Error(`Speech unavailable for ${LANGUAGE_LABELS[selectedLanguage] ?? selectedLanguage}`);
+      let buffers = prefetchedParts?.filter(Boolean) ?? [];
+      if (!buffers.length) {
+        let arrayBuffer = prefetchedAudio;
+        if (!arrayBuffer) {
+          if (cachedUrl) {
+            const response = await fetch(cachedUrl);
+            if (!response.ok) throw new Error("Cached speech unavailable");
+            arrayBuffer = await response.arrayBuffer();
+          } else {
+            const trimmed = text.trim();
+            const ttsText = spokenText(trimmed, maxSpokenChars);
+            const speakStarted = performance.now();
+            arrayBuffer = await postSpeak({
+              text: ttsText,
+              language: selectedLanguage,
+              speaker: voice,
+              pace,
+            });
+            const speakMs = Math.round(performance.now() - speakStarted);
+            logStageTiming("speak", speakMs);
+            turnTimingRef.current.speak += speakMs;
+          }
         }
-        url = URL.createObjectURL(await response.blob());
+        buffers = [arrayBuffer!];
       }
-      const audio = new Audio(url);
-      audioRef.current?.pause();
-      audioRef.current = audio;
-      // Playback is routed through the context for the orb meter, so a suspended context
-      // means total silence — repair it before wiring the graph, not after.
       const context = await ensureRunningAudioContext();
-      const analyser = context.createAnalyser();
-      analyser.fftSize = 256;
-      const source = context.createMediaElementSource(audio);
-      audioSourceRef.current = source;
-      source.connect(analyser);
-      analyser.connect(context.destination);
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      const animate = () => { analyser.getByteFrequencyData(data); const normal = (from: number, to: number) => data.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255; setAmplitude(data.reduce((sum, value) => sum + value, 0) / data.length / 255); setBands({ bass: normal(0, Math.floor(data.length * 0.18)), treble: normal(Math.floor(data.length * 0.62), data.length) }); setSpectrum(Array.from({ length: 8 }, (_, index) => normal(Math.floor(data.length * index / 8), Math.floor(data.length * (index + 1) / 8)))); if (!audio.paused && !audio.ended) requestAnimationFrame(animate); };
-      audio.onplay = () => {
-        orbStateRef.current = "speaking";
-        setOrbState("speaking");
-        setStatusText("Speaking");
-        animate();
-      };
-      audio.onended = () => {
-        setAmplitude(0.2);
-        setBands({ bass: 0, treble: 0 });
-        setSpectrum(Array.from({ length: 8 }, () => 0));
-        setPreviewingVoice(null);
-        setService(null);
-        if (audioRef.current === audio) audioRef.current = null;
-        if (!cachedUrl) URL.revokeObjectURL(url);
-        onEnded?.();
-        if (continueListening) {
-          resumeListening();
-        } else {
-          orbStateRef.current = "idle";
-          setOrbState("idle");
-          setStatusText("Tap to speak");
-        }
-      };
-      await audio.play();
+      await new Promise<void>((resolve, reject) => {
+        const finishClean = () => {
+          stopBargeIn();
+          setAmplitude(0.2);
+          setBands({ bass: 0, treble: 0 });
+          setSpectrum(Array.from({ length: 8 }, () => 0));
+          setPreviewingVoice(null);
+          setService(null);
+          playbackRef.current = null;
+        };
+        void playDecodedBuffersSequential({
+          context,
+          arrayBuffers: buffers,
+          onPlay: () => {
+            orbStateRef.current = "speaking";
+            setOrbState("speaking");
+            setStatusText(bargeInEnabled ? "Speaking — interrupt anytime" : "Speaking");
+            if (bargeInEnabled) {
+              void startBargeInMonitor(context, () => {
+                if (bargedIn) return;
+                bargedIn = true;
+                voiceSessionRef.current.cancel();
+                playbackRef.current?.stop();
+                playbackRef.current = null;
+                finishClean();
+                onEnded?.();
+                resumeListening();
+                resolve();
+              }).then((monitor) => {
+                if (bargedIn || orbStateRef.current !== "speaking") {
+                  monitor.stop();
+                  return;
+                }
+                bargeInRef.current = monitor;
+              }).catch(() => {
+                /* barge-in optional on restricted browsers */
+              });
+            }
+          },
+          onAmplitude: (nextAmplitude, nextBands, nextSpectrum) => {
+            setAmplitude(nextAmplitude);
+            setBands(nextBands);
+            setSpectrum(nextSpectrum);
+          },
+          onEnded: () => {
+            if (bargedIn) return;
+            finishClean();
+            onEnded?.();
+            if (continueListening) {
+              resumeListening();
+            } else {
+              orbStateRef.current = "idle";
+              setOrbState("idle");
+              setStatusText("Tap to speak");
+            }
+            resolve();
+          },
+        }).then((handles) => {
+          playbackRef.current = handles;
+        }).catch(reject);
+      });
     } catch (error) {
       console.error(`[speak] language=${selectedLanguage} speaker=${voice}`, error);
+      stopBargeIn();
       setStatusText(error instanceof Error ? error.message : "Unable to play speech");
       orbStateRef.current = "idle";
       setOrbState("idle");
       setService(null);
       if (continueListening) resumeListening();
+      else setStatusText(error instanceof Error ? error.message : "Tap to continue");
     }
   }, [ensureRunningAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
 
@@ -1758,72 +1578,11 @@ export default function Home() {
     }
   }, []);
 
-  const converse = useCallback(async (message: string, selectedLanguage: Language, hasDocument: boolean) => {
-    const payload = {
-      message,
-      language: selectedLanguage,
-      has_document: hasDocument,
-      history: getHistoryPayload(),
-      session_id: activeSessionIdRef.current,
-      user_id: userIdRef.current ?? getStoredUserId(),
-      memory: getMemoryPayload(),
-    };
-    console.info("[Setu /converse]", payload);
-    const converseStarted = performance.now();
-    const response = await fetch(`${API_URL}/converse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const converseMs = Math.round(performance.now() - converseStarted);
-    logStageTiming("converse", converseMs);
-    turnTimingRef.current.converse += converseMs;
-    if (!response.ok) throw new Error("Conversation service unavailable");
-    return response.json() as Promise<{ reply: string; intent: "chat" | "needs_document" | "document_question" }>;
-  }, [getHistoryPayload, getMemoryPayload]);
-
   const clearDocument = useCallback(() => {
     setDocId(null);
     docIdRef.current = null;
     patchActiveSession({ docId: null });
   }, [patchActiveSession]);
-
-  const askDocument = useCallback(async (activeDocId: string, question: string, answerLanguage: Language) => {
-    const payload = {
-      doc_id: activeDocId,
-      question,
-      answer_language: answerLanguage,
-      session_id: activeSessionIdRef.current,
-      user_id: userIdRef.current ?? getStoredUserId(),
-      history: getHistoryPayload(),
-    };
-    console.info("[Setu routing] /ask", payload);
-    const askStarted = performance.now();
-    const response = await fetch(`${API_URL}/ask`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const askMs = Math.round(performance.now() - askStarted);
-    logStageTiming("ask", askMs);
-    turnTimingRef.current.ask += askMs;
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      console.error("[Setu /ask] failed", response.status, detail);
-      if (response.status === 404) clearDocument();
-      throw new Error(response.status === 404 ? "Document expired — show it again" : "Document answer service unavailable");
-    }
-    return response.json() as Promise<AskResponse>;
-  }, [clearDocument, getHistoryPayload]);
-
-  const summarizeDocument = useCallback(async (activeDocId: string, answerLanguage: Language) => {
-    const payload = { doc_id: activeDocId, answer_language: answerLanguage };
-    console.info("[Setu routing] /summarize", payload);
-    const summarizeStarted = performance.now();
-    const response = await fetch(`${API_URL}/summarize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const summarizeMs = Math.round(performance.now() - summarizeStarted);
-    logStageTiming("ask", summarizeMs);
-    turnTimingRef.current.ask += summarizeMs;
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      console.error("[Setu /summarize] failed", response.status, detail);
-      if (response.status === 404) clearDocument();
-      throw new Error(response.status === 404 ? "Document expired — show it again" : "Document summary unavailable");
-    }
-    return response.json() as Promise<{ summary: string }>;
-  }, [clearDocument]);
 
   const closeCamera = useCallback(() => {
     cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1856,12 +1615,19 @@ export default function Home() {
       form.append("file", blob, "setu-document.jpg");
       form.append("language", `${activeLanguage}-IN`);
       const scanStarted = performance.now();
-      const response = await fetch(`${API_URL}/scan`, { method: "POST", body: form });
+      const response = await fetch(`${API_URL}/scan`, { method: "POST", headers: { ...authHeaders() }, body: form });
       if (!response.ok || !response.body) throw new Error("Document scan failed");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let result: { doc_id?: string; status?: string; pages?: number; cached?: boolean } | null = null;
+      let result: {
+        doc_id?: string;
+        status?: string;
+        pages?: number;
+        cached?: boolean;
+        provider?: string;
+        preview?: string;
+      } | null = null;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1877,13 +1643,18 @@ export default function Home() {
             status?: string;
             pages?: number;
             cached?: boolean;
+            provider?: string;
+            preview?: string;
             detail?: string;
           };
-          if (event.type === "progress" && event.message) {
-            progressLabel = event.message;
-            const elapsed = Math.floor((performance.now() - started) / 1000);
-            setStatusText(`${progressLabel} · ${elapsed}s`);
-            console.info("[scan]", event.message);
+          if (event.type === "progress") {
+            if (event.provider === "openrouter") setService("VISION");
+            if (event.message) {
+              progressLabel = event.message;
+              const elapsed = Math.floor((performance.now() - started) / 1000);
+              setStatusText(`${progressLabel} · ${elapsed}s`);
+              console.info("[scan]", event.message, event.provider || "");
+            }
           } else if (event.type === "done") {
             result = event;
           } else if (event.type === "unclear_scan") {
@@ -1895,7 +1666,7 @@ export default function Home() {
       }
       const scanMs = Math.round(performance.now() - scanStarted);
       logStageTiming("scan", scanMs);
-      console.log(`[scan] vision=${scanMs}ms`);
+      console.log(`[scan] provider=${result?.provider || "?"} ${scanMs}ms`);
       if (!result || result.status === "unclear_scan" || !result.doc_id) {
         setService(null);
         await playSpeech(cameraText[activeLanguage].unclear, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
@@ -1904,49 +1675,51 @@ export default function Home() {
       }
       setDocId(result.doc_id);
       docIdRef.current = result.doc_id;
+
+      // Prefetch summary while we prepare TTS — keeps document context in this chat.
+      const summaryPromise = fetch(`${API_URL}/summarize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ doc_id: result.doc_id, answer_language: activeLanguage }),
+      })
+        .then(async (res) => (res.ok ? (await res.json() as { summary?: string }).summary : null))
+        .catch(() => null);
+
+      const readyText = cameraText[activeLanguage].ready;
+      const readyAudioPromise = postSpeak({
+        text: readyText,
+        language: activeLanguage,
+        speaker: "setu",
+        pace,
+      }).catch(() => null);
+
+      const summary = (await summaryPromise)?.trim() || null;
+      const spoken = summary || readyText;
       patchActiveSession({
         docId: result.doc_id,
-        documentName: sampleNamesRef.current[result.doc_id] ?? null,
+        documentName: sampleNamesRef.current[result.doc_id] ?? "Scanned document",
+        summary: summary || (result.preview || "").slice(0, 280) || null,
       });
       console.info("[Setu document] stored docId on session after /scan", {
         docId: result.doc_id,
         pages: result.pages,
+        provider: result.provider,
         sessionId: activeSessionIdRef.current,
-        refNow: docIdRef.current,
+        summaryChars: summary?.length ?? 0,
       });
-      setService("105B");
-      progressLabel = "Preparing overview";
-      setStatusText(`${progressLabel} · ${Math.floor((performance.now() - started) / 1000)}s`);
-      try {
-        const { summary } = await summarizeDocument(result.doc_id, activeLanguage);
-        setService(null);
-        addTurn({
-          userText: "Scanned document",
-          setuText: summary,
-          language: activeLanguage,
-          docId: result.doc_id,
-          documentImage,
-          setuKind: "summary",
-        });
-        setStatusText("Speaking overview");
-        await playSpeech(spokenText(summary), activeLanguage, false, speaker, undefined, async () => {
-          await playSpeech(cameraText[activeLanguage].ready, activeLanguage, true);
-          logTurnTiming(turnTimingRef.current);
-        });
-      } catch (summaryError) {
-        console.warn("[Setu document] summary failed; continuing", summaryError);
-        setService(null);
-        addTurn({
-          userText: "Scanned document",
-          setuText: cameraText[activeLanguage].ready,
-          language: activeLanguage,
-          docId: result.doc_id,
-          documentImage,
-          setuKind: "summary",
-        });
-        await playSpeech(cameraText[activeLanguage].ready, activeLanguage, true);
-        logTurnTiming(turnTimingRef.current);
-      }
+      setService(null);
+      addTurn({
+        userText: "Scanned document",
+        setuText: spoken,
+        language: activeLanguage,
+        docId: result.doc_id,
+        documentImage,
+        setuKind: summary ? "summary" : undefined,
+      });
+      setStatusText("Ready — ask me anything");
+      const readyBuf = summary ? undefined : (await readyAudioPromise) || undefined;
+      await playSpeech(spoken, activeLanguage, true, "setu", undefined, undefined, 220, readyBuf || undefined, undefined, false);
+      logTurnTiming(turnTimingRef.current);
     } catch (error) {
       setService(null);
       setOrbState("idle");
@@ -1955,7 +1728,7 @@ export default function Home() {
     } finally {
       window.clearInterval(clock);
     }
-  }, [addTurn, cameraText, patchActiveSession, playSpeech, speaker, summarizeDocument]);
+  }, [addTurn, cameraText, patchActiveSession, playSpeech, pace, speaker]);
 
   const captureDocument = useCallback(() => {
     if (cameraCapturedRef.current) return;
@@ -1963,7 +1736,8 @@ export default function Home() {
     if (!video || !canvas || !video.videoWidth) return;
     cameraCapturedRef.current = true;
     playCue([1], 0.04, 0.08, true);
-    const width = 1280; const height = Math.round(width * video.videoHeight / video.videoWidth);
+    // Sharp still for OCR — high res JPEG.
+    const width = 1600; const height = Math.round(width * video.videoHeight / video.videoWidth);
     canvas.width = width; canvas.height = height;
     canvas.getContext("2d")?.drawImage(video, 0, 0, width, height);
     canvas.toBlob((blob) => {
@@ -1971,39 +1745,57 @@ export default function Home() {
       console.log(`[capture] size=${blob.size} dims=${canvas.width}x${canvas.height}`);
       closeCamera();
       void scanDocument(blob);
-    }, "image/jpeg", 0.9);
+    }, "image/jpeg", 0.92);
   }, [closeCamera, playCue, scanDocument]);
 
   useEffect(() => {
     if (!cameraOpen) return;
-    cameraCapturedRef.current = false; cameraGoodChecksRef.current = 0;
+    cameraCapturedRef.current = false;
+    cameraGoodChecksRef.current = 0;
+    setCameraReadiness(0);
     let interval = 0;
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false })
+    let lastEdge = -1;
+    const openedAt = performance.now();
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      } as MediaTrackConstraints,
+      audio: false,
+    })
       .then((stream) => {
         cameraStreamRef.current = stream;
         const video = cameraVideoRef.current; if (!video) return;
         video.srcObject = stream;
+        void video.play().catch(() => undefined);
         interval = window.setInterval(() => {
           const canvas = cameraCanvasRef.current;
           if (!canvas || !video.videoWidth || cameraCapturedRef.current) return;
-          const width = 320; const height = Math.round(width * video.videoHeight / video.videoWidth);
+          if (performance.now() - openedAt < CAPTURE_MIN_WAIT_MS) {
+            setCameraReadiness(0);
+            return;
+          }
+          const width = 360; const height = Math.round(width * video.videoHeight / video.videoWidth);
           canvas.width = width; canvas.height = height;
           const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context) return;
           context.drawImage(video, 0, 0, width, height);
           const data = context.getImageData(0, 0, width, height).data;
           const analysis = analyzeDocumentFrame(data, width, height);
-          cameraGoodChecksRef.current = analysis.passed
+          const stable = lastEdge < 0 || Math.abs(analysis.edgeDensity - lastEdge) <= CAPTURE_STABILITY;
+          lastEdge = analysis.edgeDensity;
+          cameraGoodChecksRef.current = analysis.passed && stable
             ? Math.min(CAPTURE_STREAK, cameraGoodChecksRef.current + 1)
             : 0;
           setCameraReadiness(cameraGoodChecksRef.current);
-          console.info(
-            `[capture] edgeDensity=${analysis.edgeDensity.toFixed(3)} brightnessVar=${analysis.brightnessVariance.toFixed(1)} ` +
-              `peak=${analysis.peak.toFixed(3)} bestBlock=${analysis.bestBlock.toFixed(3)} ` +
-              `hot=${analysis.hotCells} blob=${analysis.largestBlob} passed=${analysis.passed} ` +
+          debugLog(
+            "[capture]",
+            `edge=${analysis.edgeDensity.toFixed(3)} var=${analysis.brightnessVariance.toFixed(1)} ` +
+              `peak=${analysis.peak.toFixed(3)} stable=${stable} ` +
               `streak=${cameraGoodChecksRef.current}/${CAPTURE_STREAK}`,
           );
-          if (cameraGoodChecksRef.current === CAPTURE_STREAK) captureDocument();
-        }, 500);
+          if (cameraGoodChecksRef.current >= CAPTURE_STREAK) captureDocument();
+        }, 280);
       })
       .catch(() => { setStatusText("Camera permission is required"); setCameraOpen(false); });
     return () => { window.clearInterval(interval); cameraStreamRef.current?.getTracks().forEach((track) => track.stop()); cameraStreamRef.current = null; };
@@ -2014,19 +1806,20 @@ export default function Home() {
     const recorder = recorderRef.current;
     if (!recorder) return;
     recorderRef.current = null;
-    window.clearInterval(recorder.watchdog);
-    cancelAnimationFrame(recorder.raf); recorder.processor.disconnect(); recorder.silenceGain.disconnect(); recorder.source.disconnect(); recorder.stream.getTracks().forEach((track) => track.stop());
+    teardownRecorder(recorder);
     isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
-    const speechMs = recorder.speechFrames * recorder.frameMs;
-    const tooLittleSpeech = !cancelled && recorder.heardSpeech && speechMs < MIN_SPEECH_MS;
+    const sttSession = browserSttRef.current;
+    browserSttRef.current = null;
+    const spokenMs = speechMs(recorder);
+    const tooLittleSpeech = !cancelled && recorder.heardSpeech && spokenMs < MIN_SPEECH_MS;
     if (cancelled || !recorder.heardSpeech || tooLittleSpeech) {
+      sttSession?.abort();
       orbStateRef.current = "idle";
       setOrbState("idle");
-      // Keep listening through short room noise instead of answering it.
       if (tooLittleSpeech && noiseDiscardsRef.current < 3) {
         noiseDiscardsRef.current += 1;
-        console.info("[Setu mic] ignored noise", { speechMs: Math.round(speechMs) });
+        debugLog("[Setu mic] ignored noise", { speechMs: Math.round(spokenMs) });
         setStatusText("Listening…");
         window.setTimeout(() => startRecordingRef.current?.({ force: true }), 120);
         return;
@@ -2035,26 +1828,76 @@ export default function Home() {
       setStatusText("Tap to continue");
       return;
     }
+    const browserTranscript = sttSession ? await sttSession.stop() : "";
+    if (browserTranscript) debugLog("[browser-stt]", { chars: browserTranscript.length, text: browserTranscript.slice(0, 80) });
     playCue([660, 440], 0.12, 0.07);
-    setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
+    setOrbState("processing"); setStatusText("Hearing you"); setService("LISTEN");
     turnTimingRef.current = emptyTurnTiming();
     try {
-      // Never pin STT to the active reply language — that blocks switches like "Marathi".
-      const form = new FormData(); form.append("file", encodeWav(recorder.chunks, recorder.sampleRate), "setu-question.wav");
-      const listenStarted = performance.now();
-      const listenResponse = await fetch(`${API_URL}/listen`, { method: "POST", body: form });
-      const listenMs = Math.round(performance.now() - listenStarted);
-      logStageTiming("listen", listenMs);
-      turnTimingRef.current.listen += listenMs;
-      if (!listenResponse.ok) throw new Error("Transcription service unavailable");
-      const listenResult = await listenResponse.json() as { transcript: string; language_code?: string };
-      const heard = listenResult.transcript.trim();
-      setService(null); setTranscript(heard);
+      const wav = recorderToWav(recorder);
+      const activeSession = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
+      const loadedDocId = docIdRef.current;
+      const history = getHistoryPayload();
+      const memory = getMemoryPayload();
+      const voiceStarted = performance.now();
+      const sessionCfg = {
+        language: languageRef.current,
+        hasDocument: Boolean(loadedDocId),
+        docId: loadedDocId,
+        sessionId: activeSessionIdRef.current,
+        history,
+        memory,
+        onboarded: Boolean(activeSession?.onboarded),
+        pace,
+      };
+
+      let result: VoiceTurnResponse;
+      const session = voiceSessionRef.current;
+      try {
+        await session.updateSession(sessionCfg);
+        result = await session.runUtterance(
+          wav,
+          {
+            onStatus: (stage, text) => {
+              if (stage === "stt") setService("LISTEN");
+              else if (stage === "think") setService("CHAT");
+              else if (stage === "tts") setService("VOICE");
+              if (text) setStatusText(text);
+            },
+            onTranscript: (text) => {
+              if (text) setTranscript(text);
+            },
+          },
+          undefined,
+          browserTranscript || null,
+        );
+        debugLog("[voice] websocket turn", { route: result.route, tools: result.tools_used });
+      } catch (wsError) {
+        debugLog("[voice] websocket fallback to POST /voice", wsError);
+        result = await postVoiceTurn({
+          audio: wav,
+          language: languageRef.current,
+          hasDocument: Boolean(loadedDocId),
+          docId: loadedDocId,
+          sessionId: activeSessionIdRef.current,
+          history,
+          memory,
+          onboarded: Boolean(activeSession?.onboarded),
+          speaker: "setu",
+          pace,
+          transcript: browserTranscript || null,
+        });
+      }
+      const voiceMs = Math.round(performance.now() - voiceStarted);
+      logStageTiming("listen", voiceMs);
+      turnTimingRef.current.listen += voiceMs;
+
+      const heard = result.transcript.trim();
+      setTranscript(heard);
       if (!heard) throw new Error("I could not understand that. Try again.");
-      // Short audio that transcribes to a stock filler is almost always invented by STT.
-      if (speechMs < 1100 && STT_NOISE_ONLY.test(heard) && noiseDiscardsRef.current < 3) {
+      if (spokenMs < 1100 && STT_NOISE_ONLY.test(heard) && noiseDiscardsRef.current < 3) {
         noiseDiscardsRef.current += 1;
-        console.info("[Setu mic] ignored likely hallucination", { heard, speechMs: Math.round(speechMs) });
+        debugLog("[Setu mic] ignored likely hallucination", { heard, speechMs: Math.round(spokenMs) });
         orbStateRef.current = "idle";
         setOrbState("idle");
         setTranscript("");
@@ -2063,309 +1906,167 @@ export default function Home() {
         return;
       }
       noiseDiscardsRef.current = 0;
-      const detected = listenResult.language_code?.toLowerCase().split("-", 1)[0] || "unknown";
+
       const requestedLanguage = explicitLanguage(heard);
       const activeLanguage = languageRef.current;
-      // Explicit name always wins (even after lock). Otherwise keep lock, or auto-detect on first turns.
-      const resolvedLanguage = requestedLanguage
-        ?? (languageLockedRef.current ? activeLanguage : resolveLanguage(heard, listenResult.language_code));
-      console.info(
-        `[lang] transcript=${JSON.stringify(heard)} detected=${detected} requested=${requestedLanguage ?? "none"} active=${activeLanguage} next=${resolvedLanguage}`,
-      );
+      const resolvedLanguage = (result.language as Language | undefined)
+        ?? requestedLanguage
+        ?? (languageLockedRef.current ? activeLanguage : resolveLanguage(heard, result.language_code));
+      debugLog("[lang]", { heard, requested: requestedLanguage, next: resolvedLanguage, route: result.route });
       setLanguage(resolvedLanguage);
       languageRef.current = resolvedLanguage;
       languageLockedRef.current = true;
       patchActiveSession({ language: resolvedLanguage });
 
-      const activeSession = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
-      if (activeSession && !activeSession.onboarded) {
-        setStatusText("Preparing Setu…");
-        const introResponse = await fetch(`${API_URL}/intro`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ language: resolvedLanguage }),
-        });
-        if (!introResponse.ok) throw new Error("Intro unavailable");
-        const introData = await introResponse.json() as { text: string };
-        const introText = introData.text.trim();
+      const audioParts = (result.audio_parts_base64?.length
+        ? result.audio_parts_base64
+        : result.audio_base64
+          ? [result.audio_base64]
+          : []
+      ).map((part) => base64ToArrayBuffer(part));
+      const audioBuffer = audioParts[0];
+
+      if (result.route === "intro") {
+        const introText = result.reply.trim() || introForLanguage(resolvedLanguage);
         addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
         patchActiveSession({ onboarded: true, language: resolvedLanguage });
         setHasStarted(true);
-        await playSpeech(introText, resolvedLanguage, true, speaker, undefined, undefined, 320);
+        await playSpeech(introText, resolvedLanguage, true, "setu", undefined, undefined, 160, audioBuffer, audioParts, false);
         logTurnTiming(turnTimingRef.current);
         return;
       }
 
-      if (requestedLanguage && (isLanguageChangeOnly(heard, requestedLanguage) || LANGUAGE_CHANGE.test(heard))) {
-        const reply = LANGUAGE_SWITCH_CONFIRMATION[resolvedLanguage];
-        addTurn({ userText: heard, setuText: reply, language: resolvedLanguage, ...(docIdRef.current ? { docId: docIdRef.current } : {}) });
-        // Confirm the switch and stay hands-free in the new language.
-        await playSpeech(reply, resolvedLanguage, true);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-      setStatusText("Thinking");
-      const loadedDocId = docIdRef.current;
-      const hasDocument = Boolean(loadedDocId);
-      const smallTalk = isClearSmallTalk(heard);
-      const substantive = isSubstantiveQuestion(heard);
-      const showDocument = WANTS_TO_SHOW_DOCUMENT.test(heard) || DOCUMENT_MENTION.test(heard);
-      console.info("[Setu routing] turn", {
-        docId: loadedDocId,
-        has_document: hasDocument,
-        smallTalk,
-        substantive,
-        showDocument,
-        transcript: heard,
-        language: resolvedLanguage,
-      });
-
-      // "I have a document" / show-it phrases → camera, never /ask.
-      if (showDocument && (WANTS_TO_SHOW_DOCUMENT.test(heard) || !loadedDocId)) {
-        console.info("[Setu routing] branch=open-camera", { reason: "user wants to show a document" });
-        addTurn({ userText: heard, setuText: cameraText[resolvedLanguage].show, language: resolvedLanguage });
-        await playSpeech(cameraText[resolvedLanguage].show, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true));
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      // Document loaded → /ask only for substantive questions.
-      if (loadedDocId && substantive) {
-        console.info("[Setu routing] branch=/ask", { docId: loadedDocId, reason: "document loaded, substantive question" });
-        setService("105B");
-        try {
-          const answer = await askDocument(loadedDocId, heard, resolvedLanguage);
-          setService(null);
-          setAnswerSheet({
-            answer: answer.answer,
-            status: answer.status,
-            abstain: answer.abstain,
-            all_verified: answer.all_verified,
-            evidence: answer.evidence ?? [],
-            corrections: answer.corrections ?? [],
-            action_items: answer.action_items ?? [],
-          });
-          mergeSessionCorrections(answer.corrections ?? []);
-          playCue([523, 659, 784], 0.06, 0.09);
-          addTurn({
-            userText: heard,
-            setuText: answer.answer,
-            language: resolvedLanguage,
-            docId: loadedDocId,
-            evidence: answer.evidence,
-            askMeta: askMetaFromResponse(answer),
-          });
-          await playSpeech(answer.answer, resolvedLanguage, true);
-        } catch (askError) {
-          setService(null);
-          console.error("[Setu routing] /ask error", askError);
-          setOrbState("idle");
-          setStatusText(askError instanceof Error ? askError.message : "Could not answer from the document");
+      if (result.route === "language_switch") {
+        // Before onboarding, never play the short switch confirm — deliver full intro instead.
+        if (!activeSession?.onboarded) {
+          const introText = introForLanguage(resolvedLanguage);
+          addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
+          patchActiveSession({ onboarded: true, language: resolvedLanguage });
+          setHasStarted(true);
+          await playSpeech(introText, resolvedLanguage, true, "setu", undefined, undefined, 160, undefined, undefined, false);
+          logTurnTiming(turnTimingRef.current);
+          return;
         }
+        addTurn({ userText: heard, setuText: result.reply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
+        await playSpeech(result.reply, resolvedLanguage, true, "setu", undefined, undefined, 200, audioBuffer, audioParts);
         logTurnTiming(turnTimingRef.current);
         return;
       }
 
-      if (loadedDocId && !substantive) {
-        const reason = acknowledgmentReason(heard);
-        console.info("[Setu routing] branch=acknowledgment", { reason, transcript: heard });
+      if (result.open_camera || result.route === "open_camera") {
+        addTurn({ userText: heard, setuText: result.reply || cameraText[resolvedLanguage].show, language: resolvedLanguage });
+        await playSpeech(result.reply || cameraText[resolvedLanguage].show, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true), 200, audioBuffer, audioParts);
+        logTurnTiming(turnTimingRef.current);
+        return;
+      }
+
+      if (result.route === "ask" && result.ask) {
+        const answer = result.ask;
+        setService("CHAT");
+        setAnswerSheet({
+          answer: answer.answer,
+          status: answer.status,
+          abstain: answer.abstain,
+          all_verified: answer.all_verified,
+          evidence: answer.evidence ?? [],
+          corrections: answer.corrections ?? [],
+          action_items: answer.action_items ?? [],
+        });
+        mergeSessionCorrections(answer.corrections ?? []);
+        playCue([523, 659, 784], 0.06, 0.09);
         addTurn({
           userText: heard,
-          setuText: BRIEF_ACK[resolvedLanguage],
+          setuText: answer.answer,
+          language: resolvedLanguage,
+          docId: loadedDocId ?? undefined,
+          evidence: answer.evidence,
+          askMeta: askMetaFromResponse(answer),
+        });
+        await playSpeech(answer.answer, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
+        logTurnTiming(turnTimingRef.current);
+        return;
+      }
+
+      if (result.route === "ack") {
+        addTurn({
+          userText: heard,
+          setuText: result.reply,
           language: resolvedLanguage,
           docId: loadedDocId ?? undefined,
         });
-        await playSpeech(BRIEF_ACK[resolvedLanguage], resolvedLanguage, true);
+        await playSpeech(result.reply, resolvedLanguage, true, speaker, undefined, undefined, 200, audioBuffer, audioParts);
         logTurnTiming(turnTimingRef.current);
         return;
       }
 
-      console.info("[Setu routing] branch=/converse", {
-        has_document: hasDocument,
-        reason: loadedDocId ? "small talk with document" : "no document",
-      });
-      const chat = await converse(heard, resolvedLanguage, hasDocument);
-      console.info("[Setu /converse] response", { intent: chat.intent, reply: chat.reply, has_document: hasDocument });
-
-      if (!loadedDocId && (chat.intent === "needs_document" || DOCUMENT_MENTION.test(heard))) {
-        console.info("[Setu routing] branch=open-camera", { intent: chat.intent });
-        addTurn({ userText: heard, setuText: cameraText[resolvedLanguage].show, language: resolvedLanguage });
-        await playSpeech(cameraText[resolvedLanguage].show, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true));
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      // An empty reply used to leave the loop silent and reopen the mic instantly.
-      const spokenReply = chat.reply.trim() || cameraText[resolvedLanguage].show;
+      const spokenReply = result.reply.trim() || cameraText[resolvedLanguage].show;
       addTurn({ userText: heard, setuText: spokenReply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-      await playSpeech(spokenReply, resolvedLanguage, true);
+      await playSpeech(spokenReply, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
       logTurnTiming(turnTimingRef.current);
     } catch (error) {
+      if (error instanceof Error && error.message === "cancelled") {
+        setService(null);
+        return;
+      }
       setService(null);
       setOrbState("idle");
-      setStatusText(error instanceof Error ? error.message : "Something went wrong");
+      const message = error instanceof Error ? error.message : "Something went wrong";
+      setStatusText(`${message} — tap to continue`);
       logTurnTiming(turnTimingRef.current);
     }
-  }, [addTurn, askDocument, cameraText, converse, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, speaker]);
+  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, speaker, pace]);
 
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     if (isRecordingFlagRef.current) { void finishRecording(); return; }
-    const audio = audioRef.current;
-    const audioStillPlaying = Boolean(audio && !audio.paused && !audio.ended);
-    if (!options?.force && (orbStateRef.current === "speaking" || audioStillPlaying)) return;
-    if (options?.force && audioStillPlaying) {
-      audio?.pause();
-      audioRef.current = null;
+    const playbackLive = Boolean(playbackRef.current);
+    if (!options?.force && (orbStateRef.current === "speaking" || playbackLive)) return;
+    if (options?.force && playbackLive) {
+      playbackRef.current?.stop();
+      playbackRef.current = null;
     }
+    audioRef.current?.pause();
+    audioRef.current = null;
     try {
       const context = await ensureRunningAudioContext();
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const source = context.createMediaStreamSource(stream); const analyser = context.createAnalyser(); analyser.fftSize = 256;
-      const processor = context.createScriptProcessor(4096, 1, 1); const silenceGain = context.createGain(); silenceGain.gain.value = 0;
-      source.connect(analyser); source.connect(processor); processor.connect(silenceGain); silenceGain.connect(context.destination);
-      const recorder = {
-        stream,
-        source,
-        analyser,
-        processor,
-        silenceGain,
-        chunks: [] as Float32Array[],
-        sampleRate: context.sampleRate,
-        startedAt: performance.now(),
-        heardSpeech: false,
-        silentSince: null as number | null,
-        raf: 0,
-        speechThreshold: SPEECH_LEVEL,
-        ambientSum: 0,
-        ambientCount: 0,
-        thresholdLocked: false,
-        lastLogAt: 0,
-        speechRunFrames: 0,
-        speechFrames: 0,
-        frameMs: (4096 / context.sampleRate) * 1000,
-        framesSeen: 0,
-        watchdog: 0,
-      };
+      const recorder = await startVoiceRecorder(context, {
+        onLevel: (amp, nextBands, level, threshold) => {
+          setAmplitude(amp);
+          setBands(nextBands);
+          setMicLevel(level);
+          setMicThreshold(threshold);
+        },
+        onAutoStopProgress: setAutoStopProgress,
+        onFinish: (cancelled) => {
+          if (recorderRef.current) void finishRecording(cancelled);
+        },
+        onWatchdog: (message) => {
+          setStatusText(message);
+          orbStateRef.current = "idle";
+          setOrbState("idle");
+        },
+      });
       recorderRef.current = recorder;
-      // Every stop rule below lives in processor.onaudioprocess. iOS Safari suspends the
-      // AudioContext outside a user gesture, so when the mic reopens by itself after Setu
-      // speaks that callback can never fire and the mic would stay open forever. This
-      // wall-clock timer is independent of the audio graph.
-      recorder.watchdog = window.setInterval(() => {
-        if (recorderRef.current !== recorder) {
-          window.clearInterval(recorder.watchdog);
-          return;
-        }
-        const elapsed = performance.now() - recorder.startedAt;
-        if (recorder.framesSeen === 0 && elapsed >= 1500) {
-          window.clearInterval(recorder.watchdog);
-          console.error("[Setu mic] no audio frames arrived", {
-            contextState: context.state,
-            elapsedMs: Math.round(elapsed),
-          });
-          void finishRecording(true);
-          setStatusText(
-            context.state === "running"
-              ? "Microphone gave no audio — tap to retry"
-              : "Microphone paused by the phone — tap to speak",
-          );
-          return;
-        }
-        if (elapsed >= MAX_RECORDING_MS + 1500) {
-          window.clearInterval(recorder.watchdog);
-          void finishRecording();
-        }
-      }, 250);
-      setTranscript("");
+      browserSttRef.current?.abort();
+      browserSttRef.current = startBrowserStt(languageRef.current);
       isRecordingFlagRef.current = true;
-      setIsRecording(true); playCue([440, 660], 0.12, 0.07);
+      setIsRecording(true);
       orbStateRef.current = "listening";
       setOrbState("listening");
-      setStatusText("I am listening…");
+      setStatusText("Listening…");
       setAutoStopProgress(0);
-      setMicLevel(0);
-      setMicThreshold(SPEECH_LEVEL);
-      const frequencyData = new Uint8Array(analyser.frequencyBinCount);
-      const animate = () => {
-        analyser.getByteFrequencyData(frequencyData);
-        const normal = (from: number, to: number) => frequencyData.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255;
-        setAmplitude(frequencyData.reduce((sum, value) => sum + value, 0) / frequencyData.length / 255);
-        setBands({ bass: normal(0, Math.floor(frequencyData.length * 0.18)), treble: normal(Math.floor(frequencyData.length * 0.62), frequencyData.length) });
-        setSpectrum(Array.from({ length: 8 }, (_, index) => normal(Math.floor(frequencyData.length * index / 8), Math.floor(frequencyData.length * (index + 1) / 8))));
-        if (recorderRef.current === recorder) recorder.raf = requestAnimationFrame(animate);
-      };
-      animate();
-      processor.onaudioprocess = (event) => {
-        const samples = new Float32Array(event.inputBuffer.getChannelData(0));
-        recorder.chunks.push(samples);
-        recorder.framesSeen += 1;
-        const rms = Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length);
-        const now = performance.now();
-        const elapsed = now - recorder.startedAt;
-
-        if (!recorder.thresholdLocked) {
-          if (elapsed < AMBIENT_MS) {
-            recorder.ambientSum += rms;
-            recorder.ambientCount += 1;
-          } else {
-            const ambient = recorder.ambientCount ? recorder.ambientSum / recorder.ambientCount : 0;
-            // Cap at 0.05 — noisy buses raise ambient so high speech never crosses the floor.
-            recorder.speechThreshold = Math.min(Math.max(ambient * 2.5, SPEECH_LEVEL), 0.05);
-            recorder.thresholdLocked = true;
-            setMicThreshold(recorder.speechThreshold);
-            console.info("[Setu mic] auto-gain", {
-              ambient: Number(ambient.toFixed(5)),
-              speechThreshold: Number(recorder.speechThreshold.toFixed(5)),
-              capped: ambient * 2.5 > 0.05,
-            });
-          }
-        }
-
-        const isSpeech = rms >= recorder.speechThreshold;
-        if (elapsed >= MAX_RECORDING_MS) {
-          void finishRecording();
-          return;
-        }
-        if (isSpeech) {
-          recorder.speechRunFrames += 1;
-          recorder.speechFrames += 1;
-          // A single spike is a tap or a door — only a sustained run counts as speech.
-          if (recorder.speechRunFrames >= SPEECH_FRAMES_TO_CONFIRM) {
-            recorder.heardSpeech = true;
-            recorder.silentSince = null;
-            setAutoStopProgress(0);
-          }
-        } else {
-          recorder.speechRunFrames = 0;
-          if (recorder.heardSpeech && elapsed >= MIN_RECORDING_MS) {
-            recorder.silentSince ??= now;
-            const silentFor = now - recorder.silentSince;
-            setAutoStopProgress(Math.max(0, (silentFor - (SILENCE_MS - 300)) / 300));
-            if (silentFor >= SILENCE_MS) void finishRecording();
-          }
-        }
-
-        if (now - recorder.lastLogAt >= 100) {
-          recorder.lastLogAt = now;
-          setMicLevel(rms);
-          console.info("[Setu mic]", {
-            rms: Number(rms.toFixed(5)),
-            heardSpeech: recorder.heardSpeech,
-            elapsedMs: Math.round(elapsed),
-            threshold: Number(recorder.speechThreshold.toFixed(5)),
-            speechNow: isSpeech,
-          });
-        }
-
-        if (!recorder.heardSpeech && elapsed >= NO_SPEECH_MS) void finishRecording(true);
-      };
+      window.setTimeout(() => {
+        if (recorderRef.current === recorder) void finishRecording(false);
+      }, MAX_RECORDING_MS + 1500);
     } catch (error) {
+      console.error("[Setu mic] start failed", error);
       isRecordingFlagRef.current = false;
       orbStateRef.current = "idle";
       setOrbState("idle");
+      setIsRecording(false);
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
     }
-  }, [ensureRunningAudioContext, finishRecording, playCue]);
+  }, [ensureRunningAudioContext, finishRecording]);
+
 
   useEffect(() => {
     startRecordingRef.current = (options?: { force?: boolean }) => void startRecording(options);
@@ -2373,7 +2074,17 @@ export default function Home() {
 
   const beginOrStop = async () => {
     if (isRecording) { void finishRecording(); return; }
-    if (orbState === "speaking") { audioRef.current?.pause(); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setOrbState("idle"); setStatusText("Tap to speak"); setService(null); return; }
+    if (orbState === "speaking") {
+      playbackRef.current?.stop();
+      playbackRef.current = null;
+      audioRef.current?.pause();
+      setAmplitude(0.2);
+      setBands({ bass: 0, treble: 0 });
+      setOrbState("idle");
+      setStatusText("Tap to speak");
+      setService(null);
+      return;
+    }
     setViewMode("voice");
     const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
     if (!session?.onboarded && !(session?.turns.length)) {
@@ -2382,7 +2093,7 @@ export default function Home() {
       setStatusText("Welcome to Setu");
       try {
         await getAudioContext().resume();
-        await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true);
+        await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true, "setu", undefined, undefined, 200, undefined, undefined, false);
       } catch {
         setOrbState("idle");
         setStatusText("Tap to start");
@@ -2408,7 +2119,7 @@ export default function Home() {
     try {
       let url = previewCacheRef.current.get(voice);
       if (!url) {
-        const response = await fetch(`${API_URL}/speak`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: samples[language], language, speaker: voice, pace }) });
+        const response = await fetch(`${API_URL}/speak`, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify({ text: samples[language], language, speaker: voice, pace }) });
         if (!response.ok) throw new Error("Speech service unavailable");
         url = URL.createObjectURL(await response.blob());
         previewCacheRef.current.set(voice, url);
@@ -2436,37 +2147,32 @@ export default function Home() {
           setAuthStatus("Sign-in link expired");
         }
       }
-      let restored: Session[];
-      let activeId: string;
+      // Always open a fresh chat — no restored history on launch.
       try {
-        const [storedSessions, storedActiveId] = await Promise.all([
-          readSessions<Session>(),
-          readActiveSessionId(),
-        ]);
-        ({ sessions: restored, activeId } = hydrateStoredSessions(storedSessions, storedActiveId, languageRef.current));
-      } catch (error) {
-        console.warn("Setu local database unavailable; using legacy storage", error);
-        ({ sessions: restored, activeId } = loadSessionsFromStorage(languageRef.current));
+        await Promise.all([writeSessions([]), writeActiveSessionId(null)]);
+      } catch {
+        try {
+          localStorage.removeItem("setu-sessions");
+          localStorage.removeItem("setu-active-session");
+          localStorage.removeItem("setu-history");
+        } catch { /* ignore */ }
       }
       if (cancelled) return;
-      setSessions(restored);
-      setActiveSessionId(activeId);
-      activeSessionIdRef.current = activeId;
-      sessionsRef.current = restored;
-      const active = restored.find((session) => session.id === activeId) ?? restored[0];
-      if (active) {
-        setDocId(active.docId);
-        docIdRef.current = active.docId;
-        setLanguage(active.language);
-        languageRef.current = active.language;
-        languageLockedRef.current = Boolean(active.onboarded || active.turns.length);
-        setHasStarted(Boolean(active.onboarded || active.turns.length));
-        if (!active.onboarded && active.turns.length === 0) {
-          setStatusText("Tap to start");
-        } else {
-          setStatusText(active.turns.length ? "Tap to continue" : "Tap to speak");
-        }
-      }
+      const fresh = makeSession("en");
+      setSessions([fresh]);
+      setActiveSessionId(fresh.id);
+      activeSessionIdRef.current = fresh.id;
+      sessionsRef.current = [fresh];
+      setDocId(null);
+      docIdRef.current = null;
+      setLanguage("en");
+      languageRef.current = "en";
+      languageLockedRef.current = false;
+      setHasStarted(false);
+      setTranscript("");
+      setAnswerSheet(null);
+      setSpeaker("setu");
+      setStatusText("Tap to start");
       setSessionsLoaded(true);
     };
     void restore();
@@ -2475,36 +2181,56 @@ export default function Home() {
 
   useEffect(() => {
     if (!sessionsLoaded) return;
+    // Persist only the active fresh session (no multi-chat history restore).
     void (async () => {
       try {
+        const active = sessions.find((session) => session.id === activeSessionId);
+        const only = active ? [active] : [];
         await Promise.all([
-          writeSessions(sessions),
+          writeSessions(only),
           writeActiveSessionId(activeSessionId),
         ]);
-        const active = sessions.find((session) => session.id === activeSessionId);
         if (active) await syncSessionToServer(active);
       } catch (error) {
         console.error("Setu could not save chat history locally", error);
-        setStatusText("Could not save chat history");
       }
     })();
   }, [sessions, activeSessionId, sessionsLoaded, syncSessionToServer]);
 
-  useEffect(() => () => { recorderRef.current?.stream.getTracks().forEach((track) => track.stop()); audioRef.current?.pause(); previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url)); }, []);
+  useEffect(() => () => {
+    teardownRecorder(recorderRef.current);
+    recorderRef.current = null;
+    const monitor = bargeInRef.current;
+    bargeInRef.current = null;
+    monitor?.stop();
+    playbackRef.current?.stop();
+    audioRef.current?.pause();
+    voiceSessionRef.current.close();
+    previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url));
+  }, []);
 
   // Hold a wake lock while the conversation is live so the phone cannot lock mid-answer.
   useEffect(() => {
     const conversationLive = orbState !== "idle" || isRecording;
     let sentinel: WakeLockSentinel | null = null;
     let released = false;
-    if (conversationLive && "wakeLock" in navigator) {
+
+    const request = () => {
+      if (!conversationLive || !("wakeLock" in navigator)) return;
       void navigator.wakeLock.request("screen").then((lock) => {
         if (released) { void lock.release(); return; }
         sentinel = lock;
       }).catch(() => { /* denied or unsupported — conversation still works */ });
-    }
+    };
+
+    request();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && conversationLive) request();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       released = true;
+      document.removeEventListener("visibilitychange", onVisibility);
       if (sentinel && !sentinel.released) void sentinel.release().catch(() => {});
     };
   }, [orbState, isRecording]);
@@ -2594,12 +2320,11 @@ export default function Home() {
         </header>
         {viewMode === "history" ? (
           <div
-            ref={transcriptRef}
             aria-label="Conversation transcript"
             className="flex min-h-0 flex-1 flex-col overflow-hidden px-1 py-3"
           >
             <CorrectionsStrip corrections={activeCorrections} language={actionSheetLanguage} className="mb-3 shrink-0" />
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <div ref={transcriptRef} className="min-h-0 flex-1 overflow-y-auto">
               <div className="flex flex-col gap-3">
                 {(activeSession?.turns ?? []).map((turn) => (
                   <TranscriptBubble key={turn.id} turn={turn} />
@@ -2611,7 +2336,7 @@ export default function Home() {
           <>
             <section className="flex flex-1 flex-col items-center justify-center pb-5 pt-8">
               <SetuOrb orbState={orbState} amplitude={amplitude} bass={bands.bass} treble={bands.treble} spectrum={spectrum} autoStopProgress={autoStopProgress} onClick={() => void beginOrStop()} />
-              {isRecording && (
+              {isRecording && isDebugAudio() && (
                 <div className="mt-5 w-44" aria-label="Microphone level">
                   <div className="h-1.5 overflow-hidden rounded-full bg-slate-200/80">
                     <div
@@ -2627,6 +2352,15 @@ export default function Home() {
               <AnimatePresence mode="wait"><motion.p key={displayStatus || "status"} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.22 }} className={`${isRecording ? "mt-4" : "mt-8"} text-center text-sm font-medium tracking-[-0.01em] text-slate-700`}>{displayStatus}</motion.p></AnimatePresence>
               <CorrectionsStrip corrections={activeCorrections} language={actionSheetLanguage} className="mt-2 max-w-xs w-full" />
               {transcript && <motion.p variants={{ show: { transition: { staggerChildren: 0.03 } } }} initial="hidden" animate="show" className="mt-2 max-w-xs text-center text-xs leading-5 text-slate-500">Heard: {transcript.split(/\s+/).filter(Boolean).map((word, index) => <motion.span key={`heard-${index}`} variants={{ hidden: { opacity: 0, y: 4 }, show: { opacity: 1, y: 0 } }} className="mr-1 inline-block">{word}</motion.span>)}</motion.p>}
+              {(activeSession?.turns.length ?? 0) > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setViewMode("history")}
+                  className="mt-4 text-xs font-semibold text-[#4f46e5] underline-offset-2 hover:underline"
+                >
+                  Open conversation
+                </button>
+              )}
             </section>
             <div
               className="setu-composer glass-surface glass-on-waves mb-3 flex h-14 shrink-0 items-center gap-2 rounded-full pl-1.5 pr-1.5 shadow-[0_10px_28px_rgba(71,85,105,0.10)]"
@@ -2665,7 +2399,7 @@ export default function Home() {
                 {isExportingActionSheet ? "…" : actionSheetLabels.download}
               </button>
             )}
-            <footer className="flex shrink-0 items-center justify-center gap-2 pb-1 text-[9px] font-semibold tracking-[0.16em]">{(["VISION", "105B", "BULBUL", "SAARAS"] as StackService[]).map((service, index) => <span key={service} className={activeService === service ? "text-[#ff6b00]" : "text-slate-500"}>{index > 0 && <span className="mr-2 text-slate-400">·</span>}{service}</span>)}</footer>
+            <footer className="flex shrink-0 items-center justify-center gap-2 pb-1 text-[9px] font-semibold tracking-[0.16em]">{(["VISION", "CHAT", "VOICE", "LISTEN"] as StackService[]).map((service, index) => <span key={service} className={activeService === service ? "text-[#ff6b00]" : "text-slate-500"}>{index > 0 && <span className="mr-2 text-slate-400">·</span>}{service}</span>)}</footer>
           </>
         )}
       </div>
@@ -2877,24 +2611,7 @@ export default function Home() {
             </div>
             <div className="mt-8 min-h-0 flex-1">
               <p className="text-xs font-semibold tracking-[0.14em] text-slate-400">VOICE</p>
-              <div className="mt-3 max-h-64 space-y-1 overflow-y-auto pr-1">
-                {voices.length ? voices.map((voice) => (
-                  <button
-                    key={voice}
-                    onClick={() => void selectVoice(voice)}
-                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition ${speaker === voice ? "bg-[#4f46e5] text-white" : "hover:bg-[#fff7ed] text-slate-600"}`}
-                  >
-                    <span>{voice}</span>
-                    {previewingVoice === voice && (
-                      <motion.span
-                        className="h-2 w-2 rounded-full bg-[#ff6b00]"
-                        animate={{ scale: [1, 1.6] }}
-                        transition={{ type: "tween", duration: 0.5, repeat: Infinity, repeatType: "reverse" }}
-                      />
-                    )}
-                  </button>
-                )) : <p className="text-sm text-slate-400">Loading voices…</p>}
-              </div>
+              <p className="mt-3 text-sm text-slate-600">OpenRouter Indic TTS — one consistent Setu voice.</p>
             </div>
           </motion.aside>
         )}
