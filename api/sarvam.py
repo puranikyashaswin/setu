@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import zipfile
 from collections import OrderedDict
@@ -231,6 +232,21 @@ def v3_speakers() -> list[str]:
 _TTS_CACHE_DIR = _CACHE_DIR / "tts"
 _TTS_MEMORY: "OrderedDict[str, bytes]" = OrderedDict()
 _TTS_MEMORY_MAX = 64
+# One Bulbul request in flight per process — avoids 429 storms on Render.
+_TTS_LOCK = threading.Lock()
+_TTS_IN_FLIGHT = 0
+_TTS_MAX_CHARS = 240
+_LAZY_INTRO_WARM_STARTED = False
+_LAZY_INTRO_WARM_LOCK = threading.Lock()
+
+
+class TtsError(RuntimeError):
+    """Structured TTS failure — never treat as empty success."""
+
+    def __init__(self, message: str, *, status: object = None, language: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.language = language
 
 
 def _tts_cache_key(text: str, lang: str, voice: str, pace: float) -> str:
@@ -269,18 +285,48 @@ def _tts_cache_put(key: str, data: bytes) -> None:
         logger.warning("[speak] cache write failed key=%s", key, exc_info=True)
 
 
-def speak(
-    text: str, language: str, speaker: str = "shubh", pace: float = 1.0
-) -> bytes:
+def _cap_tts_text(text: str, max_chars: int = _TTS_MAX_CHARS) -> str:
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return ""
+    if len(trimmed) <= max_chars:
+        return trimmed
+    cut = trimmed[:max_chars].rsplit(" ", 1)[0].strip()
+    return cut or trimmed[:max_chars].strip()
+
+
+def _retry_after_seconds(exc: BaseException, default: float = 1.0) -> float:
+    headers = getattr(exc, "headers", None) or {}
+    raw = None
+    try:
+        items = headers.items() if hasattr(headers, "items") else []
+        for key, value in items:
+            if str(key).lower() == "retry-after":
+                raw = value
+                break
+    except Exception:
+        raw = None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = default
+    return max(0.0, min(val, 2.0))
+
+
+def _is_http_429(exc: BaseException) -> bool:
+    status = _error_status(exc)
+    return status == 429 or str(status) == "429"
+
+
+def _tts_provider_convert(
+    *,
+    text: str,
+    lang: str,
+    voice: str,
+    pace: float,
+):
+    """One provider call with a single 429 retry honoring Retry-After (≤2s)."""
     client = get_client()
-    voice = resolve_speaker(speaker)
-    lang = _lang_code(language)
-    # Intros and confirmations repeat constantly; synthesizing them again costs seconds.
-    key = _tts_cache_key(text, lang, voice, pace)
-    cached = _tts_cache_get(key)
-    if cached is not None:
-        logger.info("[speak] cache hit language=%s chars=%s", lang, len(text))
-        return cached
 
     def call():
         return client.text_to_speech.convert(
@@ -293,18 +339,115 @@ def speak(
         )
 
     try:
-        resp = _with_backoff(call)
-    except Exception as exc:
-        logger.error(
-            "[speak] TTS failed language=%s speaker=%s: %s",
+        return call()
+    except BaseException as first:
+        if not _is_http_429(first):
+            raise
+        wait_s = _retry_after_seconds(first, default=1.0)
+        logger.info("[tts] retry_429 attempt=1 retry_after_s=%s", wait_s)
+        time.sleep(wait_s)
+        try:
+            return call()
+        except BaseException as second:
+            logger.info(
+                "[tts] failed status=%s language=%s",
+                _error_status(second),
+                lang,
+            )
+            raise TtsError(
+                f"TTS rate-limited: {second}",
+                status=_error_status(second),
+                language=lang,
+            ) from second
+
+
+def _schedule_lazy_intro_warm(language: str) -> None:
+    """After first real TTS success, optionally cache one te/hi/en intro — never at startup."""
+    global _LAZY_INTRO_WARM_STARTED
+    base = _lang_base(language)
+    if base not in {"te", "hi", "en"}:
+        return
+    with _LAZY_INTRO_WARM_LOCK:
+        if _LAZY_INTRO_WARM_STARTED:
+            return
+        _LAZY_INTRO_WARM_STARTED = True
+
+    def _run() -> None:
+        try:
+            phrase = intro_for_language(base)
+            speak(phrase, base)
+            logger.info("[warmup] lazy_intro language=%s chars=%s", base, len(phrase))
+        except Exception:
+            logger.warning("[warmup] lazy_intro failed language=%s", base, exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name="lazy-intro-tts").start()
+
+
+def speak(
+    text: str, language: str, speaker: str = "shubh", pace: float = 1.0
+) -> bytes:
+    global _TTS_IN_FLIGHT
+    voice = resolve_speaker(speaker)
+    lang = _lang_code(language)
+    capped = _cap_tts_text(text, _TTS_MAX_CHARS)
+    if not capped:
+        raise TtsError("TTS text empty after cap", status="empty_text", language=lang)
+
+    key = _tts_cache_key(capped, lang, voice, pace)
+    cached = _tts_cache_get(key)
+    if cached is not None:
+        logger.info(
+            "[tts] cache_hit=true language=%s chars=%s",
             lang,
-            voice,
-            exc,
+            len(capped),
         )
-        raise
-    audio = _tts_to_wav(resp)
-    _tts_cache_put(key, audio)
+        return cached
+
+    wait_t0 = time.perf_counter()
+    with _TTS_LOCK:
+        wait_ms = int((time.perf_counter() - wait_t0) * 1000)
+        logger.info("[tts] request_wait_ms=%s", wait_ms)
+        _TTS_IN_FLIGHT += 1
+        try:
+            if _TTS_IN_FLIGHT != 1:
+                # Should be impossible under a lock; keep for tests/observability.
+                logger.warning("[tts] in_flight=%s under lock", _TTS_IN_FLIGHT)
+            try:
+                resp = _tts_provider_convert(
+                    text=capped, lang=lang, voice=voice, pace=pace
+                )
+            except TtsError:
+                raise
+            except BaseException as exc:
+                logger.info(
+                    "[tts] failed status=%s language=%s",
+                    _error_status(exc),
+                    lang,
+                )
+                raise TtsError(
+                    f"TTS failed: {exc}",
+                    status=_error_status(exc),
+                    language=lang,
+                ) from exc
+            audio = _tts_to_wav(resp)
+            if not audio:
+                logger.info("[tts] failed status=empty_audio language=%s", lang)
+                raise TtsError(
+                    "TTS returned empty audio",
+                    status="empty_audio",
+                    language=lang,
+                )
+            _tts_cache_put(key, audio)
+        finally:
+            _TTS_IN_FLIGHT -= 1
+
+    _schedule_lazy_intro_warm(lang)
     return audio
+
+
+def tts_in_flight_count() -> int:
+    """Test helper: current in-flight Bulbul conversions (0 or 1)."""
+    return _TTS_IN_FLIGHT
 
 
 def listen(audio_bytes: bytes, filename: str, language: str | None = None) -> dict:
@@ -832,12 +975,12 @@ def camera_phrase(language: str, key: str) -> str:
     return phrases.get(key) or CAMERA_PHRASES_BY_LANG["en"].get(key, "")
 
 
-def spoken_text(text: str, max_chars: int = 200) -> str:
-    """Frontend-compatible spoken truncation for TTS."""
+def spoken_text(text: str, max_chars: int = 240) -> str:
+    """Spoken truncation for TTS — one short sentence, hard-capped."""
     trimmed = (text or "").strip()
     if not trimmed:
         return ""
-    capped = cap_answer_sentences(trimmed, 2)
+    capped = cap_answer_sentences(trimmed, 1)
     if len(capped) <= max_chars:
         return capped
     cut = capped[:max_chars].rsplit(" ", 1)[0].strip()
@@ -845,17 +988,8 @@ def spoken_text(text: str, max_chars: int = 200) -> str:
 
 
 def fixed_warm_phrases() -> list[tuple[str, str]]:
-    """(text, language) pairs to pre-synthesize for demo snappiness."""
-    pairs: list[tuple[str, str]] = [(VOICE_LANGUAGE_PROMPT, "en")]
-    for lang in ("en", "hi", "te", "kn", "ta", "mr"):
-        pairs.append((intro_for_language(lang), lang))
-        pairs.append((brief_ack_for_language(lang), lang))
-        pairs.append((language_switch_for_language(lang), lang))
-        for key in ("show", "ready", "unclear"):
-            text = camera_phrase(lang, key)
-            if text:
-                pairs.append((text, lang))
-    return pairs
+    """Deprecated: startup must not bulk-warm TTS. Kept for tests/compat (empty)."""
+    return []
 
 
 def chat_reply(

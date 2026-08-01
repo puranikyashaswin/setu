@@ -8,7 +8,15 @@ import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions 
 import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
-import { base64ToArrayBuffer, playDecodedBuffersSequential, type PlaybackHandles } from "@/lib/audio/playback";
+import {
+  base64ToArrayBuffer,
+  nextPlaybackTurnId,
+  playDecodedBuffersSequential,
+  stopAllPlayback,
+  type PlaybackHandles,
+} from "@/lib/audio/playback";
+import { browserSttSupported, startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
+import { createVoiceLoop } from "@/lib/voice-loop";
 import {
   MAX_RECORDING_MS,
   MIN_SPEECH_MS,
@@ -20,7 +28,6 @@ import {
   teardownRecorder,
   type RecorderSession,
 } from "@/lib/audio/recorder";
-import { startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
 import { debugLog, isDebugAudio, voiceClientLog } from "@/lib/debug";
 import { getVoiceSession } from "@/lib/voice-session";
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
@@ -551,11 +558,11 @@ const SUMMARY_LABEL: Record<Language, string> = {
   or: "ଏହି ଦଲିଲର ସମୀକ୍ଷା",
 };
 
-function spokenText(text: string, maxChars = 200): string {
+function spokenText(text: string, maxChars = 240): string {
   const trimmed = text.trim();
   if (!trimmed) return "";
   const sentences = trimmed.match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g) ?? [trimmed];
-  let spoken = sentences.slice(0, 2).join(" ").trim();
+  let spoken = (sentences[0] || trimmed).trim();
   if (spoken.length > maxChars) {
     spoken = spoken.slice(0, maxChars).replace(/\s+\S*$/, "").trim();
     if (!spoken) spoken = trimmed.slice(0, maxChars).trim();
@@ -1050,6 +1057,12 @@ export default function Home() {
   const browserSttRef = useRef<BrowserSttSession | null>(null);
   const playbackRef = useRef<PlaybackHandles | null>(null);
   const bargeInRef = useRef<BargeInMonitor | null>(null);
+  const voiceLoopRef = useRef(
+    createVoiceLoop((event, data) => {
+      voiceClientLog(event, data);
+    }),
+  );
+  const speakTurnIdRef = useRef(0);
   const stopBargeIn = () => {
     const monitor = bargeInRef.current;
     bargeInRef.current = null;
@@ -1402,11 +1415,15 @@ export default function Home() {
     setMicLevel(0);
   }, []);
 
-  const resumeListening = useCallback(() => {
-    voiceClientLog("auto_relisten_fired");
-    orbStateRef.current = "idle";
-    setOrbState("idle");
+  const resumeListening = useCallback((fromTurnId?: number) => {
+    const loop = voiceLoopRef.current;
+    const turn = fromTurnId ?? speakTurnIdRef.current;
+    voiceClientLog("auto_relisten_fired", { turn_id: turn });
+    const gate = loop.tryResumeListening(turn);
+    if (!gate.ok) return;
     audioRef.current = null;
+    orbStateRef.current = "listening";
+    setOrbState("listening");
     setStatusText("Listening…");
     window.setTimeout(() => {
       startRecordingRef.current?.({ force: true });
@@ -1420,7 +1437,7 @@ export default function Home() {
     voice = speaker,
     cachedUrl?: string,
     onEnded?: () => void,
-    maxSpokenChars = 200,
+    maxSpokenChars = 240,
     prefetchedAudio?: ArrayBuffer,
     prefetchedParts?: ArrayBuffer[],
     allowBargeIn = true,
@@ -1429,7 +1446,14 @@ export default function Home() {
     stopBargeIn();
     playbackRef.current?.stop();
     playbackRef.current = null;
+    stopAllPlayback();
+    const loop = voiceLoopRef.current;
+    const playTurnId = loop.beginTurn();
+    speakTurnIdRef.current = playTurnId;
+    const playbackTurnId = nextPlaybackTurnId();
+
     if (!cachedUrl && !prefetchedAudio && !(prefetchedParts && prefetchedParts.length) && !text.trim()) {
+      loop.transition("idle", "empty_speech");
       orbStateRef.current = "idle";
       setOrbState("idle");
       setService(null);
@@ -1438,6 +1462,7 @@ export default function Home() {
       return;
     }
     setService("BULBUL");
+    loop.transition("thinking", "prepare_tts");
     orbStateRef.current = "processing";
     setOrbState("processing");
     setStatusText("Preparing a response");
@@ -1447,7 +1472,12 @@ export default function Home() {
     const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
     const bargeInEnabled = Boolean(allowBargeIn && continueListening && session?.onboarded);
     try {
+      // Prefer a single buffer when possible — multi-part only if server already split.
       let buffers = prefetchedParts?.filter(Boolean) ?? [];
+      if (buffers.length > 1) {
+        // Collapse to one part for normal chat unless we only have streamed parts.
+        // Keep serial queue but prefer first+join is not possible for audio; play serially.
+      }
       if (!buffers.length) {
         let arrayBuffer = prefetchedAudio;
         if (!arrayBuffer) {
@@ -1486,20 +1516,25 @@ export default function Home() {
         void playDecodedBuffersSequential({
           context,
           arrayBuffers: buffers,
+          turnId: playbackTurnId,
           onPlay: () => {
+            loop.transition("speaking", "playback_start");
             orbStateRef.current = "speaking";
             setOrbState("speaking");
             setStatusText(bargeInEnabled ? "Speaking — interrupt anytime" : "Speaking");
             if (bargeInEnabled) {
               void startBargeInMonitor(context, () => {
                 if (bargedIn) return;
+                if (speakTurnIdRef.current !== playTurnId) return;
                 bargedIn = true;
                 voiceSessionRef.current.cancel();
                 playbackRef.current?.stop();
                 playbackRef.current = null;
+                stopAllPlayback();
                 finishClean();
+                loop.transition("idle", "barge_in");
                 onEnded?.();
-                resumeListening();
+                resumeListening(playTurnId);
                 resolve();
               }).then((monitor) => {
                 if (bargedIn || orbStateRef.current !== "speaking") {
@@ -1519,11 +1554,19 @@ export default function Home() {
           },
           onEnded: () => {
             if (bargedIn) return;
+            if (speakTurnIdRef.current !== playTurnId) {
+              voiceClientLog("mic_open_skipped", { reason: "stale_turn", turn_id: playTurnId });
+              finishClean();
+              resolve();
+              return;
+            }
             finishClean();
             onEnded?.();
             if (continueListening) {
-              resumeListening();
+              loop.transition("idle", "playback_end");
+              resumeListening(playTurnId);
             } else {
+              loop.transition("idle", "playback_end_no_listen");
               orbStateRef.current = "idle";
               setOrbState("idle");
               setStatusText("Tap to speak");
@@ -1538,10 +1581,11 @@ export default function Home() {
       console.error(`[speak] language=${selectedLanguage} speaker=${voice}`, error);
       stopBargeIn();
       setStatusText(error instanceof Error ? error.message : "Unable to play speech");
+      loop.transition("idle", "speak_error");
       orbStateRef.current = "idle";
       setOrbState("idle");
       setService(null);
-      if (continueListening) resumeListening();
+      if (continueListening && speakTurnIdRef.current === playTurnId) resumeListening(playTurnId);
       else setStatusText(error instanceof Error ? error.message : "Tap to continue");
     }
   }, [ensureRunningAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
@@ -1586,11 +1630,19 @@ export default function Home() {
     patchActiveSession({ docId: null });
   }, [patchActiveSession]);
 
+  const openCamera = useCallback(() => {
+    voiceLoopRef.current.transition("scanning", "camera_open");
+    setCameraOpen(true);
+  }, []);
+
   const closeCamera = useCallback(() => {
     cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     cameraStreamRef.current = null;
     cameraGoodChecksRef.current = 0;
     setCameraOpen(false); setCameraReadiness(0);
+    if (voiceLoopRef.current.state === "scanning") {
+      voiceLoopRef.current.transition("idle", "camera_closed");
+    }
   }, []);
 
   const scanDocument = useCallback(async (blob: Blob) => {
@@ -1616,7 +1668,7 @@ export default function Home() {
         language: activeLanguage,
         documentImage,
       });
-      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
+      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => openCamera());
       return;
     }
     try {
@@ -1654,7 +1706,7 @@ export default function Home() {
         language: activeLanguage,
         documentImage,
       });
-      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
+      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => openCamera());
       logTurnTiming(turnTimingRef.current);
     };
 
@@ -1694,7 +1746,7 @@ export default function Home() {
           false,
           speaker,
           undefined,
-          () => setCameraOpen(true),
+          () => openCamera(),
         );
         logTurnTiming(turnTimingRef.current);
         return;
@@ -1759,7 +1811,7 @@ export default function Home() {
       window.clearInterval(watchdog);
       window.clearInterval(clock);
     }
-  }, [addTurn, cameraText, patchActiveSession, playSpeech, pace, speaker]);
+  }, [addTurn, cameraText, openCamera, patchActiveSession, playSpeech, pace, speaker]);
 
   const captureDocument = useCallback(() => {
     if (cameraCapturedRef.current) return;
@@ -1857,8 +1909,10 @@ export default function Home() {
       if (tooLittleSpeech && noiseDiscardsRef.current < 3) {
         noiseDiscardsRef.current += 1;
         debugLog("[Setu mic] ignored noise", { speechMs: Math.round(spokenMs) });
-        setStatusText("Listening…");
-        window.setTimeout(() => startRecordingRef.current?.({ force: true }), 120);
+        const turn = voiceLoopRef.current.beginTurn();
+        speakTurnIdRef.current = turn;
+        voiceLoopRef.current.transition("idle", "noise_discard");
+        resumeListening(turn);
         return;
       }
       noiseDiscardsRef.current = 0;
@@ -1869,7 +1923,13 @@ export default function Home() {
     let browserTranscript = "";
     if (sttSession) {
       try {
-        browserTranscript = sttSession.unavailable() ? "" : await sttSession.stop();
+        if (sttSession.unavailable()) {
+          voiceLoopRef.current.noteBrowserSttUnavailable();
+          browserTranscript = "";
+        } else {
+          browserTranscript = await sttSession.stop();
+          if (sttSession.unavailable()) voiceLoopRef.current.noteBrowserSttUnavailable();
+        }
       } catch {
         browserTranscript = "";
         sttSession.abort();
@@ -1881,6 +1941,7 @@ export default function Home() {
       setTranscript(browserTranscript);
     }
     playCue([660, 440], 0.12, 0.07);
+    voiceLoopRef.current.transition("thinking", "utterance_submitted");
     setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     turnTimingRef.current = emptyTurnTiming();
     try {
@@ -1951,8 +2012,10 @@ export default function Home() {
         orbStateRef.current = "idle";
         setOrbState("idle");
         setTranscript("");
-        setStatusText("Listening…");
-        window.setTimeout(() => startRecordingRef.current?.({ force: true }), 120);
+        const turn = voiceLoopRef.current.beginTurn();
+        speakTurnIdRef.current = turn;
+        voiceLoopRef.current.transition("idle", "hallucination_discard");
+        resumeListening(turn);
         return;
       }
       noiseDiscardsRef.current = 0;
@@ -2005,7 +2068,7 @@ export default function Home() {
       if (result.open_camera || result.route === "open_camera" || result.intent === "scan") {
         const guide = result.reply.trim() || cameraText[resolvedLanguage].show;
         addTurn({ userText: heard, setuText: guide, language: resolvedLanguage });
-        await playSpeech(guide, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true), 200, audioBuffer, audioParts);
+        await playSpeech(guide, resolvedLanguage, false, speaker, undefined, () => openCamera(), 200, audioBuffer, audioParts);
         logTurnTiming(turnTimingRef.current);
         return;
       }
@@ -2064,18 +2127,30 @@ export default function Home() {
       setStatusText(`${message} — tap to continue`);
       logTurnTiming(turnTimingRef.current);
     }
-  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, speaker, pace]);
+  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, resumeListening, speaker, pace]);
 
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
+    const loop = voiceLoopRef.current;
     if (isRecordingFlagRef.current) { void finishRecording(); return; }
     const playbackLive = Boolean(playbackRef.current);
-    if (!options?.force && (orbStateRef.current === "speaking" || playbackLive)) return;
+    if (!options?.force && (orbStateRef.current === "speaking" || playbackLive || loop.state === "speaking")) {
+      voiceClientLog("mic_open_skipped", { reason: "not_active", state: loop.state });
+      return;
+    }
     if (options?.force && playbackLive) {
       playbackRef.current?.stop();
       playbackRef.current = null;
+      stopAllPlayback();
+    }
+    // Always tear down any leftover mic before opening a new one.
+    if (recorderRef.current) {
+      teardownRecorder(recorderRef.current);
+      recorderRef.current = null;
+      isRecordingFlagRef.current = false;
     }
     audioRef.current?.pause();
     audioRef.current = null;
+    const openTurnId = speakTurnIdRef.current || loop.beginTurn();
     try {
       const context = await ensureRunningAudioContext();
       const recorder = await startVoiceRecorder(context, {
@@ -2091,13 +2166,27 @@ export default function Home() {
         },
         onWatchdog: (message) => {
           setStatusText(message);
+          loop.transition("idle", "mic_watchdog");
           orbStateRef.current = "idle";
           setOrbState("idle");
         },
       });
+      const gated = loop.noteMicOpen(openTurnId);
+      if (!gated.ok) {
+        teardownRecorder(recorder);
+        return;
+      }
       recorderRef.current = recorder;
       browserSttRef.current?.abort();
-      browserSttRef.current = startBrowserStt(languageRef.current);
+      browserSttRef.current = null;
+      if (browserSttSupported() && !loop.browserSttDisabled) {
+        const stt = startBrowserStt(languageRef.current);
+        browserSttRef.current = stt;
+        // If this session already marked unavailable, mirror into voice loop.
+        if (stt?.unavailable()) loop.noteBrowserSttUnavailable();
+      } else if (!browserSttSupported()) {
+        loop.noteBrowserSttUnavailable();
+      }
       isRecordingFlagRef.current = true;
       setIsRecording(true);
       orbStateRef.current = "listening";
@@ -2110,6 +2199,7 @@ export default function Home() {
     } catch (error) {
       console.error("[Setu mic] start failed", error);
       isRecordingFlagRef.current = false;
+      loop.transition("idle", "mic_start_failed");
       orbStateRef.current = "idle";
       setOrbState("idle");
       setIsRecording(false);
@@ -2417,7 +2507,7 @@ export default function Home() {
               data-document-loaded={docId ? "true" : "false"}
             >
               <button
-                onClick={() => setCameraOpen(true)}
+                onClick={() => openCamera()}
                 aria-label={docId ? "Replace loaded document" : "Add a document"}
                 className="icon-button shrink-0 text-[#4f46e5]"
               >

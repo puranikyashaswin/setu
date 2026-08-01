@@ -191,7 +191,8 @@ export async function startVoiceRecorder(
     }
   }, 250);
 
-  voiceClientLog("mic_open", { sampleRate: recorder.sampleRate });
+  // mic_open is logged by the voice-loop gate with turn_id (avoids duplicate bursts).
+  voiceClientLog("mic_stream_ready", { sampleRate: recorder.sampleRate });
   return recorder;
 }
 

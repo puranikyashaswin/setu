@@ -7,7 +7,6 @@ import base64
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -123,41 +122,8 @@ def _require_ai_user(user_id: str = Depends(rate_limit.require_user_id)) -> str:
     return user_id
 
 
-def _warm_fixed_tts() -> None:
-    """Synthesize fixed phrases in parallel so first turns never wait on cold TTS."""
-    phrases = sarvam.fixed_warm_phrases()
-    # Deduplicate while preserving order.
-    seen: set[tuple[str, str]] = set()
-    unique: list[tuple[str, str]] = []
-    for text, language in phrases:
-        key = (text, language)
-        if key in seen or not text.strip():
-            continue
-        seen.add(key)
-        unique.append(key)
-
-    def _one(item: tuple[str, str]) -> None:
-        text, language = item
-        t0 = time.perf_counter()
-        sarvam.speak(text, language)
-        logger.info(
-            "Warm-up complete: TTS language=%s chars=%s in %.2fs",
-            language,
-            len(text),
-            time.perf_counter() - t0,
-        )
-
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="tts-warm") as pool:
-        futures = [pool.submit(_one, item) for item in unique]
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception:
-                logger.warning("TTS warm item failed", exc_info=True)
-    logger.info("Warm-up complete: intro-TTS")
-
-
 def _warm_client() -> None:
+    """HTTP/LLM client touch only — must never call Bulbul TTS."""
     t0 = time.perf_counter()
     sarvam.chat_reply("hi", "en", False)
     logger.info("Warm-up complete: converse client in %.3fs", time.perf_counter() - t0)
@@ -183,18 +149,14 @@ def _hydrate_sample_ids_from_cache() -> None:
 
 
 async def _warmup_background() -> None:
-    """Intro TTS + converse client only — never OCR/Vision. Failures log only."""
+    """No TTS at startup (avoids 429). Optional LLM client warm only."""
+    logger.info("[warmup] tts_skipped=true reason=avoid_rate_limit")
     loop = asyncio.get_running_loop()
-
-    async def _one(label: str, fn) -> None:
-        try:
-            await loop.run_in_executor(None, fn)
-        except Exception:
-            logger.warning("Warm-up failed: %s", label, exc_info=True)
-
-    await _one("intro-TTS", _warm_fixed_tts)
-    await _one("converse client", _warm_client)
-    logger.info("Warm-up complete: all items")
+    try:
+        await loop.run_in_executor(None, _warm_client)
+    except Exception:
+        logger.warning("Warm-up failed: converse client", exc_info=True)
+    logger.info("Warm-up complete: client-only")
 
 
 @asynccontextmanager
@@ -324,16 +286,15 @@ def debug_last_turn():
 
 @app.get("/warm")
 def warm():
-    """Keep-alive that also touches the Sarvam client so TLS stays hot."""
+    """Keep-alive ping — touch HTTP client only; never Bulbul TTS."""
     if not os.getenv("SARVAM_API_KEY"):
-        return {"status": "ok", "warmed": False}
+        return {"status": "ok", "warmed": False, "tts_skipped": True}
     try:
-        # Cheap fixed-phrase TTS hits disk/memory cache after first warm.
-        sarvam.speak(sarvam.brief_ack_for_language("en"), "en")
-        return {"status": "ok", "warmed": True}
+        sarvam.get_client()
+        return {"status": "ok", "warmed": True, "tts_skipped": True}
     except Exception:
         logger.warning("warm ping failed", exc_info=True)
-        return {"status": "ok", "warmed": False}
+        return {"status": "ok", "warmed": False, "tts_skipped": True}
 
 
 @app.post("/auth/guest")
@@ -886,10 +847,25 @@ def speak(body: SpeakBody, user_id: str = Depends(_require_ai_user)):
             body.text, body.language, speaker=body.speaker, pace=body.pace
         )
         tts_ms = _ms_since(t_tts)
+        if not wav:
+            status = 502
+            raise HTTPException(502, "TTS returned empty audio")
     except ValueError as exc:
         status = 400
         logger.error("[speak] bad request language=%s speaker=%s: %s", body.language, body.speaker, exc)
         raise HTTPException(400, str(exc)) from exc
+    except sarvam.TtsError as exc:
+        status = 502
+        logger.error(
+            "[speak] tts error language=%s speaker=%s status=%s: %s",
+            body.language,
+            body.speaker,
+            exc.status,
+            exc,
+        )
+        raise HTTPException(502, f"TTS failed for {body.language}/{body.speaker}: {exc}") from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         status = 502
         logger.exception("[speak] failed language=%s speaker=%s", body.language, body.speaker)

@@ -237,7 +237,7 @@ class AgentResult:
     intent: str = "chat"
     open_camera: bool = False
     continue_listening: bool = True
-    max_spoken: int = 200
+    max_spoken: int = 240
     model_used: str | None = None
     ask: dict | None = None
     tools_used: list[str] = field(default_factory=list)
@@ -313,13 +313,12 @@ def is_substantive(message: str) -> bool:
     return len(text.split()) >= 3
 
 
-def _split_spoken_parts(text: str, max_chars: int = 200) -> list[str]:
+def _split_spoken_parts(text: str, max_chars: int = 240) -> list[str]:
+    """One short TTS part for normal chat — avoids multi-part 429/choppy audio."""
     spoken = sarvam.spoken_text(text, max_chars)
     if not spoken:
         return []
-    parts = re.split(r"(?<=[.!?।])\s+", spoken)
-    cleaned = [p.strip() for p in parts if p.strip()]
-    return cleaned or [spoken]
+    return [spoken]
 
 
 def _run_ask(

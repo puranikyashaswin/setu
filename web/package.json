@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test lib/scan-events.test.ts"
+    "test": "node --experimental-strip-types --test lib/scan-events.test.ts lib/voice-loop.test.ts"
   },
   "dependencies": {
     "framer-motion": "^12.42.2",

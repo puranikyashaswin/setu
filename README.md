@@ -103,10 +103,11 @@ Verify the API is running: [http://localhost:8000/health](http://localhost:8000/
 ```bash
 cd api
 source .venv/bin/activate
-python -m unittest test_agent_routing test_ocr_timeout -v
+python -m unittest test_agent_routing test_ocr_timeout test_tts_rate_limit -v
 
 cd ../web
-node --experimental-strip-types --test lib/scan-events.test.ts
+npm test
+# or: node --experimental-strip-types --test lib/scan-events.test.ts lib/voice-loop.test.ts
 ```
 
 ### Manual scan / OCR checklist
@@ -116,6 +117,12 @@ node --experimental-strip-types --test lib/scan-events.test.ts
 3. Capture a blurry / dark page → timeout or unclear within ~15s server-side (client watchdog at 20s); analyzing clears; camera reopens with a retry message (spoken).
 4. In Render logs, a finished scan shows one line like: `[ocr] doc_id=... status=done|timeout|error total_ms=... polls=N pages=N`. Timeouts also show `[scan] ocr_ms=...` with a prior NDJSON `type=timeout`.
 5. Confirm startup warm-up does **not** call Vision / document-digitization (no job-status spam on boot).
+
+### Manual TTS / mic checklist
+
+1. Fresh Render restart: logs show `[warmup] tts_skipped=true reason=avoid_rate_limit` and **zero** Bulbul `text-to-speech` / `speak` calls before the first user turn.
+2. One Telugu chat with five short turns: no `[tts] retry_429` / HTTP 429 spam; each reply plays to completion (single `playback_start` → `playback_end` per turn).
+3. Talk over one answer (barge-in): playback stops; exactly one `mic_open` follows (no burst of three).
 
 ## Environment variables
 
