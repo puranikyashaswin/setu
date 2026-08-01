@@ -64,6 +64,23 @@ def fake_agent_result(**over):
     return types.SimpleNamespace(**base)
 
 
+class RecordingEngine:
+    """Captures every frame handed to the VAD; voiced when RMS exceeds threshold."""
+
+    name = "recording"
+
+    def __init__(self):
+        self.frames: list[bytes] = []
+
+    def is_speech(self, frame: bytes) -> bool:
+        if len(frame) != server_vad.FRAME_BYTES:
+            raise AssertionError(f"invalid frame length: {len(frame)}")
+        self.frames.append(frame)
+        samples = struct.unpack(f"<{server_vad.FRAME_SAMPLES}h", frame)
+        rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+        return rms > 1000
+
+
 class WsVadTests(unittest.TestCase):
     def setUp(self):
         self._old_db = db._DB_PATH
@@ -244,6 +261,60 @@ class WsVadTests(unittest.TestCase):
                 }))
                 done, _ = self._recv_until(ws, lambda m: m.get("type") == "turn.done")
                 self.assertEqual(done["transcript"], "hello setu")
+
+    def test_irregular_chunk_boundaries_preserve_all_bytes(self):
+        """73ms + 127ms chunks: VAD must receive only exact 20ms frames, zero byte loss."""
+        engine = RecordingEngine()
+        with (
+            mock.patch.object(server_vad, "create_engine", lambda *a, **k: engine),
+            mock.patch.object(sarvam, "listen", mock.Mock(return_value={"transcript": "hello setu", "language_code": "en-IN"})),
+            mock.patch.object(agent, "run_agent_turn", mock.Mock(side_effect=lambda *a, **k: fake_agent_result())),
+            mock.patch.object(sarvam, "speak", mock.Mock(return_value=pcm_chunk(100, 8000))),
+            mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}),
+        ):
+            client = TestClient(main.app)
+            with client.websocket_connect("/ws/voice?user_id=vad-it-9") as ws:
+                ws.receive_text()
+                ws.receive_text()
+                # Speech in irregular pieces: 73ms + 127ms + 31ms + 169ms = 400ms.
+                speech = pcm_chunk(400, 8000)
+                boundaries = [73, 127, 31, 169]
+                seq = 0
+                offset = 0
+                sent = bytearray()
+                for ms in boundaries:
+                    size = server_vad.SAMPLE_RATE * 2 * ms // 1000
+                    piece = speech[offset:offset + size]
+                    offset += size
+                    sent.extend(piece)
+                    ws.send_text(json.dumps({
+                        "type": "audio.chunk", "turn_id": 9, "sequence": seq, "pcm_base64": b64(piece),
+                    }))
+                    seq += 1
+                # Silence in irregular pieces: 277ms x 4 = 1108ms → crosses 800ms.
+                silence = pcm_chunk(1108, 100)
+                offset = 0
+                for _ in range(4):
+                    piece = silence[offset:offset + 277 * server_vad.SAMPLE_RATE * 2 // 1000]
+                    offset += len(piece)
+                    sent.extend(piece)
+                    ws.send_text(json.dumps({
+                        "type": "audio.chunk", "turn_id": 9, "sequence": seq, "pcm_base64": b64(piece),
+                    }))
+                    seq += 1
+                final, _ = self._recv_until(ws, lambda m: m.get("type") == "turn_finalized")
+                self.assertEqual(final["turn_finalize_reason"], "vad_silence")
+                self._recv_until(ws, lambda m: m.get("type") == "turn.done")
+
+        # Every frame is exactly 640 bytes; concatenation is a byte-identical
+        # prefix of everything sent — zero loss, duplication, or reordering.
+        self.assertTrue(all(len(f) == server_vad.FRAME_BYTES for f in engine.frames))
+        received = b"".join(engine.frames)
+        self.assertEqual(len(received) % server_vad.FRAME_BYTES, 0)
+        self.assertEqual(received, bytes(sent[: len(received)]))
+        # All 400ms of speech reached the VAD (post-finalize trailing silence is
+        # correctly rejected by the completed-turn guard).
+        self.assertGreaterEqual(len(received), 400 * server_vad.SAMPLE_RATE * 2 // 1000)
 
     def test_legacy_mode_ignores_chunks(self):
         p1, p2, p3, p4 = self._patches()

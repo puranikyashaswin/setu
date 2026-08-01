@@ -171,7 +171,7 @@ async def voice_socket(websocket: WebSocket):
     # server_vad_v1: per-socket VAD state (None in legacy_client mode).
     voice_turn_mode, mode_fallback = server_vad.resolve_turn_mode(os.getenv("VOICE_TURN_MODE"))
     vad_engine = server_vad.create_engine() if voice_turn_mode == server_vad.MODE_SERVER_VAD else None
-    vad_state: dict[str, Any] = {"turn": None}
+    vad_state: dict[str, Any] = {"turn": None, "carry": bytearray(), "completed_turn_id": None}
 
     def sid() -> str:
         return str(session.get("session_id") or persisted_session_id)
@@ -428,6 +428,8 @@ async def voice_socket(websocket: WebSocket):
     async def complete_vad_turn(turn: server_vad.ServerVoiceTurn) -> None:
         """VAD finalized → assemble padded WAV and run the normal turn pipeline."""
         vad_state["turn"] = None
+        vad_state["carry"] = bytearray()
+        vad_state["completed_turn_id"] = turn.turn_id
         wav = turn.utterance_wav()
         if not wav:
             voice_log(sid(), "vad_turn_empty", turn_id=turn.turn_id, reason=turn.finalize_reason)
@@ -454,6 +456,7 @@ async def voice_socket(websocket: WebSocket):
                 if vad_state["turn"] is not None:
                     voice_log(sid(), "vad_turn_cancelled", turn_id=vad_state["turn"].turn_id)
                     vad_state["turn"] = None
+                    vad_state["carry"] = bytearray()
                 voice_log(sid(), "barge_in_fired")
                 await _send(websocket, {"type": "cancelled"})
                 continue
@@ -468,19 +471,29 @@ async def voice_socket(websocket: WebSocket):
                 if turn is not None and turn.turn_id != chunk_turn:
                     voice_log(sid(), "vad_stale_ignored", turn_id=chunk_turn, active_turn_id=turn.turn_id)
                     continue
+                if turn is None and chunk_turn == vad_state["completed_turn_id"]:
+                    # Same-id chunks after finalization must not resurrect the turn.
+                    voice_log(sid(), "vad_stale_ignored", turn_id=chunk_turn, reason="turn_completed")
+                    continue
                 if turn is None:
                     turn = server_vad.ServerVoiceTurn(chunk_turn, vad_engine, voice_session_id=sid())
                     vad_state["turn"] = turn
+                    vad_state["carry"] = bytearray()
                     voice_log(sid(), "vad_turn_start", turn_id=chunk_turn, engine=vad_engine.name)
                 try:
                     pcm = base64.b64decode(msg.get("pcm_base64") or "")
                 except Exception:
                     continue
-                now_ms = time.monotonic() * 1000.0
+                # Buffer across chunks: split into exact 20ms frames, keep the remainder.
+                carry: bytearray = vad_state["carry"]
+                carry.extend(pcm)
                 step = server_vad.FRAME_BYTES
-                for offset in range(0, len(pcm) - step + 1, step):
-                    turn.accept_frame(pcm[offset:offset + step], now_ms)
+                frames = len(carry) // step
+                now_ms = time.monotonic() * 1000.0
+                for i in range(frames):
+                    turn.accept_frame(bytes(carry[i * step:(i + 1) * step]), now_ms)
                     now_ms += server_vad.FRAME_MS
+                del carry[: frames * step]
                 await drain_vad_events(turn)
                 if turn.state == server_vad.STATE_FINALIZED:
                     await complete_vad_turn(turn)
