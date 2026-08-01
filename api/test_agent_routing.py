@@ -95,6 +95,71 @@ class LanguageRoutingTests(unittest.TestCase):
             )
         self.assertEqual(result.route, "converse")
         self.assertTrue(result.reply.strip())
+        self.assertEqual(result.reply, sarvam.brief_ack_for_language("en"))
+        self.assertTrue(result.spoken_parts)
+        self.assertTrue(all((p or "").strip() for p in result.spoken_parts))
+
+    def test_empty_model_reply_localized_fallback_telugu(self):
+        with patch.object(
+            sarvam,
+            "chat_reply",
+            return_value={"reply": "   ", "intent": "chat"},
+        ):
+            with self.assertLogs("setu", level="INFO") as logs:
+                result = agent.run_agent_turn(
+                    "nenu oka doubt undi",
+                    language="te-IN",
+                    onboarded=True,
+                    use_tools=False,
+                )
+        self.assertEqual(result.route, "converse")
+        self.assertEqual(result.language, "te-IN")
+        self.assertTrue(result.reply.strip())
+        self.assertEqual(result.reply, sarvam.brief_ack_for_language("te"))
+        self.assertTrue(any("empty_reply fallback=true" in line for line in logs.output))
+
+    def test_stt_language_mismatch_keeps_selected_language(self):
+        """Explicit session language is sticky when STT flips (te -> ta)."""
+        with patch.object(
+            sarvam,
+            "chat_reply",
+            return_value={"reply": "అవును, చెప్పండి.", "intent": "chat"},
+        ) as mocked:
+            with self.assertLogs("setu", level="INFO") as logs:
+                result = agent.run_agent_turn(
+                    "nenu oka doubt undi",
+                    language="te-IN",
+                    onboarded=True,
+                    use_tools=False,
+                    stt_language_code="ta-IN",
+                )
+        mocked.assert_called_once()
+        self.assertEqual(result.route, "converse")
+        self.assertEqual(result.language, "te-IN")
+        self.assertNotEqual(result.route, "language_switch")
+        self.assertTrue(
+            any(
+                "language_mismatch selected=te-IN detected=ta-IN" in line
+                for line in logs.output
+            )
+        )
+
+    def test_stt_mismatch_does_not_language_switch_on_name_noise(self):
+        """Onboarded Telugu session: accidental Tamil name in a short turn must not switch."""
+        with patch.object(
+            sarvam,
+            "chat_reply",
+            return_value={"reply": "Okay.", "intent": "chat"},
+        ):
+            result = agent.run_agent_turn(
+                "tamil weather tomorrow",
+                language="te",
+                onboarded=True,
+                use_tools=False,
+                stt_language_code="ta-IN",
+            )
+        self.assertNotEqual(result.route, "language_switch")
+        self.assertEqual(result.language, "te-IN")
 
 
 class BrowserSttContractTests(unittest.TestCase):

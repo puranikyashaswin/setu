@@ -333,5 +333,5 @@ export function __resetPlaybackForTests(): void {
 }
 
 // Re-export owner helpers used by page/tests.
-export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, attemptNonTtsSound } from "./audio-owner";
+export { stopNonTtsAudio, beginAssistantTts, finalizePlayback } from "./audio-owner";
 export type { PlaybackOutcome } from "./audio-owner";

@@ -286,9 +286,24 @@ def detect_language_request(message: str) -> str | None:
 
 
 def is_language_switch_only(message: str, code: str) -> bool:
-    """True when the utterance is (only) a language pick/switch for `code`."""
+    """True when the utterance is an explicit language pick/switch for `code`.
+
+    Once onboarded we only allow switches on exact language names or clear
+    preference phrases — not short noisy turns that merely contain a language word.
+    """
     detected = detect_language_request(message)
-    return detected == code
+    if detected != code:
+        return False
+    text = normalize_utterance(message)
+    if not text:
+        return False
+    if text == code:
+        return True
+    for name in _LANG_NAME_HINTS.get(code, ()):
+        n = normalize_utterance(name)
+        if n and text == n:
+            return True
+    return bool(_LANG_PREF_RE.search(text))
 
 
 def wants_document(message: str) -> bool:
@@ -319,6 +334,30 @@ def _split_spoken_parts(text: str, max_chars: int = 240) -> list[str]:
     if not spoken:
         return []
     return [spoken]
+
+
+def _lang_base(code: str | None) -> str:
+    base = (code or "").strip().lower().split("-", 1)[0]
+    if base == "od":
+        return "or"
+    return base
+
+
+def ensure_speakable_reply(reply: str | None, language: str, *, context: str = "llm") -> str:
+    """Never hand empty text to TTS — localized fallback + explicit log."""
+    text = (reply or "").strip()
+    if text:
+        return text
+    logger.info(
+        "[llm] empty_reply fallback=true context=%s language=%s",
+        context,
+        language,
+    )
+    return sarvam.brief_ack_for_language(language)
+
+
+# Back-compat alias for internal call sites / older imports.
+_ensure_speakable_reply = ensure_speakable_reply
 
 
 def _run_ask(
@@ -468,22 +507,21 @@ def _route_with_tools(
     tool_calls = getattr(message, "tool_calls", None) or []
     if not tool_calls:
         content = (getattr(message, "content", None) or "").strip()
+        content = _ensure_speakable_reply(content, language, context="tool_direct")
         _voice_log(
             session_id,
             "llm_done",
             ms=int((time.perf_counter() - t_llm) * 1000),
             reply_chars=len(content or ""),
         )
-        if content:
-            return AgentResult(
-                route="converse",
-                reply=content,
-                language=language,
-                model_used="sarvam-105b",
-                tools_used=["chat_direct"],
-                spoken_parts=_split_spoken_parts(content),
-            )
-        return None
+        return AgentResult(
+            route="converse",
+            reply=content,
+            language=language,
+            model_used="sarvam-105b",
+            tools_used=["chat_direct"],
+            spoken_parts=_split_spoken_parts(content),
+        )
 
     call0 = tool_calls[0]
     name = call0.function.name
@@ -639,17 +677,29 @@ def run_agent_turn(
     onboarded: bool = False,
     force_route: str | None = None,
     use_tools: bool = True,
+    stt_language_code: str | None = None,
 ) -> AgentResult:
     """Resolve a transcript into a speakable agent action."""
     history_msgs = history or []
-    reply_language = (language or "en").split("-", 1)[0]
-    if reply_language == "od":
-        reply_language = "or"
+    reply_language = _lang_base(language) or "en"
+    detected_stt = _lang_base(stt_language_code)
+    if onboarded and reply_language and detected_stt and detected_stt != reply_language:
+        logger.info(
+            "[stt] language_mismatch selected=%s-IN detected=%s-IN",
+            reply_language,
+            detected_stt,
+        )
     requested = detect_language_request(transcript)
     route = (force_route or "").strip().lower() or None
     t_route = time.perf_counter()
 
     def _decided(path: str, result: AgentResult) -> AgentResult:
+        # Never emit empty speakable text.
+        result.reply = _ensure_speakable_reply(
+            result.reply, result.language or reply_language, context="route"
+        )
+        if not result.spoken_parts:
+            result.spoken_parts = _split_spoken_parts(result.reply, result.max_spoken)
         _voice_log(
             session_id,
             "route_decision",
@@ -660,10 +710,26 @@ def run_agent_turn(
         return result
 
     # 1) Language pick/switch BEFORE chat/classifier/onboarding catch-alls.
-    if route == "language_switch" or (not route and requested):
+    # Once onboarded, session language is sticky — only explicit switch phrases flip it.
+    allow_switch = False
+    if route == "language_switch":
+        allow_switch = True
+    elif requested:
+        if not onboarded:
+            allow_switch = True
+        elif requested == reply_language:
+            allow_switch = True
+        elif is_language_switch_only(transcript, requested):
+            allow_switch = True
+        else:
+            logger.info(
+                "[stt] language_mismatch selected=%s-IN detected=%s-IN",
+                reply_language,
+                requested,
+            )
+    if allow_switch and (requested or route == "language_switch"):
         code = requested or reply_language
         bcp = to_bcp47(code)
-        # Session language is the selected code; client persists it from this result.
         if not onboarded:
             reply = sarvam.intro_for_language(bcp)
             max_spoken = 220
@@ -800,10 +866,9 @@ def run_agent_turn(
     except Exception as exc:
         _voice_log(session_id, "error", stage="llm", detail=str(exc))
         raise
-    reply = (chat.get("reply") or "").strip()
+    raw_reply = (chat.get("reply") or "").strip()
     intent = chat.get("intent", "chat")
-    if not reply:
-        reply = sarvam.brief_ack_for_language(reply_language)
+    reply = _ensure_speakable_reply(raw_reply, reply_language, context="chat_reply")
     _voice_log(
         session_id,
         "llm_done",
@@ -839,9 +904,11 @@ def synthesize_turn_audio(
     cancelled: Callable[[], bool] | None = None,
 ) -> tuple[bytes, list[bytes]]:
     """Return (combined_wav, per_sentence_wavs). Stops early if cancelled()."""
-    parts = result.spoken_parts or _split_spoken_parts(result.reply, result.max_spoken)
+    reply = _ensure_speakable_reply(result.reply, result.language, context="synthesize")
+    result.reply = reply
+    parts = [p.strip() for p in (result.spoken_parts or _split_spoken_parts(reply, result.max_spoken)) if p and p.strip()]
     if not parts:
-        parts = [sarvam.spoken_text(result.reply, result.max_spoken) or result.reply]
+        parts = [_ensure_speakable_reply("", result.language, context="synthesize_empty_parts")]
     wavs: list[bytes] = []
     for part in parts:
         if cancelled and cancelled():
@@ -850,7 +917,7 @@ def synthesize_turn_audio(
             continue
         wavs.append(sarvam.speak(part, result.language, speaker="shubh", pace=pace))
     if not wavs:
-        spoken = sarvam.spoken_text(result.reply, result.max_spoken) or result.reply or "Okay."
+        spoken = _ensure_speakable_reply("", result.language, context="synthesize_no_wav")
         wavs = [sarvam.speak(spoken, result.language, speaker="shubh", pace=pace)]
     return wavs[0] if len(wavs) == 1 else _concat_wavs(wavs), wavs
 

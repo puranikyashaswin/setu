@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, Mic, Plus, Settings2, Square, Trash2, Volume2, VolumeX, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, Mic, Plus, Settings2, Square, Trash2, X } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
@@ -9,7 +9,6 @@ import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } f
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
 import {
-  attemptNonTtsSound,
   base64ToArrayBuffer,
   playDecodedBuffersSequential,
   stopAllPlayback,
@@ -1033,7 +1032,6 @@ export default function Home() {
   const [micThreshold, setMicThreshold] = useState(SPEECH_LEVEL);
   const [statusText, setStatusText] = useState("Tap to begin");
   const [thinkingStage, setThinkingStage] = useState(0);
-  const [soundOn, setSoundOn] = useState(true);
   const [answerSheet, setAnswerSheet] = useState<AnswerSheet | null>(null);
   const [transcript, setTranscript] = useState("");
   const [activeService, setActiveService] = useState<StackService | null>(null);
@@ -1175,16 +1173,7 @@ export default function Home() {
     return context;
   }, [getAudioContext]);
 
-  /**
-   * DISABLED for this release — was the “tiding/tiding” thinking chime.
-   * OscillatorNode cues competed with Bulbul TTS on the shared AudioContext.
-   * Keep as a blocked no-op so call sites do not reintroduce audible effects.
-   */
-  const playCue = useCallback((_notes: number[], _duration: number, _volume = 0.08, _noise = false) => {
-    attemptNonTtsSound(soundOn ? "playCue" : "playCue_muted");
-  }, [soundOn]);
-
-  // Visual thinking stages only — never play tones while processing/speaking.
+  // Visual thinking stages only — no web-audio / cue tones.
   useEffect(() => {
     if (orbState !== "processing" || activeService === "VISION") return;
     const interval = window.setInterval(() => {
@@ -1834,7 +1823,6 @@ export default function Home() {
     const video = cameraVideoRef.current; const canvas = cameraCanvasRef.current;
     if (!video || !canvas || !video.videoWidth) return;
     cameraCapturedRef.current = true;
-    playCue([1], 0.04, 0.08, true);
     // Capture native frame; scanDocument preprocesses (max 1600 / JPEG 0.82).
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -1845,7 +1833,7 @@ export default function Home() {
       closeCamera();
       void scanDocument(blob);
     }, "image/jpeg", 0.92);
-  }, [closeCamera, playCue, scanDocument]);
+  }, [closeCamera, scanDocument]);
 
   useEffect(() => {
     if (!cameraOpen) return;
@@ -1956,7 +1944,6 @@ export default function Home() {
       // Display-only; the turn uses server STT transcript from the response.
       setTranscript(browserTranscript);
     }
-    playCue([660, 440], 0.12, 0.07);
     voiceLoopRef.current.transition("thinking", "utterance_submitted");
     setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     turnTimingRef.current = emptyTurnTiming();
@@ -2039,9 +2026,23 @@ export default function Home() {
       const requestedLanguage = explicitLanguage(heard);
       const activeLanguage = languageRef.current;
       const serverLang = (result.language || "").split("-")[0] as Language | "";
-      const resolvedLanguage = (serverLang || undefined)
-        ?? requestedLanguage
-        ?? (languageLockedRef.current ? activeLanguage : resolveLanguage(heard, result.language_code));
+      const detectedStt = (result.language_code || "").split("-")[0] as Language | "";
+      // Sticky: once the user picked a language, keep it unless this turn is an explicit switch.
+      let resolvedLanguage: Language = activeLanguage;
+      if (result.route === "language_switch" && serverLang) {
+        resolvedLanguage = serverLang;
+      } else if (languageLockedRef.current) {
+        resolvedLanguage = activeLanguage;
+        if (detectedStt && detectedStt !== activeLanguage) {
+          console.info(`[stt] language_mismatch selected=${activeLanguage}-IN detected=${detectedStt}-IN`);
+          debugLog("[stt] language_mismatch", { selected: activeLanguage, detected: detectedStt });
+        }
+      } else {
+        resolvedLanguage =
+          serverLang ||
+          requestedLanguage ||
+          resolveLanguage(heard, result.language_code);
+      }
       debugLog("[lang]", { heard, requested: requestedLanguage, next: resolvedLanguage, route: result.route });
       // Persist session.language as soon as the server decided it (esp. language_switch).
       setLanguage(resolvedLanguage);
@@ -2102,7 +2103,6 @@ export default function Home() {
           action_items: answer.action_items ?? [],
         });
         mergeSessionCorrections(answer.corrections ?? []);
-        playCue([523, 659, 784], 0.06, 0.09);
         addTurn({
           userText: heard,
           setuText: answer.answer,
@@ -2143,7 +2143,7 @@ export default function Home() {
       setStatusText(`${message} — tap to continue`);
       logTurnTiming(turnTimingRef.current);
     }
-  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playCue, playSpeech, resumeListening, speaker, pace]);
+  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playSpeech, resumeListening, speaker, pace]);
 
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     const loop = voiceLoopRef.current;
@@ -2646,7 +2646,6 @@ export default function Home() {
         )}
       </div>
       <AnimatePresence>{cameraOpen && <motion.section key="camera-overlay" className="absolute inset-0 z-20 bg-black" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}><video ref={cameraVideoRef} autoPlay playsInline muted className="h-full w-full object-cover" /><canvas ref={cameraCanvasRef} className="hidden" /><div className="absolute inset-0 flex flex-col items-center justify-between bg-gradient-to-b from-black/45 via-transparent to-black/60 p-6 text-center text-white"><p className="mt-4 max-w-xs text-lg font-medium">{cameraText[language].hold}</p><div className="grid h-16 w-16 place-items-center rounded-full border-2 border-white/80" style={{ background: `conic-gradient(#ff6b00 ${(cameraReadiness / CAPTURE_STREAK) * 100}%, rgba(255,255,255,.22) 0)` }}><span className="grid h-12 w-12 place-items-center rounded-full bg-black/55 text-xs">{cameraReadiness}/{CAPTURE_STREAK}</span></div><div className="flex w-full justify-between"><button onClick={closeCamera} className="rounded-full bg-black/45 px-5 py-3 text-sm backdrop-blur">Cancel</button><button onClick={captureDocument} className="rounded-full bg-[#ff6b00] px-5 py-3 text-sm font-medium">Capture now</button></div></div></motion.section>}</AnimatePresence>
-      <AnimatePresence>{isSettingsOpen && <motion.button key="sound-toggle" initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 30 }} onClick={() => setSoundOn((enabled) => !enabled)} className="absolute right-8 top-[232px] z-[11] flex items-center gap-2 rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">{soundOn ? <Volume2 size={15} /> : <VolumeX size={15} />}{soundOn ? "Sound on" : "Muted"}</motion.button>}</AnimatePresence>
       <AnimatePresence>
         {sessionPickerOpen && (
           <>

@@ -238,6 +238,7 @@ async def voice_socket(websocket: WebSocket):
                 onboarded=bool(session.get("onboarded")),
                 force_route=force_route,
                 use_tools=True,
+                stt_language_code=language_code or None,
             )
         except Exception as exc:
             logger.exception("ws agent failed")

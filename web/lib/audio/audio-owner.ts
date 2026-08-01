@@ -66,40 +66,6 @@ export function stopNonTtsAudio(reason: string): number {
   return count;
 }
 
-/** Register a non-TTS effect so stopNonTtsAudio can kill it. Blocked while speaking. */
-export function registerNonTtsEffect(name: string, stop: () => void): boolean {
-  if (assistantSpeaking) {
-    console.info(`[audio] unexpected_non_tts_attempt name=${name} blocked=true`);
-    ownerLog("audio", { unexpected_non_tts_attempt: name, blocked: true });
-    try {
-      stop();
-    } catch {
-      /* ignore */
-    }
-    return false;
-  }
-  effectHandles.push({ name, stop });
-  return true;
-}
-
-export function registerNonTtsTimer(id: number): void {
-  effectTimers.add(id);
-}
-
-/**
- * Gate any non-TTS sound. This release disables all effects — always returns false
- * (blocked). Logs when attempted during speaking.
- */
-export function attemptNonTtsSound(name: string): boolean {
-  console.info(`[audio] unexpected_non_tts_attempt name=${name} blocked=true`);
-  ownerLog("audio", {
-    unexpected_non_tts_attempt: name,
-    blocked: true,
-    speaking: assistantSpeaking,
-  });
-  return false;
-}
-
 /**
  * Settle a playback turn exactly once. Returns false if already finalized.
  */

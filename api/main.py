@@ -637,9 +637,12 @@ async def voice(
             onboarded=onboarded,
             force_route=force_route,
             use_tools=True,
+            stt_language_code=language_code or None,
         )
         if not (result.reply or "").strip():
-            result.reply = sarvam.camera_phrase(result.language, "show")
+            result.reply = agent.ensure_speakable_reply(
+                "", result.language or language, context="voice_http"
+            )
         spoken = sarvam.spoken_text(result.reply, result.max_spoken)
         # Demo: one consistent voice — ignore client speaker switches.
         wav, parts = agent.synthesize_turn_audio(result, pace=pace)
