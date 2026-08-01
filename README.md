@@ -202,6 +202,8 @@ git push origin main
 
 **Free tier note:** Render sleeps after about 15 minutes of idle time. The first request after sleep can take 30 to 60 seconds. Before a live demo, open `/health` once and wait for a response.
 
+**Free tier limitations:** On the free plan the filesystem is ephemeral — the SQLite database and OCR/TTS caches under `./cache/` reset on every restart or redeploy (scanned docs and chat history on the server are lost). Persistence requires either the Starter plan (uncomment the `disk` block and `DB_PATH` / `CACHE_PATH` env vars in `render.yaml`) or a hosted Postgres later.
+
 ### Step 3: Frontend on Vercel
 
 1. Sign in at [vercel.com](https://vercel.com) and import the GitHub repository.
