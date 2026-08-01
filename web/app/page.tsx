@@ -9,11 +9,13 @@ import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } f
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
 import {
+  attemptNonTtsSound,
   base64ToArrayBuffer,
-  nextPlaybackTurnId,
   playDecodedBuffersSequential,
   stopAllPlayback,
+  stopNonTtsAudio,
   type PlaybackHandles,
+  type PlaybackOutcome,
 } from "@/lib/audio/playback";
 import { browserSttSupported, startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
 import { createVoiceLoop } from "@/lib/voice-loop";
@@ -1173,24 +1175,23 @@ export default function Home() {
     return context;
   }, [getAudioContext]);
 
-  const playCue = useCallback((notes: number[], duration: number, volume = 0.08, noise = false) => {
-    if (!soundOn) return;
-    try {
-      const context = getAudioContext(); const now = context.currentTime;
-      notes.forEach((frequency, index) => {
-        const gain = context.createGain(); const start = now + index * duration;
-        gain.gain.setValueAtTime(0.0001, start); gain.gain.exponentialRampToValueAtTime(volume, start + 0.012); gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-        if (noise) { const buffer = context.createBuffer(1, Math.ceil(context.sampleRate * duration), context.sampleRate); const values = buffer.getChannelData(0); values.forEach((_, sample) => { values[sample] = Math.random() * 2 - 1; }); const source = context.createBufferSource(); source.buffer = buffer; source.connect(gain); gain.connect(context.destination); source.start(start); }
-        else { const oscillator = context.createOscillator(); oscillator.type = "sine"; oscillator.frequency.value = frequency; oscillator.connect(gain); gain.connect(context.destination); oscillator.start(start); oscillator.stop(start + duration + 0.01); }
-      });
-    } catch { /* Audio is unlocked by the existing mic/orb gesture. */ }
-  }, [getAudioContext, soundOn]);
+  /**
+   * DISABLED for this release — was the “tiding/tiding” thinking chime.
+   * OscillatorNode cues competed with Bulbul TTS on the shared AudioContext.
+   * Keep as a blocked no-op so call sites do not reintroduce audible effects.
+   */
+  const playCue = useCallback((_notes: number[], _duration: number, _volume = 0.08, _noise = false) => {
+    attemptNonTtsSound(soundOn ? "playCue" : "playCue_muted");
+  }, [soundOn]);
 
+  // Visual thinking stages only — never play tones while processing/speaking.
   useEffect(() => {
     if (orbState !== "processing" || activeService === "VISION") return;
-    const interval = window.setInterval(() => { setThinkingStage((stage) => (stage + 1) % 3); playCue([220], 0.08, 0.03); }, 1200);
+    const interval = window.setInterval(() => {
+      setThinkingStage((stage) => (stage + 1) % 3);
+    }, 1200);
     return () => window.clearInterval(interval);
-  }, [activeService, orbState, playCue]);
+  }, [activeService, orbState]);
 
   const setService = (service: StackService | null) => setActiveService(service);
 
@@ -1444,13 +1445,18 @@ export default function Home() {
   ) => {
     stopActiveRecording();
     stopBargeIn();
-    playbackRef.current?.stop();
-    playbackRef.current = null;
-    stopAllPlayback();
+    // Cancel prior TTS cleanly (settles previous turn once as cancelled — no mic reopen).
+    if (playbackRef.current) {
+      playbackRef.current.stop("cancelled");
+      playbackRef.current = null;
+    } else {
+      stopAllPlayback("cancelled");
+    }
+    stopNonTtsAudio("play_speech_start");
+
     const loop = voiceLoopRef.current;
     const playTurnId = loop.beginTurn();
     speakTurnIdRef.current = playTurnId;
-    const playbackTurnId = nextPlaybackTurnId();
 
     if (!cachedUrl && !prefetchedAudio && !(prefetchedParts && prefetchedParts.length) && !text.trim()) {
       loop.transition("idle", "empty_speech");
@@ -1467,17 +1473,13 @@ export default function Home() {
     setOrbState("processing");
     setStatusText("Preparing a response");
     let bargedIn = false;
+    let settled = false;
     // Barge-in opens a second mic stream — skip during onboarding so welcome TTS
     // and the first listen aren't killed by speaker echo.
     const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
     const bargeInEnabled = Boolean(allowBargeIn && continueListening && session?.onboarded);
     try {
-      // Prefer a single buffer when possible — multi-part only if server already split.
       let buffers = prefetchedParts?.filter(Boolean) ?? [];
-      if (buffers.length > 1) {
-        // Collapse to one part for normal chat unless we only have streamed parts.
-        // Keep serial queue but prefer first+join is not possible for audio; play serially.
-      }
       if (!buffers.length) {
         let arrayBuffer = prefetchedAudio;
         if (!arrayBuffer) {
@@ -1513,10 +1515,50 @@ export default function Home() {
           setService(null);
           playbackRef.current = null;
         };
+
+        const handleSettled = (outcome: PlaybackOutcome) => {
+          if (settled) return;
+          settled = true;
+          finishClean();
+          // Never leave state=speaking after playback_end (natural or stopped).
+          loop.transition("idle", `playback_${outcome}`);
+          orbStateRef.current = "idle";
+          setOrbState("idle");
+
+          if (speakTurnIdRef.current !== playTurnId) {
+            voiceClientLog("mic_open_skipped", { reason: "stale_turn", turn_id: playTurnId });
+            resolve();
+            return;
+          }
+
+          if (outcome === "interrupted") {
+            onEnded?.();
+            resumeListening(playTurnId);
+            resolve();
+            return;
+          }
+          if (outcome === "natural") {
+            onEnded?.();
+            if (continueListening) resumeListening(playTurnId);
+            else setStatusText("Tap to speak");
+            resolve();
+            return;
+          }
+          if (outcome === "error") {
+            setStatusText("Tap to continue");
+            if (continueListening) resumeListening(playTurnId);
+            resolve();
+            return;
+          }
+          // cancelled — cleanup / superseded; do not fake barge-in or retry mic.
+          setStatusText("Tap to speak");
+          resolve();
+        };
+
         void playDecodedBuffersSequential({
           context,
           arrayBuffers: buffers,
-          turnId: playbackTurnId,
+          turnId: playTurnId,
           onPlay: () => {
             loop.transition("speaking", "playback_start");
             orbStateRef.current = "speaking";
@@ -1524,20 +1566,14 @@ export default function Home() {
             setStatusText(bargeInEnabled ? "Speaking — interrupt anytime" : "Speaking");
             if (bargeInEnabled) {
               void startBargeInMonitor(context, () => {
-                if (bargedIn) return;
+                if (bargedIn || settled) return;
                 if (speakTurnIdRef.current !== playTurnId) return;
                 bargedIn = true;
                 voiceSessionRef.current.cancel();
-                playbackRef.current?.stop();
-                playbackRef.current = null;
-                stopAllPlayback();
-                finishClean();
-                loop.transition("idle", "barge_in");
-                onEnded?.();
-                resumeListening(playTurnId);
-                resolve();
+                // Single settle path via stop("interrupted") — no manual resume here.
+                playbackRef.current?.stop("interrupted");
               }).then((monitor) => {
-                if (bargedIn || orbStateRef.current !== "speaking") {
+                if (bargedIn || settled || orbStateRef.current !== "speaking") {
                   monitor.stop();
                   return;
                 }
@@ -1552,27 +1588,7 @@ export default function Home() {
             setBands(nextBands);
             setSpectrum(nextSpectrum);
           },
-          onEnded: () => {
-            if (bargedIn) return;
-            if (speakTurnIdRef.current !== playTurnId) {
-              voiceClientLog("mic_open_skipped", { reason: "stale_turn", turn_id: playTurnId });
-              finishClean();
-              resolve();
-              return;
-            }
-            finishClean();
-            onEnded?.();
-            if (continueListening) {
-              loop.transition("idle", "playback_end");
-              resumeListening(playTurnId);
-            } else {
-              loop.transition("idle", "playback_end_no_listen");
-              orbStateRef.current = "idle";
-              setOrbState("idle");
-              setStatusText("Tap to speak");
-            }
-            resolve();
-          },
+          onSettled: handleSettled,
         }).then((handles) => {
           playbackRef.current = handles;
         }).catch(reject);
@@ -2214,15 +2230,12 @@ export default function Home() {
 
   const beginOrStop = async () => {
     if (isRecording) { void finishRecording(); return; }
-    if (orbState === "speaking") {
-      playbackRef.current?.stop();
+    if (orbState === "speaking" || voiceLoopRef.current.state === "speaking") {
+      // Explicit user stop — settle once as cancelled (no auto-relisten).
+      playbackRef.current?.stop("cancelled");
       playbackRef.current = null;
       audioRef.current?.pause();
-      setAmplitude(0.2);
-      setBands({ bass: 0, treble: 0 });
-      setOrbState("idle");
-      setStatusText("Tap to speak");
-      setService(null);
+      audioRef.current = null;
       return;
     }
     setViewMode("voice");

@@ -69,6 +69,8 @@ export async function startVoiceRecorder(
   const analyser = context.createAnalyser();
   analyser.fftSize = 256;
   const worklet = new AudioWorkletNode(context, getVadProcessorName());
+  // Keep the worklet in the graph without audible output (gain 0).
+  // Never raise this gain — VAD must stay silent while analyzing.
   const silenceGain = context.createGain();
   silenceGain.gain.value = 0;
   source.connect(analyser);

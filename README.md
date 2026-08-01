@@ -121,8 +121,10 @@ npm test
 ### Manual TTS / mic checklist
 
 1. Fresh Render restart: logs show `[warmup] tts_skipped=true reason=avoid_rate_limit` and **zero** Bulbul `text-to-speech` / `speak` calls before the first user turn.
-2. One Telugu chat with five short turns: no `[tts] retry_429` / HTTP 429 spam; each reply plays to completion (single `playback_start` → `playback_end` per turn).
-3. Talk over one answer (barge-in): playback stops; exactly one `mic_open` follows (no burst of three).
+2. Use **media volume** on the phone (not ringtone / notification volume).
+3. Five Telugu voice turns: **no** chime, beep, repeated “tiding” thinking tone, volume ducking, overlap, or silent/stuck final turn. Only Setu’s spoken reply should be audible.
+4. Interrupt one answer (talk over it): playback stops; exactly one `listening` / `mic_open` follows (no `mic_open_skipped … state=speaking` loop).
+5. Client logs for a clean turn include `playback_finalize outcome=natural` (or `interrupted`) and never leave `voice_state` at `speaking` after `playback_end`.
 
 ## Environment variables
 
