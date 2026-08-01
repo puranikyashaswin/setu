@@ -112,11 +112,19 @@ export async function postSummarize(docId: string, language: string): Promise<{ 
   return response.json() as Promise<{ summary: string }>;
 }
 
+export type ScanStreamResult =
+  | { kind: "done"; doc_id: string; pages?: number; cached?: boolean; preview?: string; provider?: string }
+  | { kind: "unclear" }
+  | { kind: "timeout"; detail: string }
+  | { kind: "error"; detail: string };
+
 export async function postScan(
   blob: Blob,
   language: string,
   onEvent: (event: Record<string, unknown>) => void,
-): Promise<{ doc_id: string; pages?: number; cached?: boolean } | { unclear: true }> {
+  options?: { signal?: AbortSignal },
+): Promise<ScanStreamResult> {
+  const { applyScanEvent, initialScanUiState, parseScanNdjsonLine } = await import("@/lib/scan-events");
   const form = new FormData();
   form.append("file", blob, "document.jpg");
   form.append("language", `${language}-IN`);
@@ -124,13 +132,30 @@ export async function postScan(
     method: "POST",
     headers: withAuth(),
     body: form,
+    signal: options?.signal,
   });
   if (!response.ok || !response.body) throw new Error("Scan failed");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let donePayload: { doc_id: string; pages?: number; cached?: boolean } | null = null;
-  let unclear = false;
+  let state = initialScanUiState();
+  let donePayload: Extract<ScanStreamResult, { kind: "done" }> | null = null;
+
+  const handleEvent = (event: Record<string, unknown>) => {
+    onEvent(event);
+    state = applyScanEvent(state, event);
+    if (event.type === "done") {
+      donePayload = {
+        kind: "done",
+        doc_id: String(event.doc_id),
+        pages: event.pages as number | undefined,
+        cached: event.cached as boolean | undefined,
+        preview: typeof event.preview === "string" ? event.preview : undefined,
+        provider: typeof event.provider === "string" ? event.provider : undefined,
+      };
+    }
+  };
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -138,21 +163,20 @@ export async function postScan(
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
     for (const line of lines) {
-      if (!line.trim()) continue;
-      const event = JSON.parse(line) as Record<string, unknown>;
-      onEvent(event);
-      if (event.type === "done") {
-        donePayload = {
-          doc_id: String(event.doc_id),
-          pages: event.pages as number | undefined,
-          cached: event.cached as boolean | undefined,
-        };
-      }
-      if (event.type === "unclear_scan") unclear = true;
-      if (event.type === "error") throw new Error(String(event.detail ?? "Scan failed"));
+      const event = parseScanNdjsonLine(line);
+      if (event) handleEvent(event);
     }
   }
-  if (unclear) return { unclear: true };
-  if (!donePayload) throw new Error("Scan incomplete");
-  return donePayload;
+  const tail = parseScanNdjsonLine(buffer);
+  if (tail) handleEvent(tail);
+
+  if (state.outcome === "timeout") {
+    return { kind: "timeout", detail: state.detail || "Document analysis is taking too long." };
+  }
+  if (state.outcome === "error") {
+    return { kind: "error", detail: state.detail || "Scan failed" };
+  }
+  if (state.outcome === "unclear") return { kind: "unclear" };
+  if (donePayload) return donePayload;
+  throw new Error("Scan incomplete");
 }

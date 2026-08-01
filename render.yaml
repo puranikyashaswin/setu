@@ -15,10 +15,8 @@ services:
     envVars:
       - key: SARVAM_API_KEY
         sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: OCR_PROVIDER
-        value: auto
+      - key: OCR_TIMEOUT_SECONDS
+        value: "15"
       - key: FRONTEND_ORIGIN
         sync: false
       - key: RESEND_API_KEY

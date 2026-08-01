@@ -5,7 +5,8 @@ import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, M
 import { AnimatePresence, motion } from "framer-motion";
 import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
-import { API_URL, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
+import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
+import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
 import { base64ToArrayBuffer, playDecodedBuffersSequential, type PlaybackHandles } from "@/lib/audio/playback";
 import {
@@ -1111,18 +1112,18 @@ export default function Home() {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
-  const cameraText = useState<Record<Language, { hold: string; show: string; reading: string; ready: string; unclear: string; upload: string }>>({
-    en: { hold: "Hold it steady", show: "Please hold your document up to the camera so I can read it.", reading: "Reading", ready: "Ready.", unclear: "Couldn’t read that — hold it flat in good light", upload: "Camera is unavailable. Please upload a photo of the document instead." },
-    te: { hold: "స్థిరంగా పట్టుకోండి", show: "దయచేసి పత్రాన్ని కెమెరా ముందు చూపించండి, నేను చదువుతాను.", reading: "చదువుతున్నాను", ready: "సరే.", unclear: "స్పష్టంగా చదవలేకపోయాను", upload: "కెమెరా లేదు. దయచేసి పత్రం ఫోటో అప్‌లోడ్ చేయండి." },
-    hi: { hold: "सीधा रखें", show: "कृपया दस्तावेज़ कैमरे के सामने दिखाइए, मैं पढ़ूँगा.", reading: "पढ़ रहा हूँ", ready: "हाँ.", unclear: "साफ़ नहीं पढ़ सका", upload: "कैमरा उपलब्ध नहीं है. कृपया दस्तावेज़ की फ़ोटो अपलोड करें." },
-    mr: { hold: "स्थिर धरा", show: "कृपया कागद कॅमेऱ्यासमोर दाखवा, मी वाचेन.", reading: "वाचत आहे", ready: "होय.", unclear: "स्पष्ट वाचता आले नाही", upload: "कॅमेरा उपलब्ध नाही. कृपया कागदाचा फोटो अपलोड करा." },
-    ta: { hold: "நிலையாகப் பிடியுங்கள்", show: "தயவுசெய்து ஆவணத்தை கேமராவுக்குக் காட்டுங்கள், நான் படிப்பேன்.", reading: "படிக்கிறேன்", ready: "ஆம்.", unclear: "தெளிவாகப் படிக்க முடியவில்லை", upload: "கேமரா இல்லை. ஆவணப் படத்தைப் பதிவேற்றுங்கள்." },
-    kn: { hold: "ಸ್ಥಿರವಾಗಿ ಹಿಡಿಯಿರಿ", show: "ದಯವಿಟ್ಟು ದಾಖಲೆಯನ್ನು ಕ್ಯಾಮೆರಾಗೆ ತೋರಿಸಿ, ನಾನು ಓದುತ್ತೇನೆ.", reading: "ಓದುತ್ತಿದ್ದೇನೆ", ready: "ಹೌದು.", unclear: "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ", upload: "ಕ್ಯಾಮೆರಾ ಇಲ್ಲ. ದಾಖಲೆಯ ಫೋಟೋ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ." },
-    bn: { hold: "স্থির করে ধরুন", show: "দয়া করে নথি ক্যামেরার সামনে ধরুন.", reading: "পড়ছি", ready: "হ্যাঁ.", unclear: "স্পষ্ট পড়তে পারিনি", upload: "ক্যামেরা নেই. নথির ছবি আপলোড করুন." },
-    gu: { hold: "સ્થિર રાખો", show: "કૃપા કરીને દસ્તાવેજ કેમેરા સામે બતાવો.", reading: "વાંચું છું", ready: "હા.", unclear: "સ્પષ્ટ વાંચી શક્યો નહીં", upload: "કેમેરા નથી. દસ્તાવેજનો ફોટો અપલોડ કરો." },
-    ml: { hold: "സ്ഥിരമായി പിടിക്കുക", show: "ദയവായി രേഖ ക്യാമറയ്ക്ക് മുന്നിൽ കാണിക്കുക.", reading: "വായിക്കുന്നു", ready: "അതെ.", unclear: "വ്യക്തമായി വായിക്കാനായില്ല", upload: "ക്യാമറയില്ല. രേഖയുടെ ഫോട്ടോ അപ്‌ലോഡ് ചെയ്യുക." },
-    pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਕਿਰਪਾ ਕਰਕੇ ਦਸਤਾਵੇਜ਼ ਕੈਮਰੇ ਅੱਗੇ ਵਿਖਾਓ.", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ", upload: "ਕੈਮਰਾ ਨਹੀਂ. ਦਸਤਾਵੇਜ਼ ਦੀ ਫੋਟੋ ਅੱਪਲੋਡ ਕਰੋ." },
-    or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦୟାକରି ଦଲିଲ କ୍ୟାମେରା ଆଗରେ ଦେଖାନ୍ତୁ.", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ", upload: "କ୍ୟାମେରା ନାହିଁ. ଦଲିଲ ଫଟୋ ଅପଲୋଡ୍ କରନ୍ତୁ." },
+  const cameraText = useState<Record<Language, { hold: string; show: string; reading: string; ready: string; unclear: string; timeout: string; upload: string }>>({
+    en: { hold: "Hold it steady", show: "Please hold your document up to the camera so I can read it.", reading: "Reading", ready: "Ready.", unclear: "Couldn’t read that — hold it flat in good light", timeout: "Photo unclear or analysis took too long — retake in good light", upload: "Camera is unavailable. Please upload a photo of the document instead." },
+    te: { hold: "స్థిరంగా పట్టుకోండి", show: "దయచేసి పత్రాన్ని కెమెరా ముందు చూపించండి, నేను చదువుతాను.", reading: "చదువుతున్నాను", ready: "సరే.", unclear: "స్పష్టంగా చదవలేకపోయాను", timeout: "ఫోటో స్పష్టంగా లేదు లేదా ఎక్కువ సమయం పట్టింది — మంచి వెలుతురులో మళ్లీ తీయండి", upload: "కెమెరా లేదు. దయచేసి పత్రం ఫోటో అప్‌లోడ్ చేయండి." },
+    hi: { hold: "सीधा रखें", show: "कृपया दस्तावेज़ कैमरे के सामने दिखाइए, मैं पढ़ूँगा.", reading: "पढ़ रहा हूँ", ready: "हाँ.", unclear: "साफ़ नहीं पढ़ सका", timeout: "फ़ोटो साफ़ नहीं या विश्लेषण में देर हो गई — अच्छी रोशनी में फिर से लें", upload: "कैमरा उपलब्ध नहीं है. कृपया दस्तावेज़ की फ़ोटो अपलोड करें." },
+    mr: { hold: "स्थिर धरा", show: "कृपया कागद कॅमेऱ्यासमोर दाखवा, मी वाचेन.", reading: "वाचत आहे", ready: "होय.", unclear: "स्पष्ट वाचता आले नाही", timeout: "फोटो अस्पष्ट किंवा विश्लेषणात वेळ लागला — चांगल्या प्रकाशात पुन्हा काढा", upload: "कॅमेरा उपलब्ध नाही. कृपया कागदाचा फोटो अपलोड करा." },
+    ta: { hold: "நிலையாகப் பிடியுங்கள்", show: "தயவுசெய்து ஆவணத்தை கேமராவுக்குக் காட்டுங்கள், நான் படிப்பேன்.", reading: "படிக்கிறேன்", ready: "ஆம்.", unclear: "தெளிவாகப் படிக்க முடியவில்லை", timeout: "படம் தெளிவில்லாதது அல்லது அதிக நேரம் ஆனது — நல்ல வெளிச்சத்தில் மீண்டும் எடுங்கள்", upload: "கேமரா இல்லை. ஆவணப் படத்தைப் பதிவேற்றுங்கள்." },
+    kn: { hold: "ಸ್ಥಿರವಾಗಿ ಹಿಡಿಯಿರಿ", show: "ದಯವಿಟ್ಟು ದಾಖಲೆಯನ್ನು ಕ್ಯಾಮೆರಾಗೆ ತೋರಿಸಿ, ನಾನು ಓದುತ್ತೇನೆ.", reading: "ಓದುತ್ತಿದ್ದೇನೆ", ready: "ಹೌದು.", unclear: "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ", timeout: "ಫೋಟೋ ಅಸ್ಪಷ್ಟ ಅಥವಾ ವಿಶ್ಲೇಷಣೆ ತಡವಾಯಿತು — ಒಳ್ಳೆಯ ಬೆಳಕಿನಲ್ಲಿ ಮತ್ತೆ ತೆಗೆಯಿರಿ", upload: "ಕ್ಯಾಮೆರಾ ಇಲ್ಲ. ದಾಖಲೆಯ ಫೋಟೋ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ." },
+    bn: { hold: "স্থির করে ধরুন", show: "দয়া করে নথি ক্যামেরার সামনে ধরুন.", reading: "পড়ছি", ready: "হ্যাঁ.", unclear: "স্পষ্ট পড়তে পারিনি", timeout: "ছবি অস্পষ্ট বা বিশ্লেষণে দেরি হয়েছে — ভালো আলোয় আবার তুলুন", upload: "ক্যামেরা নেই. নথির ছবি আপলোড করুন." },
+    gu: { hold: "સ્થિર રાખો", show: "કૃપા કરીને દસ્તાવેજ કેમેરા સામે બતાવો.", reading: "વાંચું છું", ready: "હા.", unclear: "સ્પષ્ટ વાંચી શક્યો નહીં", timeout: "ફોટો અસ્પષ્ટ અથવા વિશ્લેષણમાં વાર લાગી — સારા પ્રકાશમાં ફરી લો", upload: "કેમેરા નથી. દસ્તાવેજનો ફોટો અપલોડ કરો." },
+    ml: { hold: "സ്ഥിരമായി പിടിക്കുക", show: "ദയവായി രേഖ ക്യാമറയ്ക്ക് മുന്നിൽ കാണിക്കുക.", reading: "വായിക്കുന്നു", ready: "അതെ.", unclear: "വ്യക്തമായി വായിക്കാനായില്ല", timeout: "ഫോട്ടോ അവ്യക്തം അല്ലെങ്കിൽ വിശകലനം വൈകി — നല്ല വെളിച്ചത്തിൽ വീണ്ടും എടുക്കുക", upload: "ക്യാമറയില്ല. രേഖയുടെ ഫോട്ടോ അപ്‌ലോഡ് ചെയ്യുക." },
+    pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਕਿਰਪਾ ਕਰਕੇ ਦਸਤਾਵੇਜ਼ ਕੈਮਰੇ ਅੱਗੇ ਵਿਖਾਓ.", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ", timeout: "ਫੋਟੋ ਅਸਪਸ਼ਟ ਹੈ ਜਾਂ ਵਿਸ਼ਲੇਸ਼ਣ ਵਿੱਚ ਦੇਰ ਹੋਈ — ਚੰਗੀ ਰੋਸ਼ਨੀ ਵਿੱਚ ਮੁੜ ਲਓ", upload: "ਕੈਮਰਾ ਨਹੀਂ. ਦਸਤਾਵੇਜ਼ ਦੀ ਫੋਟੋ ਅੱਪਲੋਡ ਕਰੋ." },
+    or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦୟାକରି ଦଲିଲ କ୍ୟାମେରା ଆଗରେ ଦେଖାନ୍ତୁ.", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ", timeout: "ଫଟୋ ଅସ୍ପଷ୍ଟ କିମ୍ବା ବିଶ୍ଳେଷଣରେ ବିଳମ୍ବ — ଭଲ ଆଲୋକରେ ପୁଣି ନିଅନ୍ତୁ", upload: "କ୍ୟାମେରା ନାହିଁ. ଦଲିଲ ଫଟୋ ଅପଲୋଡ୍ କରନ୍ତୁ." },
   })[0];
 
   const getAudioContext = useCallback(() => {
@@ -1594,9 +1595,32 @@ export default function Home() {
 
   const scanDocument = useCallback(async (blob: Blob) => {
     const activeLanguage = languageRef.current;
+    const timeoutMsg = cameraText[activeLanguage].timeout;
     let documentImage: string | undefined;
+    let uploadBlob = blob;
     try {
-      documentImage = await documentThumbnailDataUrl(blob);
+      uploadBlob = await preprocessScanImage(blob);
+    } catch (error) {
+      const msg = error instanceof ScanImageTooLargeError ? timeoutMsg : timeoutMsg;
+      setService(null);
+      setOrbState("idle");
+      setStatusText(msg);
+      try {
+        documentImage = await documentThumbnailDataUrl(blob);
+      } catch {
+        /* ignore */
+      }
+      addTurn({
+        userText: "Scanned document",
+        setuText: msg,
+        language: activeLanguage,
+        documentImage,
+      });
+      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
+      return;
+    }
+    try {
+      documentImage = await documentThumbnailDataUrl(uploadBlob);
     } catch (error) {
       console.warn("[Setu document] thumbnail failed", error);
     }
@@ -1611,79 +1635,81 @@ export default function Home() {
       const elapsed = Math.floor((performance.now() - started) / 1000);
       setStatusText(`${progressLabel} · ${elapsed}s`);
     }, 250);
+
+    const controller = new AbortController();
+    let lastEventAt = performance.now();
+    const watchdog = window.setInterval(() => {
+      if (performance.now() - lastEventAt > 20_000) {
+        controller.abort();
+      }
+    }, 500);
+
+    const failRetry = async (msg: string) => {
+      setService(null);
+      setOrbState("idle");
+      setStatusText(msg);
+      addTurn({
+        userText: "Scanned document",
+        setuText: msg,
+        language: activeLanguage,
+        documentImage,
+      });
+      await playSpeech(msg, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
+      logTurnTiming(turnTimingRef.current);
+    };
+
     try {
-      const form = new FormData();
-      form.append("file", blob, "setu-document.jpg");
-      form.append("language", `${activeLanguage}-IN`);
       const scanStarted = performance.now();
-      const response = await fetch(`${API_URL}/scan`, { method: "POST", headers: { ...authHeaders() }, body: form });
-      if (!response.ok || !response.body) throw new Error("Document scan failed");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let result: {
-        doc_id?: string;
-        status?: string;
-        pages?: number;
-        cached?: boolean;
-        provider?: string;
-        preview?: string;
-      } | null = null;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as {
-            type?: string;
-            message?: string;
-            doc_id?: string;
-            status?: string;
-            pages?: number;
-            cached?: boolean;
-            provider?: string;
-            preview?: string;
-            detail?: string;
-          };
+      const result = await postScan(
+        uploadBlob,
+        activeLanguage,
+        (event) => {
+          lastEventAt = performance.now();
           if (event.type === "progress") {
-            if (event.provider === "sarvam" || event.provider === "pdf-text") setService("VISION");
-            if (event.message) {
+            setService("VISION");
+            if (typeof event.message === "string" && event.message) {
               progressLabel = event.message;
               const elapsed = Math.floor((performance.now() - started) / 1000);
               setStatusText(`${progressLabel} · ${elapsed}s`);
-              console.info("[scan]", event.message, event.provider || "");
+              console.info("[scan]", event.message, event.stage || "", event.percent ?? "");
             }
-          } else if (event.type === "done") {
-            result = event;
-          } else if (event.type === "unclear_scan") {
-            result = { status: "unclear_scan" };
-          } else if (event.type === "error") {
-            throw new Error(event.detail || "Document scan failed");
           }
-        }
-      }
+        },
+        { signal: controller.signal },
+      );
       const scanMs = Math.round(performance.now() - scanStarted);
       logStageTiming("scan", scanMs);
-      console.log(`[scan] provider=${result?.provider || "?"} ${scanMs}ms`);
-      if (!result || result.status === "unclear_scan" || !result.doc_id) {
+
+      if (result.kind === "timeout" || result.kind === "error") {
+        console.log(`[scan] ${result.kind} ${scanMs}ms`);
+        await failRetry(timeoutMsg);
+        return;
+      }
+      if (result.kind === "unclear") {
+        console.log(`[scan] unclear ${scanMs}ms`);
         setService(null);
-        await playSpeech(cameraText[activeLanguage].unclear, activeLanguage, false, speaker, undefined, () => setCameraOpen(true));
+        await playSpeech(
+          cameraText[activeLanguage].unclear,
+          activeLanguage,
+          false,
+          speaker,
+          undefined,
+          () => setCameraOpen(true),
+        );
         logTurnTiming(turnTimingRef.current);
         return;
       }
+
+      console.log(`[scan] provider=${result.provider || "?"} ${scanMs}ms`);
       setDocId(result.doc_id);
       docIdRef.current = result.doc_id;
 
-      // Prefetch summary while we prepare TTS — keeps document context in this chat.
       const summaryPromise = fetch(`${API_URL}/summarize`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ doc_id: result.doc_id, answer_language: activeLanguage }),
       })
-        .then(async (res) => (res.ok ? (await res.json() as { summary?: string }).summary : null))
+        .then(async (res) => (res.ok ? ((await res.json()) as { summary?: string }).summary : null))
         .catch(() => null);
 
       const readyText = cameraText[activeLanguage].ready;
@@ -1722,11 +1748,15 @@ export default function Home() {
       await playSpeech(spoken, activeLanguage, true, "shubh", undefined, undefined, 220, readyBuf || undefined, undefined, false);
       logTurnTiming(turnTimingRef.current);
     } catch (error) {
-      setService(null);
-      setOrbState("idle");
-      setStatusText(error instanceof Error ? error.message : "Document scan failed");
-      logTurnTiming(turnTimingRef.current);
+      const aborted =
+        controller.signal.aborted ||
+        (error instanceof DOMException && error.name === "AbortError") ||
+        (error instanceof Error && error.name === "AbortError");
+      if (aborted) console.log("[scan] client watchdog abort");
+      else console.warn("[scan] failed", error);
+      await failRetry(timeoutMsg);
     } finally {
+      window.clearInterval(watchdog);
       window.clearInterval(clock);
     }
   }, [addTurn, cameraText, patchActiveSession, playSpeech, pace, speaker]);
@@ -1737,10 +1767,10 @@ export default function Home() {
     if (!video || !canvas || !video.videoWidth) return;
     cameraCapturedRef.current = true;
     playCue([1], 0.04, 0.08, true);
-    // Sharp still for OCR — high res JPEG.
-    const width = 1600; const height = Math.round(width * video.videoHeight / video.videoWidth);
-    canvas.width = width; canvas.height = height;
-    canvas.getContext("2d")?.drawImage(video, 0, 0, width, height);
+    // Capture native frame; scanDocument preprocesses (max 1600 / JPEG 0.82).
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
     canvas.toBlob((blob) => {
       if (!blob) return;
       console.log(`[capture] size=${blob.size} dims=${canvas.width}x${canvas.height}`);

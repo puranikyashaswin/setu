@@ -15,7 +15,7 @@ Setu is a voice-first document assistant. Scan a notice or upload a file, ask qu
 
 ```
 setu/
-├── api/          FastAPI backend (Sarvam STT/TTS/chat/Vision + optional fast OCR)
+├── api/          FastAPI backend (Sarvam STT/TTS/chat/Vision OCR)
 ├── web/          Next.js PWA frontend
 ├── samples/      Demo documents for testing
 ├── render.yaml   Render deployment blueprint
@@ -103,8 +103,19 @@ Verify the API is running: [http://localhost:8000/health](http://localhost:8000/
 ```bash
 cd api
 source .venv/bin/activate
-python -m unittest test_agent_routing -v
+python -m unittest test_agent_routing test_ocr_timeout -v
+
+cd ../web
+node --experimental-strip-types --test lib/scan-events.test.ts
 ```
+
+### Manual scan / OCR checklist
+
+1. Say you have a document → camera opens (scan intent).
+2. Capture a clear page in good light → analyzing ends within ~5–15s with a short spoken summary; voice mode resumes.
+3. Capture a blurry / dark page → timeout or unclear within ~15s server-side (client watchdog at 20s); analyzing clears; camera reopens with a retry message (spoken).
+4. In Render logs, a finished scan shows one line like: `[ocr] doc_id=... status=done|timeout|error total_ms=... polls=N pages=N`. Timeouts also show `[scan] ocr_ms=...` with a prior NDJSON `type=timeout`.
+5. Confirm startup warm-up does **not** call Vision / document-digitization (no job-status spam on boot).
 
 ## Environment variables
 
@@ -113,6 +124,7 @@ python -m unittest test_agent_routing -v
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SARVAM_API_KEY` | Yes | Sarvam API key (STT / TTS / chat / Vision) |
+| `OCR_TIMEOUT_SECONDS` | No | Hard Vision job budget (default `15`) |
 | `FRONTEND_ORIGIN` | For production | Deployed frontend URL, used for CORS and magic links |
 | `RESEND_API_KEY` | No | Resend API key for email magic links |
 | `RESEND_FROM` | No | Sender address for magic-link emails |

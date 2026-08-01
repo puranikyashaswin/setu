@@ -1246,8 +1246,32 @@ def _friendly_vision_error(exc: BaseException) -> str:
 
 
 _VISION_MAX_PAGES = 10
-# Vision rate limit ≈ 10 req/min — wait between sequential chunk jobs.
+# Vision rate limit ≈ 10 req/min — wait between sequential chunk jobs when budget allows.
 _VISION_CHUNK_GAP_S = 6.5
+
+OCR_TIMEOUT_DETAIL = (
+    "Document analysis is taking too long. Please retry with a clearer photo."
+)
+_OCR_POLL_SCHEDULE = (0.5, 1.0, 1.5)
+_OCR_POLL_MAX_S = 2.0
+_VISION_TERMINAL = frozenset({"Completed", "PartiallyCompleted", "Failed"})
+
+
+def ocr_timeout_seconds() -> float:
+    """Hard total OCR/Vision budget. OCR_TIMEOUT_SECONDS wins; legacy VISION_JOB_TIMEOUT_S ok."""
+    raw = (os.getenv("OCR_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        raw = (os.getenv("VISION_JOB_TIMEOUT_S") or "15").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 15.0
+
+
+def _poll_sleep_seconds(sleep_index: int) -> float:
+    if sleep_index < len(_OCR_POLL_SCHEDULE):
+        return _OCR_POLL_SCHEDULE[sleep_index]
+    return _OCR_POLL_MAX_S
 
 
 def _pdf_page_count(file_bytes: bytes) -> int:
@@ -1269,7 +1293,43 @@ def _pdf_slice(file_bytes: bytes, start: int, end: int) -> bytes:
     return buf.getvalue()
 
 
-def _run_vision(file_bytes: bytes, filename: str, language: str = "te-IN") -> tuple[str, int]:
+def _job_id_of(job) -> str:
+    return str(getattr(job, "_job_id", None) or getattr(job, "job_id", None) or "?")
+
+
+def _download_vision_text(job) -> tuple[str, int]:
+    out_fd, out_path = tempfile.mkstemp(suffix=".md")
+    os.close(out_fd)
+    try:
+        _with_backoff(lambda: job.download_output(out_path))
+        raw = Path(out_path).read_bytes()
+        if raw[:2] == b"PK":
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                md = next(n for n in zf.namelist() if n.endswith(".md"))
+                text = zf.read(md).decode("utf-8")
+        else:
+            text = raw.decode("utf-8")
+    finally:
+        os.unlink(out_path)
+
+    metrics = job.get_page_metrics()
+    pages = int(metrics["total_pages"]) if metrics and metrics.get("total_pages") else 1
+    return text, pages
+
+
+def _run_vision(
+    file_bytes: bytes,
+    filename: str,
+    language: str = "te-IN",
+    *,
+    progress=None,
+    deadline: float | None = None,
+) -> dict:
+    """Run one Sarvam Document Intelligence job with bounded status polling.
+
+    Returns structured dict with status in {done, timeout, error}.
+    Never calls wait_until_complete (SDK default polls forever every 2s).
+    """
     actual = _detect_format(file_bytes)
     if actual not in _FORMAT_EXT:
         raise ValueError("Unsupported file format; accepts PDF, PNG, JPG")
@@ -1277,57 +1337,138 @@ def _run_vision(file_bytes: bytes, filename: str, language: str = "te-IN") -> tu
     upload_name = _correct_filename(filename, actual)
     client = get_client()
     lang = language or "te-IN"
+    timeout_s = ocr_timeout_seconds()
+    if deadline is None:
+        deadline = time.perf_counter() + timeout_s
 
     def create_job():
         return client.document_intelligence.create_job(language=lang, output_format="md")
 
     job = _with_backoff(create_job)
+    job_id = _job_id_of(job)
+    polls = 0
 
     with tempfile.NamedTemporaryFile(suffix=Path(upload_name).suffix, delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
+        if time.perf_counter() >= deadline:
+            return {
+                "status": "timeout",
+                "detail": OCR_TIMEOUT_DETAIL,
+                "job_id": job_id,
+                "polls": polls,
+                "pages": 0,
+                "text": "",
+            }
+
         _with_backoff(lambda: job.upload_file(tmp_path))
         _with_backoff(job.start)
-        # Bound polling — cancelled/stuck jobs must not flood logs forever.
-        _VISION_WAIT_S = float(os.getenv("VISION_JOB_TIMEOUT_S") or "120")
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        _emit(
+            progress,
+            {
+                "type": "progress",
+                "stage": "ocr_started",
+                "percent": 20,
+                "message": "Reading document",
+            },
+        )
+        logger.debug("[ocr] vision job_id=%s started", job_id)
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-wait") as pool:
-            fut = pool.submit(lambda: _with_backoff(job.wait_until_complete))
-            try:
-                status = fut.result(timeout=_VISION_WAIT_S)
-            except FuturesTimeout as exc:
-                logger.error(
-                    "Vision job timed out after %.0fs — stopping poll",
-                    _VISION_WAIT_S,
+        sleep_index = 0
+        status = None
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                logger.debug(
+                    "[ocr] vision job_id=%s timeout after polls=%s",
+                    job_id,
+                    polls,
                 )
-                raise RuntimeError(
-                    f"Vision job timed out after {_VISION_WAIT_S:.0f}s"
-                ) from exc
-        if status.job_state == "Failed":
-            raise RuntimeError(f"Vision job failed: {status.job_state}")
+                return {
+                    "status": "timeout",
+                    "detail": OCR_TIMEOUT_DETAIL,
+                    "job_id": job_id,
+                    "polls": polls,
+                    "pages": 0,
+                    "text": "",
+                }
 
-        out_fd, out_path = tempfile.mkstemp(suffix=".md")
-        os.close(out_fd)
-        try:
-            _with_backoff(lambda: job.download_output(out_path))
-            raw = Path(out_path).read_bytes()
-            if raw[:2] == b"PK":
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    md = next(n for n in zf.namelist() if n.endswith(".md"))
-                    text = zf.read(md).decode("utf-8")
-            else:
-                text = raw.decode("utf-8")
-        finally:
-            os.unlink(out_path)
+            status = job.get_status()
+            polls += 1
+            state = getattr(status, "job_state", None)
+            logger.debug(
+                "[ocr] vision job_id=%s state=%s poll=%s",
+                job_id,
+                state,
+                polls,
+            )
 
-        metrics = job.get_page_metrics()
-        pages = int(metrics["total_pages"]) if metrics and metrics.get("total_pages") else 1
-        return text, pages
+            if state in _VISION_TERMINAL:
+                break
+
+            _emit(
+                progress,
+                {
+                    "type": "progress",
+                    "stage": "ocr_polling",
+                    "percent": min(85, 40 + polls * 5),
+                    "message": "Reading document",
+                },
+            )
+
+            delay = _poll_sleep_seconds(sleep_index)
+            sleep_index += 1
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return {
+                    "status": "timeout",
+                    "detail": OCR_TIMEOUT_DETAIL,
+                    "job_id": job_id,
+                    "polls": polls,
+                    "pages": 0,
+                    "text": "",
+                }
+            time.sleep(min(delay, remaining))
+
+        if status is None or status.job_state == "Failed":
+            detail = "Document analysis failed. Please retry with a clearer photo."
+            err = getattr(status, "error_message", None) or getattr(status, "message", None)
+            if isinstance(err, str) and err.strip() and "key" not in err.lower():
+                detail = err.strip()[:240]
+            return {
+                "status": "error",
+                "detail": detail,
+                "job_id": job_id,
+                "polls": polls,
+                "pages": 0,
+                "text": "",
+            }
+
+        text, pages = _download_vision_text(job)
+        return {
+            "status": "done",
+            "text": text,
+            "pages": pages,
+            "job_id": job_id,
+            "polls": polls,
+        }
+    except Exception as exc:  # noqa: BLE001 — structured for /scan
+        logger.debug("[ocr] vision job_id=%s error polls=%s", job_id, polls, exc_info=True)
+        return {
+            "status": "error",
+            "detail": _friendly_vision_error(exc),
+            "job_id": job_id,
+            "polls": polls,
+            "pages": 0,
+            "text": "",
+        }
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # Vision sometimes describes a photo/scene instead of reading document text.
@@ -1363,19 +1504,42 @@ def extract_document(
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     # Same bytes + different OCR language must not share a cache entry.
     doc_id = hashlib.sha256(f"{file_hash}:{lang}".encode()).hexdigest()
+    t0 = time.perf_counter()
+    polls_total = 0
+
+    def _finish(result: dict) -> dict:
+        status = result.get("status") or ("done" if result.get("text") is not None else "error")
+        if status == "unclear_scan":
+            log_status = "done"
+        elif status in {"done", "timeout", "error"}:
+            log_status = status
+        else:
+            log_status = "done"
+        logger.info(
+            "[ocr] doc_id=%s status=%s total_ms=%s polls=%s pages=%s",
+            doc_id[:12],
+            log_status,
+            int((time.perf_counter() - t0) * 1000),
+            polls_total,
+            result.get("pages") or 0,
+        )
+        return result
+
     hit = _cache.get(doc_id)
     if hit:
         _emit(
             progress,
             {
                 "type": "progress",
+                "stage": "ocr_started",
+                "percent": 20,
                 "message": f"Reading pages 1-{hit.get('pages', 1)} of {hit.get('pages', 1)}",
                 "from_page": 1,
                 "to_page": hit.get("pages", 1),
                 "total_pages": hit.get("pages", 1),
             },
         )
-        return {**hit, "cached": True}
+        return _finish({**hit, "cached": True, "status": "done"})
 
     actual = _detect_format(file_bytes)
     if actual not in _FORMAT_EXT:
@@ -1386,7 +1550,11 @@ def extract_document(
     else:
         total_pages = 1
 
+    deadline = time.perf_counter() + ocr_timeout_seconds()
     texts: list[str] = []
+    pages = total_pages
+    job_id = None
+
     if actual == "pdf" and total_pages > _VISION_MAX_PAGES:
         logger.info(
             "[vision] splitting %s pages into chunks of %s",
@@ -1400,6 +1568,8 @@ def extract_document(
                 progress,
                 {
                     "type": "progress",
+                    "stage": "ocr_polling",
+                    "percent": 40,
                     "message": f"Reading pages {start + 1}-{end} of {total_pages}",
                     "from_page": start + 1,
                     "to_page": end,
@@ -1407,16 +1577,50 @@ def extract_document(
                 },
             )
             if chunk_index > 0:
-                logger.info(
-                    "[vision] rate-limit pause %.1fs before chunk %s",
-                    _VISION_CHUNK_GAP_S,
-                    chunk_index + 1,
-                )
-                time.sleep(_VISION_CHUNK_GAP_S)
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.5:
+                    return _finish(
+                        {
+                            "doc_id": doc_id,
+                            "status": "timeout",
+                            "detail": OCR_TIMEOUT_DETAIL,
+                            "pages": 0,
+                            "cached": False,
+                            "text": "",
+                        }
+                    )
+                pause = min(_VISION_CHUNK_GAP_S, max(0.0, remaining - 0.5))
+                if pause > 0:
+                    logger.info(
+                        "[vision] rate-limit pause %.1fs before chunk %s",
+                        pause,
+                        chunk_index + 1,
+                    )
+                    time.sleep(pause)
             chunk_bytes = _pdf_slice(file_bytes, start, end)
             chunk_name = f"{Path(filename).stem or 'document'}-p{start + 1}-{end}.pdf"
-            chunk_text, _ = _run_vision(chunk_bytes, chunk_name, lang)
-            texts.append(chunk_text)
+            chunk = _run_vision(
+                chunk_bytes,
+                chunk_name,
+                lang,
+                progress=progress,
+                deadline=deadline,
+            )
+            polls_total += int(chunk.get("polls") or 0)
+            job_id = chunk.get("job_id") or job_id
+            if chunk.get("status") in {"timeout", "error"}:
+                return _finish(
+                    {
+                        "doc_id": doc_id,
+                        "status": chunk["status"],
+                        "detail": chunk.get("detail") or OCR_TIMEOUT_DETAIL,
+                        "pages": 0,
+                        "cached": False,
+                        "text": "",
+                        "job_id": job_id,
+                    }
+                )
+            texts.append(chunk.get("text") or "")
             chunk_index += 1
         text = "\n\n".join(texts)
         pages = total_pages
@@ -1425,25 +1629,58 @@ def extract_document(
             progress,
             {
                 "type": "progress",
+                "stage": "ocr_started",
+                "percent": 20,
                 "message": f"Reading pages 1-{total_pages} of {total_pages}",
                 "from_page": 1,
                 "to_page": total_pages,
                 "total_pages": total_pages,
             },
         )
-        text, pages = _run_vision(file_bytes, filename, lang)
-        # Prefer pre-count for PDFs when metrics are missing/wrong.
+        vision = _run_vision(
+            file_bytes,
+            filename,
+            lang,
+            progress=progress,
+            deadline=deadline,
+        )
+        polls_total += int(vision.get("polls") or 0)
+        job_id = vision.get("job_id")
+        if vision.get("status") in {"timeout", "error"}:
+            return _finish(
+                {
+                    "doc_id": doc_id,
+                    "status": vision["status"],
+                    "detail": vision.get("detail") or OCR_TIMEOUT_DETAIL,
+                    "pages": 0,
+                    "cached": False,
+                    "text": "",
+                    "job_id": job_id,
+                }
+            )
+        text = vision.get("text") or ""
+        pages = int(vision.get("pages") or 1)
         if actual == "pdf":
             pages = total_pages
 
     if _is_unclear(text):
-        return {
-            "doc_id": doc_id,
-            "text": text,
-            "pages": pages,
-            "cached": False,
-            "status": "unclear_scan",
-        }
-    result = {"doc_id": doc_id, "text": text, "pages": pages, "cached": False}
+        return _finish(
+            {
+                "doc_id": doc_id,
+                "text": text,
+                "pages": pages,
+                "cached": False,
+                "status": "unclear_scan",
+                "job_id": job_id,
+            }
+        )
+    result = {
+        "doc_id": doc_id,
+        "text": text,
+        "pages": pages,
+        "cached": False,
+        "status": "done",
+        "job_id": job_id,
+    }
     _set_cached_document(doc_id, {"doc_id": doc_id, "text": text, "pages": pages})
-    return result
+    return _finish(result)

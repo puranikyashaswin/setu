@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import json
+import queue
 import threading
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -457,7 +458,7 @@ async def scan(
     language: str | None = Form(default=None),
     user_id: str = Depends(_require_ai_user),
 ):
-    """NDJSON stream: progress events, then a final done / unclear_scan / error line."""
+    """NDJSON stream: progress events, then a final done / timeout / unclear_scan / error line."""
     t0 = time.perf_counter()
     data = await file.read()
     if not data:
@@ -471,49 +472,91 @@ async def scan(
         ocr_ms = 0
         http_status = 200
         cached = None
-        yield_buf: list[dict] = []
-        result_holder: dict = {}
-        error_holder: list[BaseException] = []
+        events: queue.Queue = queue.Queue()
         t_ocr = time.perf_counter()
 
         def run():
             try:
-                result_holder["value"] = ocr.extract_document(
+                result = ocr.extract_document(
                     data,
                     filename,
                     language=lang,
-                    progress=lambda event: yield_buf.append(event),
+                    progress=lambda event: events.put(event),
                 )
+                events.put({"type": "_result", "value": result})
             except BaseException as exc:  # noqa: BLE001 — forwarded as NDJSON error
-                error_holder.append(exc)
+                events.put({"type": "_exception", "exc": exc})
 
         try:
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
-            cursor = 0
-            while worker.is_alive() or cursor < len(yield_buf):
-                while cursor < len(yield_buf):
-                    event = yield_buf[cursor]
-                    cursor += 1
-                    yield json.dumps(event, ensure_ascii=False) + "\n"
-                if worker.is_alive():
-                    time.sleep(0.15)
-            worker.join()
+            result = None
+            while True:
+                try:
+                    event = events.get(timeout=0.2)
+                except queue.Empty:
+                    if worker.is_alive():
+                        continue
+                    try:
+                        event = events.get_nowait()
+                    except queue.Empty:
+                        break
+
+                etype = event.get("type")
+                if etype == "_result":
+                    result = event["value"]
+                    break
+                if etype == "_exception":
+                    exc = event["exc"]
+                    if isinstance(exc, ValueError):
+                        http_status, detail = 400, str(exc)
+                    else:
+                        logger.error("scan failed: %s", exc, exc_info=exc)
+                        http_status, detail = 502, sarvam._friendly_vision_error(exc)
+                    yield json.dumps(
+                        {"type": "error", "detail": detail, "status": http_status}
+                    ) + "\n"
+                    return
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+
+            worker.join(timeout=0.1)
             ocr_ms = _ms_since(t_ocr)
 
-            if error_holder:
-                exc = error_holder[0]
-                if isinstance(exc, ValueError):
-                    http_status, detail = 400, str(exc)
-                else:
-                    logger.error("scan failed: %s", exc, exc_info=exc)
-                    http_status, detail = 502, sarvam._friendly_vision_error(exc)
-                yield json.dumps({"type": "error", "detail": detail, "status": http_status}) + "\n"
+            if result is None:
+                http_status = 502
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "detail": "Document analysis failed. Please retry.",
+                        "status": http_status,
+                    }
+                ) + "\n"
                 return
 
-            result = result_holder["value"]
             cached = result.get("cached")
-            if result.get("status") == "unclear_scan":
+            status = result.get("status")
+            if status == "timeout":
+                http_status = 504
+                yield json.dumps(
+                    {
+                        "type": "timeout",
+                        "detail": result.get("detail") or sarvam.OCR_TIMEOUT_DETAIL,
+                        "doc_id": result.get("doc_id"),
+                    }
+                ) + "\n"
+                return
+            if status == "error":
+                http_status = 502
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "detail": result.get("detail")
+                        or "Document analysis failed. Please retry with a clearer photo.",
+                        "doc_id": result.get("doc_id"),
+                    }
+                ) + "\n"
+                return
+            if status == "unclear_scan":
                 yield json.dumps({"type": "unclear_scan", "status": "unclear_scan"}) + "\n"
                 return
             preview = (result.get("preview") or (result.get("text") or "")[:500]).strip()
@@ -522,7 +565,7 @@ async def scan(
                     "type": "done",
                     "doc_id": result["doc_id"],
                     "pages": result["pages"],
-                    "cached": result["cached"],
+                    "cached": result.get("cached", False),
                     "provider": result.get("provider") or ocr.resolve_ocr_provider(),
                     "preview": preview,
                 }
