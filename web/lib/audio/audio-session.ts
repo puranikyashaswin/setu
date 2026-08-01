@@ -17,7 +17,6 @@ export function setAudioSessionLogger(fn: SessionLog): void {
 function getAudioSession(): AudioSessionLike | null {
   if (typeof navigator === "undefined") return null;
   try {
-    // Bracket-safe: audioSession is not in all TS DOM libs / browsers.
     return ((navigator as unknown as { audioSession?: AudioSessionLike }).audioSession ??
       null) as AudioSessionLike | null;
   } catch {
@@ -58,37 +57,29 @@ export function setAudioSession(type: AudioSessionType): boolean {
   }
 }
 
-/** iOS-only short settle so play-and-record → playback routing can take effect. */
-export async function settleBeforeTtsPlayback(
-  platformIsIos: boolean = isIosPlatform(),
-): Promise<number> {
-  if (!platformIsIos) {
-    sessionLog("tts_settle_delay", { tts_settle_delay_ms: 0, platform: "other" });
-    return 0;
-  }
-  console.info(`[audio] tts_settle_delay_ms=${IOS_TTS_SETTLE_MS} platform=ios`);
-  sessionLog("tts_settle_delay", {
-    tts_settle_delay_ms: IOS_TTS_SETTLE_MS,
-    platform: "ios",
-  });
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, IOS_TTS_SETTLE_MS);
-  });
-  return IOS_TTS_SETTLE_MS;
-}
-
 /**
- * After recorder teardown: switch to playback and optionally settle on iOS.
- * Call only once the mic graph/tracks/context are fully released.
+ * Shared-context route keeps play-and-record for the whole voice session.
+ * No per-turn flip / settle delay (that caused 1.8s getUserMedia stalls).
  */
 export async function prepareAssistantPlayback(options?: {
   afterTeardown?: () => void | Promise<void>;
   platformIsIos?: boolean;
 }): Promise<{ settleMs: number }> {
   if (options?.afterTeardown) await options.afterTeardown();
-  setAudioSession("playback");
-  const settleMs = await settleBeforeTtsPlayback(options?.platformIsIos ?? isIosPlatform());
-  return { settleMs };
+  // Sticky: do not switch to "playback" between turns.
+  sessionLog("audio_session", {
+    requested: "play-and-record",
+    applied: true,
+    reason: "sticky_shared_context",
+  });
+  return { settleMs: 0 };
+}
+
+/** @deprecated settle delay removed for sticky play-and-record route */
+export async function settleBeforeTtsPlayback(
+  _platformIsIos: boolean = isIosPlatform(),
+): Promise<number> {
+  return 0;
 }
 
 /** Guard: mic must not open while thinking/speaking or TTS is active. */

@@ -26,11 +26,14 @@ router = APIRouter()
 # Ring buffer of recent WS voice events for GET /debug/last-turn.
 _VOICE_EVENTS: deque[dict[str, Any]] = deque(maxlen=50)
 _LAST_VOICE_SESSION: str | None = None
+_PROCESS_BOOT_MS = int(time.time() * 1000)
+_VOICE_ACTIVITY = False
 
 
 def voice_log(session_id: str | None, event: str, **fields: Any) -> None:
     """One-line [voice] stage log + ring buffer (logging only; never raises)."""
-    global _LAST_VOICE_SESSION
+    global _LAST_VOICE_SESSION, _VOICE_ACTIVITY
+    _VOICE_ACTIVITY = True
     sid = str(session_id or "-")[:64] or "-"
     _LAST_VOICE_SESSION = sid
     parts = [f"[voice] session={sid} event={event}"]
@@ -62,6 +65,23 @@ def get_voice_events() -> list[dict[str, Any]]:
 
 def last_voice_session_id() -> str | None:
     return _LAST_VOICE_SESSION
+
+
+def has_voice_activity() -> bool:
+    """True once any WS voice event was logged in this process."""
+    return _VOICE_ACTIVITY
+
+
+def process_boot_ms() -> int:
+    return _PROCESS_BOOT_MS
+
+
+def reset_voice_debug_for_tests() -> None:
+    """Test helper — clear ring without pretending the process restarted."""
+    global _LAST_VOICE_SESSION, _VOICE_ACTIVITY
+    _VOICE_EVENTS.clear()
+    _LAST_VOICE_SESSION = None
+    _VOICE_ACTIVITY = False
 
 
 def _ws_url_user(websocket: WebSocket) -> str | None:

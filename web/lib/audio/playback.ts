@@ -1,4 +1,7 @@
-/** Single-flight TTS playback via HTMLAudioElement only (volume = 1). */
+/**
+ * Single-flight TTS via shared AudioContext.destination.
+ * Stays in play-and-record with the mic session (audio_route_mode=shared_context_play_and_record).
+ */
 
 import { voiceClientLog } from "@/lib/debug";
 import { createPlaybackQueue, type PlaybackQueue } from "@/lib/audio/playback-queue";
@@ -20,26 +23,26 @@ export type PlaybackHandles = {
   turnId: number;
 };
 
-export type PlayElementOptions = {
+export type PlayBufferOptions = {
+  context: AudioContext;
   arrayBuffer: ArrayBuffer;
   onPlay?: () => void;
-  /** Fired exactly once via finalizePlayback — natural | interrupted | cancelled | error. */
   onSettled?: (outcome: PlaybackOutcome) => void;
-  /** @deprecated use onSettled — kept as natural-end alias */
   onEnded?: () => void;
   onAmplitude?: (amplitude: number, bands: { bass: number; treble: number }, spectrum: number[]) => void;
   turnId?: number;
 };
 
-type ActiveElement = {
-  audio: HTMLAudioElement;
-  url: string;
+type ActiveSource = {
+  source: AudioBufferSourceNode;
+  analyser: AnalyserNode;
+  gain: GainNode;
   raf: number;
   stopped: boolean;
 };
 
 let turnCounter = 0;
-let activeElement: ActiveElement | null = null;
+let activeSource: ActiveSource | null = null;
 let activeQueue: PlaybackQueue | null = null;
 let activeObjectUrls: string[] = [];
 let activeSettle: ((outcome: PlaybackOutcome) => void) | null = null;
@@ -55,7 +58,7 @@ export function getActivePlaybackTurnId(): number | null {
 }
 
 export function isTtsPlaybackActive(): boolean {
-  return isAssistantSpeaking() || activeTurnId != null || activeElement != null;
+  return isAssistantSpeaking() || activeTurnId != null || activeSource != null;
 }
 
 function revokeUrls(urls: string[]) {
@@ -68,23 +71,21 @@ function revokeUrls(urls: string[]) {
   }
 }
 
-function stopActiveElement(): void {
-  const current = activeElement;
-  activeElement = null;
+function stopActiveSource(): void {
+  const current = activeSource;
+  activeSource = null;
   if (!current || current.stopped) return;
   current.stopped = true;
   cancelAnimationFrame(current.raf);
   try {
-    current.audio.onended = null;
-    current.audio.onerror = null;
-    current.audio.pause();
-    current.audio.removeAttribute("src");
-    current.audio.load();
+    current.source.stop();
   } catch {
-    /* ignore */
+    /* already stopped */
   }
   try {
-    URL.revokeObjectURL(current.url);
+    current.source.disconnect();
+    current.analyser.disconnect();
+    current.gain.disconnect();
   } catch {
     /* ignore */
   }
@@ -97,7 +98,7 @@ function settleActive(outcome: PlaybackOutcome): void {
   activeTurnId = null;
   const queue = activeQueue;
   activeQueue = null;
-  stopActiveElement();
+  stopActiveSource();
   revokeUrls(activeObjectUrls);
   activeObjectUrls = [];
   if (queue) queue.stop();
@@ -118,9 +119,8 @@ function settleActive(outcome: PlaybackOutcome): void {
   settle?.(outcome);
 }
 
-/** Stop active TTS and settle as cancelled/interrupted (exactly once). */
 export function stopAllPlayback(outcome: PlaybackOutcome = "cancelled"): void {
-  if (activeTurnId == null && !activeQueue && !activeElement) {
+  if (activeTurnId == null && !activeQueue && !activeSource) {
     stopNonTtsAudio("stop_all_idle");
     return;
   }
@@ -128,94 +128,98 @@ export function stopAllPlayback(outcome: PlaybackOutcome = "cancelled"): void {
 }
 
 async function playOnePart(
+  context: AudioContext,
   arrayBuffer: ArrayBuffer,
-  onAmplitude?: PlayElementOptions["onAmplitude"],
+  onAmplitude?: PlayBufferOptions["onAmplitude"],
 ): Promise<"natural" | "stopped"> {
+  if (context.state !== "running") {
+    try {
+      await context.resume();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const audioBuffer = await context.decodeAudioData(arrayBuffer.slice(0));
+
   return new Promise<"natural" | "stopped">((resolve, reject) => {
-    if (activeElement) stopActiveElement();
+    if (activeSource) stopActiveSource();
 
-    const blob = new Blob([arrayBuffer], { type: "audio/wav" });
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio();
-    audio.preload = "auto";
-    // Explicit unity volume — never duck TTS on mobile play-and-record residue.
-    audio.volume = 1;
-    audio.src = url;
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 256;
+    const gain = context.createGain();
+    gain.gain.value = getTtsVolume();
+    source.connect(analyser);
+    analyser.connect(gain);
+    gain.connect(context.destination);
 
-    const session: ActiveElement = { audio, url, raf: 0, stopped: false };
-    activeElement = session;
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const session: ActiveSource = { source, analyser, gain, raf: 0, stopped: false };
+    activeSource = session;
 
     const animate = () => {
-      if (session.stopped || activeElement !== session) return;
-      if (audio.volume !== 1) audio.volume = 1;
-      // Soft pulse for orb viz — HTMLAudioElement path has no AnalyserNode.
-      const t = audio.currentTime || 0;
-      const amp = 0.32 + 0.28 * Math.abs(Math.sin(t * 7));
+      if (session.stopped || activeSource !== session) return;
+      if (gain.gain.value !== 1) gain.gain.value = 1;
+      analyser.getByteFrequencyData(data);
+      const normal = (from: number, to: number) =>
+        data.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255;
+      const amplitude = data.reduce((sum, value) => sum + value, 0) / data.length / 255;
       onAmplitude?.(
-        amp,
-        { bass: amp * 0.85, treble: amp * 0.55 },
-        Array.from({ length: 8 }, (_, index) => amp * (0.45 + 0.55 * Math.abs(Math.sin(t * 5 + index)))),
+        amplitude,
+        {
+          bass: normal(0, Math.floor(data.length * 0.18)),
+          treble: normal(Math.floor(data.length * 0.62), data.length),
+        },
+        Array.from({ length: 8 }, (_, index) =>
+          normal(Math.floor((data.length * index) / 8), Math.floor((data.length * (index + 1)) / 8)),
+        ),
       );
       session.raf = requestAnimationFrame(animate);
     };
 
-    audio.onended = () => {
+    source.onended = () => {
       if (session.stopped) {
         resolve("stopped");
         return;
       }
       session.stopped = true;
       cancelAnimationFrame(session.raf);
-      if (activeElement === session) activeElement = null;
       try {
-        URL.revokeObjectURL(url);
+        source.disconnect();
+        analyser.disconnect();
+        gain.disconnect();
       } catch {
         /* ignore */
       }
+      if (activeSource === session) activeSource = null;
       resolve("natural");
     };
 
-    audio.onerror = () => {
-      session.stopped = true;
-      cancelAnimationFrame(session.raf);
-      if (activeElement === session) activeElement = null;
-      try {
-        URL.revokeObjectURL(url);
-      } catch {
-        /* ignore */
-      }
-      reject(new Error("HTMLAudioElement playback failed"));
-    };
-
     animate();
-    void audio.play().then(() => {
-      // Keep volume pinned after play() in case the browser reset it.
-      audio.volume = getTtsVolume();
-    }).catch((error) => {
+    try {
+      source.start(0);
+    } catch (error) {
       session.stopped = true;
-      cancelAnimationFrame(session.raf);
-      if (activeElement === session) activeElement = null;
+      if (activeSource === session) activeSource = null;
       reject(error);
-    });
+    }
   });
 }
 
-/**
- * Play audio parts strictly in series on HTMLAudioElement.
- * onSettled fires exactly once via finalizePlayback.
- */
 export async function playDecodedBuffersSequential(
-  options: Omit<PlayElementOptions, "arrayBuffer"> & { arrayBuffers: ArrayBuffer[]; turnId?: number },
+  options: Omit<PlayBufferOptions, "arrayBuffer"> & { arrayBuffers: ArrayBuffer[]; turnId?: number },
 ): Promise<PlaybackHandles> {
-  const { arrayBuffers, onPlay, onSettled, onEnded, onAmplitude } = options;
+  const { arrayBuffers, onPlay, onSettled, onEnded, onAmplitude, context } = options;
   const turnId = options.turnId ?? nextPlaybackTurnId();
 
-  if (activeTurnId != null || activeQueue || activeElement) {
+  if (activeTurnId != null || activeQueue || activeSource) {
     settleActive("cancelled");
   }
 
   beginAssistantTts(turnId);
-  console.info(`[audio] tts_volume=${getTtsVolume()} turn_id=${turnId} path=html_audio`);
+  console.info(`[audio] tts_volume=${getTtsVolume()} turn_id=${turnId} path=shared_context`);
 
   const queue = createPlaybackQueue(arrayBuffers.length, turnId);
   activeQueue = queue;
@@ -252,10 +256,10 @@ export async function playDecodedBuffersSequential(
           part,
           parts: arrayBuffers.length,
           tts_volume: getTtsVolume(),
-          path: "html_audio",
+          path: "shared_context",
         });
         if (part === 1) onPlay?.();
-        const partResult = await playOnePart(arrayBuffers[i], onAmplitude);
+        const partResult = await playOnePart(context, arrayBuffers[i], onAmplitude);
         if (stopOutcome || activeQueue !== queue) return;
         if (partResult === "stopped") return;
         const done = queue.endPart(true);
@@ -282,8 +286,9 @@ export async function playDecodedBuffersSequential(
   };
 }
 
-export async function playDecodedBuffer(options: PlayElementOptions): Promise<PlaybackHandles> {
+export async function playDecodedBuffer(options: PlayBufferOptions): Promise<PlaybackHandles> {
   return playDecodedBuffersSequential({
+    context: options.context,
     arrayBuffers: [options.arrayBuffer],
     onPlay: options.onPlay,
     onSettled: options.onSettled,
@@ -306,12 +311,11 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-/** Test helper */
 export function __resetPlaybackForTests(): void {
   activeSettle = null;
   activeTurnId = null;
   activeQueue = null;
-  stopActiveElement();
+  stopActiveSource();
   revokeUrls(activeObjectUrls);
   activeObjectUrls = [];
   turnCounter = 0;

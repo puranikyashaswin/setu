@@ -277,10 +277,23 @@ def health():
 
 @app.get("/debug/last-turn")
 def debug_last_turn():
-    """Last REST stage timings + last WS voice event ring (up to 50)."""
+    """Last REST stage timings + last WS voice event ring (up to 50).
+
+    Survives client disconnect for the life of the process. Right after boot
+    (no voice activity yet) returns note=server_restarted so null is not
+    confused with a client mic bug.
+    """
     payload = dict(_LAST_TURN) if _LAST_TURN else {}
     payload["voice_session_id"] = voice_ws.last_voice_session_id()
     payload["voice_events"] = voice_ws.get_voice_events()
+    payload["process_boot_ms"] = voice_ws.process_boot_ms()
+    if (
+        not _LAST_TURN
+        and payload["voice_session_id"] is None
+        and not payload["voice_events"]
+        and not voice_ws.has_voice_activity()
+    ):
+        payload["note"] = "server_restarted"
     return payload
 
 

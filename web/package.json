@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test lib/scan-events.test.ts lib/voice-loop.test.ts lib/audio/audio-owner.test.ts lib/audio/audio-session.test.ts"
+    "test": "node --experimental-strip-types --test lib/scan-events.test.ts lib/voice-loop.test.ts lib/audio/audio-owner.test.ts lib/audio/audio-session.test.ts lib/audio/mic-session.test.ts"
   },
   "dependencies": {
     "framer-motion": "^12.42.2",

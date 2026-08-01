@@ -10,10 +10,15 @@ import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-sc
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
   micOpenBlockReason,
-  prepareAssistantPlayback,
   setAudioSession,
   setAudioSessionLogger,
 } from "@/lib/audio/audio-session";
+import {
+  ensureMicSession,
+  getSharedAudioContext,
+  setMicSessionAudioSession,
+  setMicSessionLogger,
+} from "@/lib/audio/mic-session";
 import {
   base64ToArrayBuffer,
   isTtsPlaybackActive,
@@ -26,20 +31,22 @@ import {
 import { browserSttSupported, startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
 import { createVoiceLoop } from "@/lib/voice-loop";
 import {
-  MAX_RECORDING_MS,
   MIN_SPEECH_MS,
   POST_TTS_RESUME_MS,
   SPEECH_LEVEL,
   recorderToWav,
+  releaseMicSession,
   speechMs,
   startVoiceRecorder,
-  teardownRecorder,
+  stopRecorderTurn,
   type RecorderSession,
 } from "@/lib/audio/recorder";
 import { debugLog, isDebugAudio, voiceClientLog } from "@/lib/debug";
 import { getVoiceSession } from "@/lib/voice-session";
 
 setAudioSessionLogger(voiceClientLog);
+setMicSessionLogger(voiceClientLog);
+setMicSessionAudioSession(setAudioSession);
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
 import { SetuOrb } from "@/components/SetuOrb";
 import type {
@@ -1081,6 +1088,8 @@ export default function Home() {
   const startRecordingRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
   const isRecordingFlagRef = useRef(false);
+  const earlyReopenUsedRef = useRef(false);
+  const micOpeningRef = useRef(false);
   const previewCacheRef = useRef(new Map<string, string>());
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [sampleNames, setSampleNames] = useState<Record<string, string>>({});
@@ -1282,9 +1291,12 @@ export default function Home() {
     voiceSessionRef.current.cancel();
     const recorder = recorderRef.current;
     recorderRef.current = null;
-    teardownRecorder(recorder);
+    stopRecorderTurn(recorder, { reason: "new_chat", releaseStream: false });
+    releaseMicSession();
     setIsRecording(false);
     setMicLevel(0);
+    earlyReopenUsedRef.current = false;
+    micOpeningRef.current = false;
     const session = makeSession("en");
     setSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
@@ -1314,9 +1326,12 @@ export default function Home() {
     voiceSessionRef.current.cancel();
     const recorder = recorderRef.current;
     recorderRef.current = null;
-    teardownRecorder(recorder);
+    stopRecorderTurn(recorder, { reason: "load_session", releaseStream: false });
+    releaseMicSession();
     setIsRecording(false);
     setMicLevel(0);
+    earlyReopenUsedRef.current = false;
+    micOpeningRef.current = false;
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id;
     setDocId(session.docId);
@@ -1368,15 +1383,16 @@ export default function Home() {
     setAnswerSheet(null);
   }, []);
 
-  const stopActiveRecording = useCallback(() => {
+  const stopActiveRecording = useCallback((reason = "stop_active") => {
     const recorder = recorderRef.current;
-    if (!recorder) return;
+    if (!recorder) return null;
     recorderRef.current = null;
-    teardownRecorder(recorder);
+    const result = stopRecorderTurn(recorder, { reason, releaseStream: false });
     isRecordingFlagRef.current = false;
     setIsRecording(false);
     setAutoStopProgress(0);
     setMicLevel(0);
+    return result;
   }, []);
 
   const resumeListening = useCallback((fromTurnId?: number) => {
@@ -1406,10 +1422,9 @@ export default function Home() {
     prefetchedParts?: ArrayBuffer[],
     _allowBargeIn = true,
   ) => {
-    // Full mic teardown before TTS so iOS leaves play-and-record voice mode.
-    stopActiveRecording();
+    // Detach VAD for this turn — keep MediaStream alive (no getUserMedia on next listen).
+    stopActiveRecording("prepare_tts");
     stopBargeIn();
-    // Cancel prior TTS cleanly (settles previous turn once as cancelled — no mic reopen).
     if (playbackRef.current) {
       playbackRef.current.stop("cancelled");
       playbackRef.current = null;
@@ -1423,6 +1438,7 @@ export default function Home() {
     const loop = voiceLoopRef.current;
     const playTurnId = loop.beginTurn();
     speakTurnIdRef.current = playTurnId;
+    earlyReopenUsedRef.current = false;
 
     if (!cachedUrl && !prefetchedAudio && !(prefetchedParts && prefetchedParts.length) && !text.trim()) {
       loop.transition("idle", "empty_speech");
@@ -1466,8 +1482,18 @@ export default function Home() {
         buffers = [arrayBuffer!];
       }
 
-      // recorder closed → tracks stopped → audio session playback → iOS settle → HTMLAudioElement.
-      await prepareAssistantPlayback();
+      // TTS through shared AudioContext.destination — session stays play-and-record.
+      // Warm mic session on first speak (user gesture) so later turns reuse the stream.
+      let context = getSharedAudioContext();
+      if (!context || context.state === "closed") {
+        const warmed = await ensureMicSession();
+        context = warmed.context;
+      }
+      try {
+        if (context.state !== "running") await context.resume();
+      } catch {
+        /* playOnePart also resumes */
+      }
 
       await new Promise<void>((resolve, reject) => {
         const finishClean = () => {
@@ -1485,9 +1511,6 @@ export default function Home() {
           if (settled) return;
           settled = true;
           finishClean();
-          // Keep playback session until the next getUserMedia.
-          setAudioSession("playback");
-          // Never leave state=speaking after playback_end (natural or stopped).
           loop.transition("idle", `playback_${outcome}`);
           orbStateRef.current = "idle";
           setOrbState("idle");
@@ -1517,19 +1540,18 @@ export default function Home() {
             resolve();
             return;
           }
-          // cancelled — cleanup / superseded; do not fake barge-in or retry mic.
           setStatusText("Tap to speak");
           resolve();
         };
 
         void playDecodedBuffersSequential({
+          context,
           arrayBuffers: buffers,
           turnId: playTurnId,
           onPlay: () => {
             loop.transition("speaking", "playback_start");
             orbStateRef.current = "speaking";
             setOrbState("speaking");
-            // No getUserMedia barge-in during speaking — keeps audio session in playback.
             setStatusText("Speaking — tap to interrupt");
           },
           onAmplitude: (nextAmplitude, nextBands, nextSpectrum) => {
@@ -1854,16 +1876,40 @@ export default function Home() {
     return () => { window.clearInterval(interval); cameraStreamRef.current?.getTracks().forEach((track) => track.stop()); cameraStreamRef.current = null; };
   }, [cameraOpen, cameraText, captureDocument, playSpeech, speaker]);
 
-  const finishRecording = useCallback(async (cancelled = false) => {
+  const finishRecording = useCallback(async (cancelled = false, meta?: { reason?: string }) => {
     setViewMode("voice");
     const recorder = recorderRef.current;
     if (!recorder) return;
     recorderRef.current = null;
-    teardownRecorder(recorder);
+    const stopResult = stopRecorderTurn(recorder, {
+      reason: meta?.reason || (cancelled ? "cancelled" : "utterance"),
+      releaseStream: false,
+    });
     isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
-    // Leave play-and-record as soon as capture ends (before STT/LLM/TTS).
-    setAudioSession("playback");
+
+    // Early teardown without speech → one guarded reopen (not user stop / real utterance).
+    const reopenBlocked = new Set(["user_stop", "utterance", "prepare_tts", "new_chat", "page_unload"]);
+    if (
+      stopResult.early &&
+      !recorder.heardSpeech &&
+      !earlyReopenUsedRef.current &&
+      !reopenBlocked.has(stopResult.reason) &&
+      (voiceLoopRef.current.state === "listening" || voiceLoopRef.current.state === "idle")
+    ) {
+      earlyReopenUsedRef.current = true;
+      voiceClientLog("teardown_early_reopen", {
+        turn_id: stopResult.turnId,
+        reason: stopResult.reason,
+        age_ms: stopResult.ageMs,
+      });
+      const turn = voiceLoopRef.current.beginTurn();
+      speakTurnIdRef.current = turn;
+      voiceLoopRef.current.transition("idle", "teardown_early_reopen");
+      resumeListening(turn);
+      return;
+    }
+
     const sttSession = browserSttRef.current;
     browserSttRef.current = null;
     const spokenMs = speechMs(recorder);
@@ -2110,6 +2156,11 @@ export default function Home() {
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     const loop = voiceLoopRef.current;
     if (isRecordingFlagRef.current) { void finishRecording(); return; }
+    // Prevent overlapping getUserMedia / VAD starts while a prior open is in flight.
+    if (micOpeningRef.current) {
+      voiceClientLog("mic_open_blocked", { reason: "opening_in_flight", force: Boolean(options?.force) });
+      return;
+    }
 
     const block = micOpenBlockReason({
       voiceState: loop.state,
@@ -2120,44 +2171,45 @@ export default function Home() {
       console.info(`[audio] mic_open_blocked reason=${block}`);
       return;
     }
-    // Also block orb speaking even if loop briefly drifted.
     if (!options?.force && orbStateRef.current === "speaking") {
       voiceClientLog("mic_open_blocked", { reason: "speaking", state: "speaking" });
       return;
     }
 
-    // Always tear down any leftover mic before opening a new one.
     if (recorderRef.current) {
-      teardownRecorder(recorderRef.current);
+      stopRecorderTurn(recorderRef.current, { reason: "replace_turn", releaseStream: false });
       recorderRef.current = null;
       isRecordingFlagRef.current = false;
     }
     audioRef.current?.pause();
     audioRef.current = null;
     const openTurnId = speakTurnIdRef.current || loop.beginTurn();
+    micOpeningRef.current = true;
     try {
-      // play-and-record + getUserMedia happen inside startVoiceRecorder / openMicrophoneStream.
-      const recorder = await startVoiceRecorder({
-        onLevel: (amp, nextBands, level, threshold) => {
-          setAmplitude(amp);
-          setBands(nextBands);
-          setMicLevel(level);
-          setMicThreshold(threshold);
+      const recorder = await startVoiceRecorder(
+        {
+          onLevel: (amp, nextBands, level, threshold) => {
+            setAmplitude(amp);
+            setBands(nextBands);
+            setMicLevel(level);
+            setMicThreshold(threshold);
+          },
+          onAutoStopProgress: setAutoStopProgress,
+          onFinish: (cancelled, meta) => {
+            if (recorderRef.current) void finishRecording(cancelled, meta);
+          },
+          onWatchdog: (message) => {
+            setStatusText(message);
+            loop.transition("idle", "mic_watchdog");
+            orbStateRef.current = "idle";
+            setOrbState("idle");
+          },
         },
-        onAutoStopProgress: setAutoStopProgress,
-        onFinish: (cancelled) => {
-          if (recorderRef.current) void finishRecording(cancelled);
-        },
-        onWatchdog: (message) => {
-          setStatusText(message);
-          loop.transition("idle", "mic_watchdog");
-          orbStateRef.current = "idle";
-          setOrbState("idle");
-        },
-      });
+        { turnId: openTurnId },
+      );
       const gated = loop.noteMicOpen(openTurnId);
       if (!gated.ok) {
-        teardownRecorder(recorder);
+        stopRecorderTurn(recorder, { reason: "gate_rejected", releaseStream: false });
         return;
       }
       recorderRef.current = recorder;
@@ -2166,7 +2218,6 @@ export default function Home() {
       if (browserSttSupported() && !loop.browserSttDisabled) {
         const stt = startBrowserStt(languageRef.current);
         browserSttRef.current = stt;
-        // If this session already marked unavailable, mirror into voice loop.
         if (stt?.unavailable()) loop.noteBrowserSttUnavailable();
       } else if (!browserSttSupported()) {
         loop.noteBrowserSttUnavailable();
@@ -2177,9 +2228,7 @@ export default function Home() {
       setOrbState("listening");
       setStatusText("Listening…");
       setAutoStopProgress(0);
-      window.setTimeout(() => {
-        if (recorderRef.current === recorder) void finishRecording(false);
-      }, MAX_RECORDING_MS + 1500);
+      // Max/no-speech timers live inside the recorder (armed at mic_stream_ready).
     } catch (error) {
       console.error("[Setu mic] start failed", error);
       isRecordingFlagRef.current = false;
@@ -2188,6 +2237,8 @@ export default function Home() {
       setOrbState("idle");
       setIsRecording(false);
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
+    } finally {
+      micOpeningRef.current = false;
     }
   }, [finishRecording]);
 
@@ -2197,7 +2248,7 @@ export default function Home() {
   }, [startRecording]);
 
   const beginOrStop = async () => {
-    if (isRecording) { void finishRecording(); return; }
+    if (isRecording) { void finishRecording(true, { reason: "user_stop" }); return; }
     if (orbState === "speaking" || voiceLoopRef.current.state === "speaking") {
       // Explicit user stop — settle once as cancelled (no auto-relisten).
       playbackRef.current?.stop("cancelled");
@@ -2319,9 +2370,10 @@ export default function Home() {
 
   useEffect(() => {
     const releaseAudioSession = () => {
-      teardownRecorder(recorderRef.current);
+      stopRecorderTurn(recorderRef.current, { reason: "page_unload", releaseStream: false });
       recorderRef.current = null;
       isRecordingFlagRef.current = false;
+      micOpeningRef.current = false;
       const monitor = bargeInRef.current;
       bargeInRef.current = null;
       monitor?.stop();
@@ -2330,7 +2382,7 @@ export default function Home() {
       stopAllPlayback("cancelled");
       audioRef.current?.pause();
       audioRef.current = null;
-      setAudioSession("auto");
+      releaseMicSession();
     };
     const onPageHide = () => releaseAudioSession();
     window.addEventListener("pagehide", onPageHide);

@@ -1,5 +1,5 @@
-import { setAudioSession } from "@/lib/audio/audio-session";
 import { debugLog, voiceClientLog } from "@/lib/debug";
+import { ensureMicSession, releaseMicSession } from "@/lib/audio/mic-session";
 import { encodeWav } from "@/lib/audio/wav";
 import { ensureVadWorklet, getVadProcessorName } from "@/lib/audio/worklet-vad";
 
@@ -12,8 +12,10 @@ export const AMBIENT_MS = 350;
 /** ~80ms of loud frames at 128-sample worklet quantum (~48kHz). */
 export const SPEECH_FRAMES_TO_CONFIRM = 24;
 export const MIN_SPEECH_MS = 160;
-/** Post-TTS delay before reopening the mic (speakerphone echo). */
-export const POST_TTS_RESUME_MS = 700;
+/** Post-TTS delay before re-arming VAD (speakerphone echo). */
+export const POST_TTS_RESUME_MS = 400;
+/** Early teardown without speech — bug guard window. */
+export const EARLY_TEARDOWN_MS = 2000;
 
 export type RecorderSession = {
   context: AudioContext;
@@ -24,7 +26,9 @@ export type RecorderSession = {
   silenceGain: GainNode;
   chunks: Float32Array[];
   sampleRate: number;
+  /** Armed only when VAD is live (mic_stream_ready) — never at getUserMedia request. */
   startedAt: number;
+  turnId: number;
   heardSpeech: boolean;
   silentSince: number | null;
   raf: number;
@@ -37,15 +41,28 @@ export type RecorderSession = {
   frameMs: number;
   framesSeen: number;
   watchdog: number;
+  maxTimer: number;
   constraintsPath: string;
+  acquireMs: number;
+  reusedStream: boolean;
+  finished: boolean;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
 
 export type RecorderCallbacks = {
   onLevel?: (amplitude: number, bands: { bass: number; treble: number }, micLevel: number, threshold: number) => void;
   onAutoStopProgress?: (progress: number) => void;
-  onFinish: (cancelled: boolean) => void;
+  onFinish: (cancelled: boolean, meta?: { reason?: string }) => void;
   onWatchdog?: (message: string) => void;
+};
+
+export type StopTurnResult = {
+  /** Tracks stopped (0 when stream kept alive for next turn). */
+  trackCount: number;
+  early: boolean;
+  ageMs: number;
+  turnId: number;
+  reason: string;
 };
 
 let workletReadyFor: AudioContext | null = null;
@@ -56,68 +73,46 @@ async function ensureWorklet(context: AudioContext) {
   workletReadyFor = context;
 }
 
-/** Preferred mic constraints — disable voice-processing that ducks later TTS. */
-export const PREFERRED_MIC_CONSTRAINTS: MediaStreamConstraints = {
-  audio: {
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: false,
-    channelCount: 1,
-  },
-};
+function finishOnce(
+  recorder: RecorderSession,
+  callbacks: RecorderCallbacks,
+  cancelled: boolean,
+  reason: string,
+) {
+  if (recorder.finished) return;
+  recorder.finished = true;
+  if (reason === "no_speech" || reason === "max_recording") {
+    console.info(`[audio] utterance_timeout turn_id=${recorder.turnId} reason=${reason}`);
+    voiceClientLog("utterance_timeout", { turn_id: recorder.turnId, reason });
+  }
+  callbacks.onFinish(cancelled, { reason });
+}
 
 /**
- * Open mic after switching audio session to play-and-record.
- * Falls back to `{ audio: true }` when preferred constraints are unsupported.
+ * Start a listen turn on the persistent mic session.
+ * Timers (silence / no-speech / max / watchdog) arm only after the graph is live.
  */
-export async function openMicrophoneStream(): Promise<{
-  stream: MediaStream;
-  constraintsPath: "processing_off" | "audio_true_fallback";
-}> {
-  setAudioSession("play-and-record");
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia(PREFERRED_MIC_CONSTRAINTS);
-    voiceClientLog("mic_constraints", { path: "processing_off" });
-    console.info("[audio] mic_constraints path=processing_off");
-    return { stream, constraintsPath: "processing_off" };
-  } catch {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    voiceClientLog("mic_constraints", { path: "audio_true_fallback" });
-    console.info("[audio] mic_constraints path=audio_true_fallback");
-    return { stream, constraintsPath: "audio_true_fallback" };
-  }
-}
-
-function audioContextConstructor(): typeof AudioContext {
-  const ctor =
-    window.AudioContext ||
-    (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!ctor) throw new Error("Web Audio is not supported in this browser");
-  return ctor;
-}
-
-export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<RecorderSession> {
-  const AudioContextConstructor = audioContextConstructor();
-  const context = new AudioContextConstructor();
-  try {
-    await context.resume();
-  } catch {
-    /* continue — worklet may still run once running */
-  }
-
+export async function startVoiceRecorder(
+  callbacks: RecorderCallbacks,
+  options?: { turnId?: number },
+): Promise<RecorderSession> {
+  const turnId = options?.turnId ?? 0;
+  const { stream, context, acquireMs, reused, constraintsPath } = await ensureMicSession();
   await ensureWorklet(context);
-  const { stream, constraintsPath } = await openMicrophoneStream();
+
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
   analyser.fftSize = 256;
   const worklet = new AudioWorkletNode(context, getVadProcessorName());
-  // Keep the worklet in the graph without audible output (gain 0).
   const silenceGain = context.createGain();
   silenceGain.gain.value = 0;
   source.connect(analyser);
   source.connect(worklet);
   worklet.connect(silenceGain);
   silenceGain.connect(context.destination);
+
+  // Arm utterance window ONLY now — after stream/graph are ready.
+  const startedAt = performance.now();
 
   const recorder: RecorderSession = {
     context,
@@ -128,7 +123,8 @@ export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<
     silenceGain,
     chunks: [],
     sampleRate: context.sampleRate,
-    startedAt: performance.now(),
+    startedAt,
+    turnId,
     heardSpeech: false,
     silentSince: null,
     raf: 0,
@@ -141,11 +137,27 @@ export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<
     frameMs: (128 / context.sampleRate) * 1000,
     framesSeen: 0,
     watchdog: 0,
+    maxTimer: 0,
     constraintsPath,
+    acquireMs,
+    reusedStream: reused,
+    finished: false,
   };
+
+  console.info(`[audio] utterance_window_start turn_id=${turnId}`);
+  voiceClientLog("utterance_window_start", { turn_id: turnId });
+  voiceClientLog("mic_stream_ready", {
+    sampleRate: recorder.sampleRate,
+    constraints: recorder.constraintsPath,
+    mic_acquire_ms: acquireMs,
+    reused,
+    turn_id: turnId,
+  });
+  console.info(`[audio] mic_acquire_ms=${acquireMs} turn_id=${turnId}`);
 
   const meterData = new Uint8Array(analyser.frequencyBinCount);
   const tickMeter = () => {
+    if (recorder.finished) return;
     analyser.getByteFrequencyData(meterData);
     const normal = (from: number, to: number) =>
       meterData.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255;
@@ -164,6 +176,7 @@ export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<
   recorder.raf = requestAnimationFrame(tickMeter);
 
   worklet.port.onmessage = (event: MessageEvent) => {
+    if (recorder.finished) return;
     const data = event.data as { type: string; rms?: number; samples?: Float32Array };
     const now = performance.now();
     const elapsed = now - recorder.startedAt;
@@ -205,21 +218,27 @@ export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<
         const silentFor = now - recorder.silentSince;
         callbacks.onAutoStopProgress?.(Math.min(1, silentFor / SILENCE_MS));
         if (silentFor >= SILENCE_MS && elapsed >= MIN_RECORDING_MS) {
-          callbacks.onFinish(false);
+          finishOnce(recorder, callbacks, false, "silence_end");
           return;
         }
       } else if (elapsed >= NO_SPEECH_MS) {
-        callbacks.onFinish(true);
+        finishOnce(recorder, callbacks, true, "no_speech");
         return;
       }
     }
 
     if (elapsed >= MAX_RECORDING_MS) {
-      callbacks.onFinish(false);
+      finishOnce(recorder, callbacks, false, "max_recording");
     }
   };
 
+  // Watchdog starts at mic_stream_ready (startedAt), not at getUserMedia request.
   recorder.watchdog = window.setInterval(() => {
+    if (recorder.finished) {
+      window.clearInterval(recorder.watchdog);
+      recorder.watchdog = 0;
+      return;
+    }
     const age = performance.now() - recorder.startedAt;
     if (recorder.framesSeen > 2) {
       window.clearInterval(recorder.watchdog);
@@ -229,27 +248,35 @@ export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<
     if (age > 1500) {
       window.clearInterval(recorder.watchdog);
       recorder.watchdog = 0;
-      callbacks.onWatchdog?.(
-        "Mic paused by the phone — tap the orb to continue",
-      );
-      callbacks.onFinish(true);
+      callbacks.onWatchdog?.("Mic paused by the phone — tap the orb to continue");
+      finishOnce(recorder, callbacks, true, "watchdog");
     }
   }, 250);
 
-  voiceClientLog("mic_stream_ready", {
-    sampleRate: recorder.sampleRate,
-    constraints: recorder.constraintsPath,
-  });
+  // Hard max also armed at stream ready (not at request).
+  recorder.maxTimer = window.setTimeout(() => {
+    if (!recorder.finished) finishOnce(recorder, callbacks, false, "max_recording");
+  }, MAX_RECORDING_MS + 500);
+
   return recorder;
 }
 
 /**
- * Fully release the recorder graph: disconnect nodes, stop tracks, close AudioContext.
- * Returns number of tracks stopped.
+ * End a listen turn: disconnect VAD nodes, clear timers.
+ * Keeps MediaStream + AudioContext alive unless releaseStream=true.
  */
-export function teardownRecorder(recorder: RecorderSession | null): number {
-  if (!recorder) return 0;
+export function stopRecorderTurn(
+  recorder: RecorderSession | null,
+  options?: { reason?: string; releaseStream?: boolean },
+): StopTurnResult {
+  if (!recorder) {
+    return { trackCount: 0, early: false, ageMs: 0, turnId: 0, reason: options?.reason || "none" };
+  }
+  recorder.finished = true;
   window.clearInterval(recorder.watchdog);
+  recorder.watchdog = 0;
+  window.clearTimeout(recorder.maxTimer);
+  recorder.maxTimer = 0;
   cancelAnimationFrame(recorder.raf);
   try {
     recorder.worklet.port.onmessage = null;
@@ -265,34 +292,38 @@ export function teardownRecorder(recorder: RecorderSession | null): number {
     /* ignore */
   }
 
-  let trackCount = 0;
-  try {
-    const tracks = recorder.stream.getTracks();
-    trackCount = tracks.length;
-    tracks.forEach((track) => track.stop());
-  } catch {
-    /* ignore */
-  }
-  console.info(`[audio] mic_tracks_stopped count=${trackCount}`);
-  voiceClientLog("mic_tracks_stopped", { count: trackCount });
-
-  const context = recorder.context;
-  if (workletReadyFor === context) workletReadyFor = null;
-  try {
-    // Close — do not leave suspended play-and-record graphs alive.
-    void context.close().then(() => {
-      console.info("[audio] recorder_context_closed");
-      voiceClientLog("recorder_context_closed", {});
-    }).catch(() => {
-      console.info("[audio] recorder_context_closed");
-      voiceClientLog("recorder_context_closed", { already_closed: true });
+  const ageMs = Math.round(performance.now() - recorder.startedAt);
+  const reason = options?.reason || "turn_end";
+  const early = ageMs < EARLY_TEARDOWN_MS && !recorder.heardSpeech;
+  if (early) {
+    console.info(`[audio] teardown_early turn_id=${recorder.turnId} reason=${reason} age_ms=${ageMs}`);
+    voiceClientLog("teardown_early", {
+      turn_id: recorder.turnId,
+      reason,
+      age_ms: ageMs,
     });
-  } catch {
-    console.info("[audio] recorder_context_closed");
-    voiceClientLog("recorder_context_closed", { already_closed: true });
   }
 
-  return trackCount;
+  let trackCount = 0;
+  if (options?.releaseStream) {
+    releaseMicSession();
+    trackCount = 1;
+  } else {
+    // Stream kept — do not stop tracks between turns.
+    voiceClientLog("mic_turn_stopped", {
+      turn_id: recorder.turnId,
+      keep_stream: true,
+      reason,
+      age_ms: ageMs,
+    });
+  }
+
+  return { trackCount, early, ageMs, turnId: recorder.turnId, reason };
+}
+
+/** @deprecated use stopRecorderTurn — kept for call-site migration */
+export function teardownRecorder(recorder: RecorderSession | null): number {
+  return stopRecorderTurn(recorder, { reason: "teardown", releaseStream: false }).trackCount;
 }
 
 export function recorderToWav(recorder: RecorderSession): Blob {
@@ -302,3 +333,5 @@ export function recorderToWav(recorder: RecorderSession): Blob {
 export function speechMs(recorder: RecorderSession): number {
   return recorder.speechFrames * recorder.frameMs;
 }
+
+export { releaseMicSession };
