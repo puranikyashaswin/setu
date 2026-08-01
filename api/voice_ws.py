@@ -298,9 +298,51 @@ async def voice_socket(websocket: WebSocket):
                 stt_language_code=language_code or None,
             )
         except Exception as exc:
+            # Never leak user content or exception text to the client log ring.
             logger.exception("ws agent failed")
-            voice_log(sid(), "error", stage="route", detail=str(exc))
-            await _send(websocket, {"type": "error", "message": f"Agent failed: {exc}"})
+            voice_log(sid(), "agent_error", exception=type(exc).__name__)
+            lang = session.get("language") or "en"
+            fallback = sarvam.agent_error_phrase_for_language(lang)
+            try:
+                wav = await asyncio.to_thread(
+                    sarvam.speak,
+                    fallback,
+                    lang,
+                    "shubh",
+                    float(session.get("pace") or 1.0),
+                )
+                b64 = base64.b64encode(wav).decode("ascii")
+                await _send(
+                    websocket,
+                    {
+                        "type": "audio",
+                        "audio_base64": b64,
+                        "audio_mime": "audio/wav",
+                        "index": 0,
+                        "text": fallback,
+                        "final": True,
+                    },
+                )
+                await _send(
+                    websocket,
+                    {
+                        "type": "turn.done",
+                        "transcript": transcript,
+                        "language_code": language_code,
+                        "language": lang,
+                        "route": "error",
+                        "intent": "agent_error",
+                        "reply": fallback,
+                        "spoken": fallback,
+                        "open_camera": False,
+                        "continue_listening": True,
+                        "audio_base64": b64,
+                        "audio_mime": "audio/wav",
+                        "audio_parts": 1,
+                    },
+                )
+            except Exception:
+                await _send(websocket, {"type": "error", "message": fallback})
             return
 
         if cancel_event.is_set():

@@ -811,6 +811,19 @@ def _lang_base(language: str | None) -> str:
     return (language or "").strip().lower().split("-", 1)[0]
 
 
+def _is_mostly_latin(text: str) -> bool:
+    """True when alphabetic characters are mostly Latin (ASCII) script.
+
+    Used to detect Sarvam answering in English when an Indic language was
+    requested — call sites in chat_reply retry once for native script.
+    """
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return True
+    latin = sum(1 for c in letters if ord(c) < 128)
+    return latin / len(letters) > 0.55
+
+
 def _history_language(history: list[dict] | None) -> str | None:
     """Language of the most recent turn that carries a language tag."""
     if not history:
@@ -959,9 +972,30 @@ CAMERA_PHRASES_BY_LANG: dict[str, dict[str, str]] = {
     },
 }
 
+AGENT_ERROR_BY_LANG: dict[str, str] = {
+    "en": "Sorry, something went wrong — please try again.",
+    "te": "క్షమించండి, ఏదో తప్పు జరిగింది — మళ్లీ ప్రయత్నించండి.",
+    "hi": "माफ़ कीजिए, कुछ गलत हो गया — कृपया फिर कोशिश करें.",
+    "mr": "माफ करा, काहीतरी चुकले — पुन्हा प्रयत्न करा.",
+    "ta": "மன்னிக்கவும், ஏதோ தவறு நடந்தது — மீண்டும் முயற்சிக்கவும்.",
+    "kn": "ಕ್ಷಮಿಸಿ, ಏನೋ ತಪ್ಪಾಗಿದೆ — ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.",
+    "bn": "দুঃখিত, কিছু ভুল হয়েছে — আবার চেষ্টা করুন।",
+    "gu": "માફ કરો, કંઈક ખોટું થયું — ફરી પ્રયાસ કરો.",
+    "ml": "ക്ഷമിക്കണം, എന്തോ തെറ്റായി — വീണ്ടും ശ്രമിക്കൂ.",
+    "pa": "ਮਾਫ਼ ਕਰੋ, ਕੁਝ ਗਲਤ ਹੋ ਗਿਆ — ਮੁੜ ਕੋਸ਼ਿਸ਼ ਕਰੋ।",
+    "or": "କ୍ଷମା କରନ୍ତୁ, କିଛି ଭୁଲ ହେଲା — ପୁଣି ଚେଷ୍ଟା କରନ୍ତୁ।",
+}
+
+
 def brief_ack_for_language(language: str) -> str:
     base = _lang_base(language) or "en"
     return BRIEF_ACK_BY_LANG.get(base, BRIEF_ACK_BY_LANG["en"])
+
+
+def agent_error_phrase_for_language(language: str) -> str:
+    """Short spoken fallback when the agent raises mid-turn."""
+    base = _lang_base(language) or "en"
+    return AGENT_ERROR_BY_LANG.get(base, AGENT_ERROR_BY_LANG["en"])
 
 
 def language_switch_for_language(language: str) -> str:

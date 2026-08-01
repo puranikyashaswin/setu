@@ -162,6 +162,107 @@ class LanguageRoutingTests(unittest.TestCase):
         self.assertEqual(result.language, "te-IN")
 
 
+class LatinScriptRetryTests(unittest.TestCase):
+    """Regression: _is_mostly_latin must exist — NameError crashed agent turns."""
+
+    def test_is_mostly_latin_helper(self):
+        self.assertTrue(sarvam._is_mostly_latin("Sure, I can help with that tomorrow."))
+        self.assertFalse(sarvam._is_mostly_latin("అవును, రేపు సహాయం చేస్తాను."))
+        self.assertTrue(sarvam._is_mostly_latin(""))
+
+    def test_chat_reply_latin_heavy_indic_retries_native_script(self):
+        """Agent turn with Latin-script-heavy Indic transcript retries for native script."""
+        calls: list[str] = []
+
+        class _Msg:
+            def __init__(self, content: str):
+                self.content = content
+
+        class _Choice:
+            def __init__(self, content: str):
+                self.message = _Msg(content)
+
+        class _Resp:
+            def __init__(self, content: str):
+                self.choices = [_Choice(content)]
+
+        def fake_completions(**kwargs):
+            calls.append("call")
+            if len(calls) == 1:
+                return _Resp("Sure, rain is expected tomorrow morning.")
+            return _Resp("అవును, రేపు వర్షం కురుస్తుంది.")
+
+        fake_client = type("C", (), {"chat": type("Ch", (), {"completions": staticmethod(fake_completions)})()})()
+        with patch.object(sarvam, "get_client", return_value=fake_client):
+            with patch.object(sarvam, "_with_backoff", side_effect=lambda fn, **_k: fn()):
+                result = sarvam.chat_reply(
+                    "nenu oka doubt undi rain gurinchi",
+                    "te",
+                    False,
+                )
+        self.assertEqual(len(calls), 2, "must retry once when first reply is Latin")
+        self.assertFalse(sarvam._is_mostly_latin(result["reply"]))
+        self.assertIn("వర్షం", result["reply"])
+
+    def test_agent_error_phrase_english_and_telugu(self):
+        en = sarvam.agent_error_phrase_for_language("en")
+        te = sarvam.agent_error_phrase_for_language("te-IN")
+        self.assertIn("try again", en.lower())
+        self.assertTrue(te.strip())
+        self.assertFalse(sarvam._is_mostly_latin(te))
+
+
+class AgentFailureFallbackTests(unittest.TestCase):
+    """WS agent raise → speak fallback; agent_error logs exception name only."""
+
+    def test_agent_raise_speaks_fallback_and_logs_exception_name(self):
+        import base64
+        import json
+        import os
+        from unittest import mock
+
+        from fastapi.testclient import TestClient
+
+        import main
+        import voice_ws
+
+        wav = b"RIFF" + b"\x00" * 40
+        logs: list[tuple] = []
+
+        def capture_log(session_id, event, **fields):
+            logs.append((event, fields))
+
+        with mock.patch.object(sarvam, "listen", return_value={"transcript": "hello", "language_code": "en-IN"}):
+            with mock.patch.object(agent, "run_agent_turn", side_effect=NameError("_is_mostly_latin")):
+                with mock.patch.object(sarvam, "speak", return_value=wav) as speak_mock:
+                    with mock.patch.object(voice_ws, "voice_log", side_effect=capture_log):
+                        with mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "legacy_client"}):
+                            client = TestClient(main.app)
+                            with client.websocket_connect("/ws/voice?user_id=agent-fail-1") as ws:
+                                ready = json.loads(ws.receive_text())
+                                self.assertEqual(ready["type"], "ready")
+                                audio_b64 = base64.b64encode(wav).decode("ascii")
+                                ws.send_text(json.dumps({"type": "audio.utterance", "audio_base64": audio_b64}))
+                                messages = []
+                                for _ in range(30):
+                                    msg = json.loads(ws.receive_text())
+                                    messages.append(msg)
+                                    if msg.get("type") in ("turn.done", "error"):
+                                        break
+        agent_logs = [f for e, f in logs if e == "agent_error"]
+        self.assertTrue(agent_logs, "expected agent_error log")
+        self.assertEqual(agent_logs[0].get("exception"), "NameError")
+        self.assertNotIn("detail", agent_logs[0])
+        done = next((m for m in messages if m.get("type") == "turn.done"), None)
+        self.assertIsNotNone(done)
+        self.assertEqual(done["intent"], "agent_error")
+        self.assertIn("try again", (done.get("reply") or "").lower())
+        speak_mock.assert_called()
+        # No user transcript leaked into agent_error fields.
+        dumped = json.dumps(agent_logs)
+        self.assertNotIn("hello", dumped)
+
+
 class BrowserSttContractTests(unittest.TestCase):
     """Client browser-STT unavailable errors must soft-fail (server STT continues)."""
 
