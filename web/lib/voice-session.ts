@@ -47,6 +47,15 @@ export class VoiceSession {
   private config: VoiceSessionConfig | null = null;
   private everConnected = false;
   private connectGeneration = 0;
+  /** server_vad_v1 state (legacy_client: always false). */
+  vadReady = false;
+  vadEngine: string | null = null;
+  serverTurnMode: string | null = null;
+  private vadReadyWaiter: ((ready: boolean) => void) | null = null;
+  private vadEventHandler: ((msg: Record<string, unknown>) => void) | null = null;
+  private lifecycleHandler:
+    | { onVadReady?: (engine: string) => void; onModeMismatch?: (serverMode: string) => void; onSocketDrop?: () => void }
+    | null = null;
 
   get isOpen(): boolean {
     return Boolean(this.socket && this.socket.readyState === WebSocket.OPEN && this.ready);
@@ -108,9 +117,35 @@ export class VoiceSession {
         if (type === "ready") {
           this.ready = true;
           this.everConnected = true;
-          voiceClientLog("ws_connect");
+          this.serverTurnMode = typeof msg.voice_turn_mode === "string" ? msg.voice_turn_mode : null;
+          this.vadEngine = typeof msg.vad_engine === "string" ? msg.vad_engine : null;
+          voiceClientLog("ws_connect", { voice_turn_mode: this.serverTurnMode });
           window.clearTimeout(timer);
           finish();
+          return;
+        }
+        if (type === "voice_v2_ready") {
+          this.vadReady = true;
+          this.vadEngine = typeof msg.vad_engine === "string" ? msg.vad_engine : this.vadEngine;
+          const waiter = this.vadReadyWaiter;
+          this.vadReadyWaiter = null;
+          waiter?.(true);
+          this.lifecycleHandler?.onVadReady?.(this.vadEngine || "");
+          return;
+        }
+        if (type === "mode_not_implemented") {
+          const mode = typeof msg.mode === "string" ? msg.mode : "unknown";
+          voiceClientLog("mode_not_implemented", { mode });
+          this.lifecycleHandler?.onModeMismatch?.(mode);
+          return;
+        }
+        if (
+          type === "vad_speech_start"
+          || type === "vad_speech_end_candidate"
+          || type === "semantic_turn_wait"
+          || type === "turn_finalized"
+        ) {
+          this.vadEventHandler?.(msg);
           return;
         }
         this.handleMessage(msg);
@@ -134,6 +169,14 @@ export class VoiceSession {
         window.clearTimeout(timer);
         this.ready = false;
         this.socket = null;
+        const wasVadReady = this.vadReady;
+        this.vadReady = false;
+        if (wasVadReady || this.vadReadyWaiter) {
+          const waiter = this.vadReadyWaiter;
+          this.vadReadyWaiter = null;
+          waiter?.(false);
+          this.lifecycleHandler?.onSocketDrop?.();
+        }
         if (this.pending) {
           this.pending.reject(new Error("Voice session disconnected"));
           this.pending = null;
@@ -205,6 +248,64 @@ export class VoiceSession {
         force_route: forceRoute ?? null,
       });
     });
+  }
+
+  // ---- server_vad_v1 -------------------------------------------------------
+
+  setLifecycleHandler(handler: VoiceSession["lifecycleHandler"]): void {
+    this.lifecycleHandler = handler;
+  }
+
+  setVadEventHandler(handler: ((msg: Record<string, unknown>) => void) | null): void {
+    this.vadEventHandler = handler;
+  }
+
+  /** Wait ONCE (per call) for voice_v2_ready, up to timeoutMs. */
+  whenVadReady(timeoutMs = 1000): Promise<boolean> {
+    if (this.vadReady) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => {
+        if (this.vadReadyWaiter) {
+          this.vadReadyWaiter = null;
+          resolve(false);
+        }
+      }, timeoutMs);
+      this.vadReadyWaiter = (ready) => {
+        window.clearTimeout(timer);
+        resolve(ready);
+      };
+    });
+  }
+
+  /** Register a pending server-VAD turn; resolves on turn.done like runUtterance. */
+  beginServerVadTurn(handlers: VoiceSessionHandlers = {}): Promise<VoiceTurnResponse> {
+    if (this.pending) {
+      this.pending.reject(new Error("Superseded by new utterance"));
+      this.pending = null;
+    }
+    return new Promise<VoiceTurnResponse>((resolve, reject) => {
+      this.pending = { resolve, reject, parts: [], handlers };
+    });
+  }
+
+  /** Drop a pending server-VAD turn locally (legacy fallback took over). */
+  abandonServerVadTurn(): void {
+    if (this.pending) {
+      this.pending.reject(new Error("cancelled"));
+      this.pending = null;
+    }
+  }
+
+  sendAudioChunk(turnId: number, sequence: number, pcmBase64: string): void {
+    this.send({ type: "audio.chunk", turn_id: turnId, sequence, pcm_base64: pcmBase64, sample_rate: 16000 });
+  }
+
+  sendPartialTranscript(turnId: number, text: string): void {
+    this.send({ type: "partial_transcript", turn_id: turnId, text });
+  }
+
+  sendVadClientFallback(turnId: number): void {
+    this.send({ type: "vad.client_fallback", turn_id: turnId });
   }
 
   close(): void {

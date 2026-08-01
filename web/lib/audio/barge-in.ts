@@ -1,6 +1,6 @@
 /** Listen while TTS plays — fire when the user starts talking (barge-in). */
 
-import { SPEECH_FRAMES_TO_CONFIRM, SPEECH_LEVEL } from "@/lib/audio/recorder";
+import { SPEECH_LEVEL } from "@/lib/audio/recorder";
 import { debugLog, voiceClientLog } from "@/lib/debug";
 
 export type BargeInMonitor = {
@@ -8,7 +8,8 @@ export type BargeInMonitor = {
 };
 
 const IGNORE_MS = 900; // ignore speaker bleed right after TTS starts
-const CONFIRM_FRAMES = Math.max(SPEECH_FRAMES_TO_CONFIRM + 16, 48);
+/** Sustained user voice required to interrupt; shorter echo/noise bursts ignored. */
+export const BARGE_IN_CONFIRM_MS = 350;
 
 export async function startBargeInMonitor(
   context: AudioContext,
@@ -37,7 +38,7 @@ export async function startBargeInMonitor(
   const data = new Uint8Array(analyser.fftSize);
   const startedAt = performance.now();
   let stopped = false;
-  let loudRun = 0;
+  let loudSince = 0;
   let raf = 0;
 
   const tick = () => {
@@ -56,16 +57,16 @@ export async function startBargeInMonitor(
     }
     // Higher threshold — laptop/phone speakers often trip barge-in and kill the mic loop.
     if (rms >= SPEECH_LEVEL * 2.4) {
-      loudRun += 1;
-      if (loudRun >= CONFIRM_FRAMES) {
+      if (loudSince === 0) loudSince = performance.now();
+      if (performance.now() - loudSince >= BARGE_IN_CONFIRM_MS) {
         debugLog("[barge-in] detected", { rms: rms.toFixed(4) });
-        voiceClientLog("barge_in_detected", { rms: Number(rms.toFixed(4)) });
+        voiceClientLog("barge_in_detected", { rms: Number(rms.toFixed(4)), sustained_ms: BARGE_IN_CONFIRM_MS });
         stop();
         onBargeIn();
         return;
       }
     } else {
-      loudRun = 0;
+      loudSince = 0;
     }
     raf = requestAnimationFrame(tick);
   };

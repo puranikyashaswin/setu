@@ -27,6 +27,12 @@ services:
         value: "1"
       - key: PYTHON_VERSION
         value: "3.12.8"
+      # Voice v2: legacy_client (default) | server_vad_v1. Flip after phone validation.
+      - key: VOICE_TURN_MODE
+        value: "legacy_client"
+      # Server VAD engine: webrtc (default) | silero (lazy, falls back to webrtc).
+      - key: SERVER_VAD_ENGINE
+        value: "webrtc"
       # Uncomment when upgrading to Starter plan for persistent storage.
       # - key: DB_PATH
       #   value: /data/setu.db

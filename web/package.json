@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test lib/scan-events.test.ts lib/voice-loop.test.ts lib/audio/audio-owner.test.ts lib/audio/audio-session.test.ts lib/audio/mic-session.test.ts lib/audio/playback.test.ts lib/audio/recorder.test.ts lib/audio/shared-audio-element.test.ts"
+    "test": "tsx --test lib/scan-events.test.ts lib/voice-loop.test.ts lib/voice-turn-v2.test.ts lib/audio/audio-owner.test.ts lib/audio/audio-session.test.ts lib/audio/mic-session.test.ts lib/audio/pcm-stream.test.ts lib/audio/playback.test.ts lib/audio/recorder.test.ts lib/audio/shared-audio-element.test.ts"
   },
   "dependencies": {
     "framer-motion": "^12.42.2",

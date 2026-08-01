@@ -12,12 +12,14 @@ from collections import deque
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import os
 
 import agent
 import auth
 import db
 import rate_limit
 import sarvam
+import server_vad
 
 logger = logging.getLogger("setu")
 
@@ -166,14 +168,49 @@ async def voice_socket(websocket: WebSocket):
     cancel_event = asyncio.Event()
     turn_lock = asyncio.Lock()
 
+    # server_vad_v1: per-socket VAD state (None in legacy_client mode).
+    voice_turn_mode, mode_fallback = server_vad.resolve_turn_mode(os.getenv("VOICE_TURN_MODE"))
+    vad_engine = server_vad.create_engine() if voice_turn_mode == server_vad.MODE_SERVER_VAD else None
+    vad_state: dict[str, Any] = {"turn": None}
+
     def sid() -> str:
         return str(session.get("session_id") or persisted_session_id)
 
     voice_log(sid(), "ws_connect")
     await _send(
         websocket,
-        {"type": "ready", "user_id": user_id, "session_id": sid()},
+        {
+            "type": "ready",
+            "user_id": user_id,
+            "session_id": sid(),
+            "voice_turn_mode": voice_turn_mode,
+            "vad_engine": vad_engine.name if vad_engine else None,
+        },
     )
+    if mode_fallback is not None:
+        # live_v2 (or unknown mode) requested — deterministic legacy fallback.
+        voice_log(sid(), "mode_not_implemented", mode=mode_fallback)
+        await _send(
+            websocket,
+            {
+                "type": "mode_not_implemented",
+                "mode": mode_fallback,
+                "effective_mode": voice_turn_mode,
+                "voice_session_id": sid(),
+                "sequence": 0,
+            },
+        )
+    if vad_engine is not None:
+        voice_log(sid(), "voice_v2_ready", engine=vad_engine.name)
+        await _send(
+            websocket,
+            {
+                "type": "voice_v2_ready",
+                "vad_engine": vad_engine.name,
+                "voice_session_id": sid(),
+                "sequence": 0,
+            },
+        )
 
     async def run_turn(audio_b64: str, force_route: str | None = None) -> None:
         cancel_event.clear()
@@ -377,6 +414,28 @@ async def voice_socket(websocket: WebSocket):
             },
         )
 
+    async def drain_vad_events(turn: server_vad.ServerVoiceTurn) -> None:
+        for ev in turn.drain_events():
+            voice_log(
+                sid(),
+                str(ev.get("type")),
+                turn_id=ev.get("turn_id"),
+                seq=ev.get("sequence"),
+                reason=ev.get("turn_finalize_reason"),
+            )
+            await _send(websocket, ev)
+
+    async def complete_vad_turn(turn: server_vad.ServerVoiceTurn) -> None:
+        """VAD finalized → assemble padded WAV and run the normal turn pipeline."""
+        vad_state["turn"] = None
+        wav = turn.utterance_wav()
+        if not wav:
+            voice_log(sid(), "vad_turn_empty", turn_id=turn.turn_id, reason=turn.finalize_reason)
+            await _send(websocket, {"type": "error", "message": "I could not understand that. Try again."})
+            return
+        async with turn_lock:
+            await run_turn(base64.b64encode(wav).decode("ascii"))
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -392,8 +451,71 @@ async def voice_socket(websocket: WebSocket):
                 continue
             if msg_type == "cancel":
                 cancel_event.set()
+                if vad_state["turn"] is not None:
+                    voice_log(sid(), "vad_turn_cancelled", turn_id=vad_state["turn"].turn_id)
+                    vad_state["turn"] = None
                 voice_log(sid(), "barge_in_fired")
                 await _send(websocket, {"type": "cancelled"})
+                continue
+            if msg_type == "audio.chunk":
+                if vad_engine is None:
+                    continue
+                try:
+                    chunk_turn = int(msg.get("turn_id") or 0)
+                except Exception:
+                    continue
+                turn = vad_state["turn"]
+                if turn is not None and turn.turn_id != chunk_turn:
+                    voice_log(sid(), "vad_stale_ignored", turn_id=chunk_turn, active_turn_id=turn.turn_id)
+                    continue
+                if turn is None:
+                    turn = server_vad.ServerVoiceTurn(chunk_turn, vad_engine, voice_session_id=sid())
+                    vad_state["turn"] = turn
+                    voice_log(sid(), "vad_turn_start", turn_id=chunk_turn, engine=vad_engine.name)
+                try:
+                    pcm = base64.b64decode(msg.get("pcm_base64") or "")
+                except Exception:
+                    continue
+                now_ms = time.monotonic() * 1000.0
+                step = server_vad.FRAME_BYTES
+                for offset in range(0, len(pcm) - step + 1, step):
+                    turn.accept_frame(pcm[offset:offset + step], now_ms)
+                    now_ms += server_vad.FRAME_MS
+                await drain_vad_events(turn)
+                if turn.state == server_vad.STATE_FINALIZED:
+                    await complete_vad_turn(turn)
+                continue
+            if msg_type == "partial_transcript":
+                turn = vad_state["turn"]
+                if vad_engine is not None and turn is not None:
+                    try:
+                        partial_turn = int(msg.get("turn_id") or 0)
+                    except Exception:
+                        partial_turn = 0
+                    if partial_turn == turn.turn_id:
+                        turn.note_partial(str(msg.get("text") or "")[:300], time.monotonic() * 1000.0)
+                        await _send(
+                            websocket,
+                            {
+                                "type": "partial_transcript",
+                                "voice_session_id": sid(),
+                                "turn_id": turn.turn_id,
+                                "sequence": turn.sequence,
+                            },
+                        )
+                continue
+            if msg_type == "vad.client_fallback":
+                turn = vad_state["turn"]
+                if vad_engine is not None and turn is not None:
+                    try:
+                        fallback_turn = int(msg.get("turn_id") or 0)
+                    except Exception:
+                        fallback_turn = 0
+                    if fallback_turn == turn.turn_id:
+                        voice_log(sid(), "vad_client_fallback", turn_id=turn.turn_id)
+                        turn.finalize(server_vad.REASON_CLIENT_FALLBACK, time.monotonic() * 1000.0)
+                        await drain_vad_events(turn)
+                        await complete_vad_turn(turn)
                 continue
             if msg_type == "session.update":
                 incoming_sid = (msg.get("session_id") or "").strip()
@@ -433,6 +555,9 @@ async def voice_socket(websocket: WebSocket):
     except WebSocketDisconnect as exc:
         code = getattr(exc, "code", None)
         reason = getattr(exc, "reason", None) or ""
+        if vad_state["turn"] is not None:
+            voice_log(sid(), "vad_session_cleanup", turn_id=vad_state["turn"].turn_id, reason="ws_close")
+            vad_state["turn"] = None
         voice_log(sid(), "ws_disconnect", code=code if code is not None else "", reason=str(reason))
     except Exception as exc:
         logger.exception("voice ws crashed")

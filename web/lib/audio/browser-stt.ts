@@ -74,8 +74,10 @@ export type BrowserSttSession = {
   unavailable: () => boolean;
 };
 
-/** Start continuous recognition for the active language; call stop() when mic ends. */
-export function startBrowserStt(language: Language): BrowserSttSession | null {
+/** Start continuous recognition for the active language; call stop() when mic ends.
+ *  onInterim (optional, server_vad_v1 semantic hint only): fired on every interim/final
+ *  browser transcript update. Display-only — never a finalization authority. */
+export function startBrowserStt(language: Language, onInterim?: (text: string) => void): BrowserSttSession | null {
   if (browserSttDisabled) return null;
   const Ctor = recognitionCtor();
   if (!Ctor) return null;
@@ -104,6 +106,8 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
       }
     }
     interim = interimChunk.trim();
+    const display = (finalText || interim).trim();
+    if (display) onInterim?.(display);
   };
 
   recognition.onerror = (event) => {

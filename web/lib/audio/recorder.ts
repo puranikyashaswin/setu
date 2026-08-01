@@ -63,6 +63,11 @@ export type RecorderSession = {
   lastEndpointStateLogAt: number;
   frameSeenLogged: boolean;
   vadTelemetry: VadLevelTelemetry;
+  /** server_vad_v1: passive PCM tap for streaming (does not affect local capture). */
+  onPcm?: (samples: Float32Array) => void;
+  /** server_vad_v1: when true, local endpoint decisions are suppressed (server is authoritative). */
+  localEndpointSuppressed: boolean;
+  localEndpointSuppressedLogged: boolean;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
 
@@ -201,6 +206,8 @@ export async function startVoiceRecorder(
     controller: null as unknown as TurnEndpoint,
     lastEndpointStateLogAt: 0,
     frameSeenLogged: false,
+    localEndpointSuppressed: false,
+    localEndpointSuppressedLogged: false,
     vadTelemetry: new VadLevelTelemetry(turnId),
   };
   recorder.controller = new TurnEndpoint(turnId, (reason) => {
@@ -261,6 +268,7 @@ export async function startVoiceRecorder(
     if (data.type === "frame" && data.samples) {
       recorder.chunks.push(data.samples);
       recorder.frameMs = (data.samples.length / recorder.sampleRate) * 1000;
+      recorder.onPcm?.(data.samples);
     }
 
     const rms = data.rms ?? 0;
@@ -298,8 +306,15 @@ export async function startVoiceRecorder(
     }
 
     // ONE authoritative endpoint owner — fed every RMS frame.
-    recorder.controller.handleAudioFrame(recorder.turnId, rms, now);
-    if (recorder.finished) return; // finishTurnOnce fired inside handleAudioFrame
+    // server_vad_v1: feeding stops once the server owns endpointing; the
+    // max_recording timer (separately armed) remains the safety cap.
+    if (!recorder.localEndpointSuppressed) {
+      recorder.controller.handleAudioFrame(recorder.turnId, rms, now);
+      if (recorder.finished) return; // finishTurnOnce fired inside handleAudioFrame
+    } else if (!recorder.localEndpointSuppressedLogged) {
+      recorder.localEndpointSuppressedLogged = true;
+      voiceClientLog("vad_local_endpoint_suppressed", { turn_id: recorder.turnId });
+    }
 
     if (now - recorder.lastEndpointStateLogAt >= 1000) {
       recorder.lastEndpointStateLogAt = now;

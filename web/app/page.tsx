@@ -54,6 +54,15 @@ import {
 } from "@/lib/audio/recorder";
 import { debugLog, isDebugAudio, voiceClientLog } from "@/lib/debug";
 import { getVoiceSession } from "@/lib/voice-session";
+import { PcmChunkStreamer } from "@/lib/audio/pcm-stream";
+import {
+  BARGE_IN_ENABLED,
+  FINALIZE_DEADLINE_MS,
+  ServerVadTurnController,
+  VAD_READY_TIMEOUT_MS,
+  VOICE_TURN_MODE,
+  VoiceV2SessionManager,
+} from "@/lib/voice-turn-v2";
 
 setAudioSessionLogger(voiceClientLog);
 setMicSessionLogger(voiceClientLog);
@@ -1099,6 +1108,16 @@ export default function Home() {
   };
   const startRecordingRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
   const voiceSessionRef = useRef(getVoiceSession());
+  const voiceV2Ref = useRef(new VoiceV2SessionManager());
+  const serverVadTurnRef = useRef<{
+    turn: number;
+    controller: ServerVadTurnController;
+    streamer: PcmChunkStreamer;
+    promise: Promise<VoiceTurnResponse>;
+    voiceStarted: number;
+    deadlineTimer: number;
+    speechWatch: number;
+  } | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
   const isRecordingFlagRef = useRef(false);
   const earlyReopenUsedRef = useRef(false);
@@ -1952,6 +1971,143 @@ export default function Home() {
     return () => { window.clearInterval(interval); cameraStreamRef.current?.getTracks().forEach((track) => track.stop()); cameraStreamRef.current = null; };
   }, [cameraOpen, cameraText, captureDocument, playSpeech, speaker]);
 
+  // Shared tail for legacy (local WAV) and server_vad_v1 turns: transcript →
+  // language resolution → routing → TTS playback. Never touches recorder state.
+  const processVoiceTurnResult = useCallback(async (result: VoiceTurnResponse, ctx: { spokenMs: number; voiceStarted: number }) => {
+    const { spokenMs, voiceStarted } = ctx;
+    const loadedDocId = docIdRef.current;
+    const voiceMs = Math.round(performance.now() - voiceStarted);
+    logStageTiming("listen", voiceMs);
+    turnTimingRef.current.listen += voiceMs;
+
+    const heard = result.transcript.trim();
+    setTranscript(heard);
+    if (!heard) throw new Error("I could not understand that. Try again.");
+    if (spokenMs < 1100 && STT_NOISE_ONLY.test(heard) && noiseDiscardsRef.current < 3) {
+      noiseDiscardsRef.current += 1;
+      debugLog("[Setu mic] ignored likely hallucination", { heard, speechMs: Math.round(spokenMs) });
+      orbStateRef.current = "idle";
+      setOrbState("idle");
+      setTranscript("");
+      const turn = voiceLoopRef.current.beginTurn();
+      speakTurnIdRef.current = turn;
+      voiceLoopRef.current.transition("idle", "hallucination_discard");
+      resumeListening(turn);
+      return;
+    }
+    noiseDiscardsRef.current = 0;
+
+    const requestedLanguage = explicitLanguage(heard);
+    const activeLanguage = languageRef.current;
+    const serverLang = (result.language || "").split("-")[0] as Language | "";
+    const detectedStt = (result.language_code || "").split("-")[0] as Language | "";
+    // Sticky: once the user picked a language, keep it unless this turn is an explicit switch.
+    let resolvedLanguage: Language = activeLanguage;
+    if (result.route === "language_switch" && serverLang) {
+      resolvedLanguage = serverLang;
+    } else if (languageLockedRef.current) {
+      resolvedLanguage = activeLanguage;
+      if (detectedStt && detectedStt !== activeLanguage) {
+        console.info(`[stt] language_mismatch selected=${activeLanguage}-IN detected=${detectedStt}-IN`);
+        debugLog("[stt] language_mismatch", { selected: activeLanguage, detected: detectedStt });
+      }
+    } else {
+      resolvedLanguage =
+        serverLang ||
+        requestedLanguage ||
+        resolveLanguage(heard, result.language_code);
+    }
+    debugLog("[lang]", { heard, requested: requestedLanguage, next: resolvedLanguage, route: result.route });
+    // Persist session.language as soon as the server decided it (esp. language_switch).
+    setLanguage(resolvedLanguage);
+    languageRef.current = resolvedLanguage;
+    languageLockedRef.current = true;
+    patchActiveSession({ language: resolvedLanguage });
+
+    const audioParts = (result.audio_parts_base64?.length
+      ? result.audio_parts_base64
+      : result.audio_base64
+        ? [result.audio_base64]
+        : []
+    ).map((part) => base64ToArrayBuffer(part));
+    const audioBuffer = audioParts[0];
+
+    if (result.route === "intro") {
+      const introText = result.reply.trim() || introForLanguage(resolvedLanguage);
+      addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
+      patchActiveSession({ onboarded: true, language: resolvedLanguage });
+      setHasStarted(true);
+      await playSpeech(introText, resolvedLanguage, true, "shubh", undefined, undefined, 160, audioBuffer, audioParts, false);
+      logTurnTiming(turnTimingRef.current);
+      return;
+    }
+
+    if (result.route === "language_switch") {
+      // Persist language FIRST, then speak server intro (new) or brief ack (existing).
+      languageLockedRef.current = true;
+      setLanguage(resolvedLanguage);
+      languageRef.current = resolvedLanguage;
+      patchActiveSession({ onboarded: true, language: resolvedLanguage });
+      setHasStarted(true);
+      const spoken = result.reply.trim() || introForLanguage(resolvedLanguage);
+      addTurn({ userText: heard, setuText: spoken, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
+      await playSpeech(spoken, resolvedLanguage, true, "shubh", undefined, undefined, 220, audioBuffer, audioParts, false);
+      logTurnTiming(turnTimingRef.current);
+      return;
+    }
+
+    if (result.open_camera || result.route === "open_camera" || result.intent === "scan") {
+      const guide = result.reply.trim() || cameraText[resolvedLanguage].show;
+      addTurn({ userText: heard, setuText: guide, language: resolvedLanguage });
+      await playSpeech(guide, resolvedLanguage, false, speaker, undefined, () => openCamera(), 200, audioBuffer, audioParts);
+      logTurnTiming(turnTimingRef.current);
+      return;
+    }
+
+    if (result.route === "ask" && result.ask) {
+      const answer = result.ask;
+      setService("105B");
+      setAnswerSheet({
+        answer: answer.answer,
+        status: answer.status,
+        abstain: answer.abstain,
+        all_verified: answer.all_verified,
+        evidence: answer.evidence ?? [],
+        corrections: answer.corrections ?? [],
+        action_items: answer.action_items ?? [],
+      });
+      mergeSessionCorrections(answer.corrections ?? []);
+      addTurn({
+        userText: heard,
+        setuText: answer.answer,
+        language: resolvedLanguage,
+        docId: loadedDocId ?? undefined,
+        evidence: answer.evidence,
+        askMeta: askMetaFromResponse(answer),
+      });
+      await playSpeech(answer.answer, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
+      logTurnTiming(turnTimingRef.current);
+      return;
+    }
+
+    if (result.route === "ack") {
+      addTurn({
+        userText: heard,
+        setuText: result.reply,
+        language: resolvedLanguage,
+        docId: loadedDocId ?? undefined,
+      });
+      await playSpeech(result.reply, resolvedLanguage, true, speaker, undefined, undefined, 200, audioBuffer, audioParts);
+      logTurnTiming(turnTimingRef.current);
+      return;
+    }
+
+    const spokenReply = result.reply.trim() || cameraText[resolvedLanguage].show;
+    addTurn({ userText: heard, setuText: spokenReply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
+    await playSpeech(spokenReply, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
+    logTurnTiming(turnTimingRef.current);
+  }, [addTurn, cameraText, mergeSessionCorrections, openCamera, patchActiveSession, playSpeech, resumeListening, speaker]);
+
   const finishRecording = useCallback(async (cancelled = false, meta?: { reason?: string }) => {
     setViewMode("voice");
     const recorder = recorderRef.current;
@@ -2097,136 +2253,7 @@ export default function Home() {
           transcript: browserTranscript || null,
         });
       }
-      const voiceMs = Math.round(performance.now() - voiceStarted);
-      logStageTiming("listen", voiceMs);
-      turnTimingRef.current.listen += voiceMs;
-
-      const heard = result.transcript.trim();
-      setTranscript(heard);
-      if (!heard) throw new Error("I could not understand that. Try again.");
-      if (spokenMs < 1100 && STT_NOISE_ONLY.test(heard) && noiseDiscardsRef.current < 3) {
-        noiseDiscardsRef.current += 1;
-        debugLog("[Setu mic] ignored likely hallucination", { heard, speechMs: Math.round(spokenMs) });
-        orbStateRef.current = "idle";
-        setOrbState("idle");
-        setTranscript("");
-        const turn = voiceLoopRef.current.beginTurn();
-        speakTurnIdRef.current = turn;
-        voiceLoopRef.current.transition("idle", "hallucination_discard");
-        resumeListening(turn);
-        return;
-      }
-      noiseDiscardsRef.current = 0;
-
-      const requestedLanguage = explicitLanguage(heard);
-      const activeLanguage = languageRef.current;
-      const serverLang = (result.language || "").split("-")[0] as Language | "";
-      const detectedStt = (result.language_code || "").split("-")[0] as Language | "";
-      // Sticky: once the user picked a language, keep it unless this turn is an explicit switch.
-      let resolvedLanguage: Language = activeLanguage;
-      if (result.route === "language_switch" && serverLang) {
-        resolvedLanguage = serverLang;
-      } else if (languageLockedRef.current) {
-        resolvedLanguage = activeLanguage;
-        if (detectedStt && detectedStt !== activeLanguage) {
-          console.info(`[stt] language_mismatch selected=${activeLanguage}-IN detected=${detectedStt}-IN`);
-          debugLog("[stt] language_mismatch", { selected: activeLanguage, detected: detectedStt });
-        }
-      } else {
-        resolvedLanguage =
-          serverLang ||
-          requestedLanguage ||
-          resolveLanguage(heard, result.language_code);
-      }
-      debugLog("[lang]", { heard, requested: requestedLanguage, next: resolvedLanguage, route: result.route });
-      // Persist session.language as soon as the server decided it (esp. language_switch).
-      setLanguage(resolvedLanguage);
-      languageRef.current = resolvedLanguage;
-      languageLockedRef.current = true;
-      patchActiveSession({ language: resolvedLanguage });
-
-      const audioParts = (result.audio_parts_base64?.length
-        ? result.audio_parts_base64
-        : result.audio_base64
-          ? [result.audio_base64]
-          : []
-      ).map((part) => base64ToArrayBuffer(part));
-      const audioBuffer = audioParts[0];
-
-      if (result.route === "intro") {
-        const introText = result.reply.trim() || introForLanguage(resolvedLanguage);
-        addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
-        patchActiveSession({ onboarded: true, language: resolvedLanguage });
-        setHasStarted(true);
-        await playSpeech(introText, resolvedLanguage, true, "shubh", undefined, undefined, 160, audioBuffer, audioParts, false);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      if (result.route === "language_switch") {
-        // Persist language FIRST, then speak server intro (new) or brief ack (existing).
-        languageLockedRef.current = true;
-        setLanguage(resolvedLanguage);
-        languageRef.current = resolvedLanguage;
-        patchActiveSession({ onboarded: true, language: resolvedLanguage });
-        setHasStarted(true);
-        const spoken = result.reply.trim() || introForLanguage(resolvedLanguage);
-        addTurn({ userText: heard, setuText: spoken, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-        await playSpeech(spoken, resolvedLanguage, true, "shubh", undefined, undefined, 220, audioBuffer, audioParts, false);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      if (result.open_camera || result.route === "open_camera" || result.intent === "scan") {
-        const guide = result.reply.trim() || cameraText[resolvedLanguage].show;
-        addTurn({ userText: heard, setuText: guide, language: resolvedLanguage });
-        await playSpeech(guide, resolvedLanguage, false, speaker, undefined, () => openCamera(), 200, audioBuffer, audioParts);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      if (result.route === "ask" && result.ask) {
-        const answer = result.ask;
-        setService("105B");
-        setAnswerSheet({
-          answer: answer.answer,
-          status: answer.status,
-          abstain: answer.abstain,
-          all_verified: answer.all_verified,
-          evidence: answer.evidence ?? [],
-          corrections: answer.corrections ?? [],
-          action_items: answer.action_items ?? [],
-        });
-        mergeSessionCorrections(answer.corrections ?? []);
-        addTurn({
-          userText: heard,
-          setuText: answer.answer,
-          language: resolvedLanguage,
-          docId: loadedDocId ?? undefined,
-          evidence: answer.evidence,
-          askMeta: askMetaFromResponse(answer),
-        });
-        await playSpeech(answer.answer, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      if (result.route === "ack") {
-        addTurn({
-          userText: heard,
-          setuText: result.reply,
-          language: resolvedLanguage,
-          docId: loadedDocId ?? undefined,
-        });
-        await playSpeech(result.reply, resolvedLanguage, true, speaker, undefined, undefined, 200, audioBuffer, audioParts);
-        logTurnTiming(turnTimingRef.current);
-        return;
-      }
-
-      const spokenReply = result.reply.trim() || cameraText[resolvedLanguage].show;
-      addTurn({ userText: heard, setuText: spokenReply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-      await playSpeech(spokenReply, resolvedLanguage, result.continue_listening, speaker, undefined, undefined, 200, audioBuffer, audioParts);
-      logTurnTiming(turnTimingRef.current);
+      await processVoiceTurnResult(result, { spokenMs, voiceStarted });
     } catch (error) {
       if (error instanceof Error && error.message === "cancelled") {
         setService(null);
@@ -2238,7 +2265,176 @@ export default function Home() {
       setStatusText(`${message} — tap to continue`);
       logTurnTiming(turnTimingRef.current);
     }
-  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, patchActiveSession, playSpeech, resumeListening, speaker, pace]);
+  }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, openCamera, patchActiveSession, playSpeech, processVoiceTurnResult, resumeListening, speaker, pace]);
+
+  // ---- server_vad_v1 (feature-flagged; legacy_client flow untouched) -------
+
+  const teardownServerVadTurn = (expectedTurn: number) => {
+    const active = serverVadTurnRef.current;
+    if (!active || active.turn !== expectedTurn) return null;
+    serverVadTurnRef.current = null;
+    window.clearTimeout(active.deadlineTimer);
+    window.clearInterval(active.speechWatch);
+    voiceSessionRef.current.setVadEventHandler(null);
+    return active;
+  };
+
+  /** Emergency legacy submit: reuse the exact v1 path with the local WAV. */
+  const fallbackServerVadTurnToLegacy = useCallback((turn: number, reason: "ws_error" | "finalize_deadline" | "max_recording") => {
+    const active = teardownServerVadTurn(turn);
+    if (!active) return;
+    if (reason !== "ws_error") voiceV2Ref.current.noteFinalizeDeadline(turn);
+    voiceSessionRef.current.abandonServerVadTurn();
+    void active.promise.catch(() => undefined);
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorder.localEndpointSuppressed = false;
+      recorder.onPcm = undefined;
+    }
+    voiceClientLog("vad_fallback_submit", { turn_id: turn, reason });
+    void finishRecording(false, { reason: `legacy_${reason}` });
+  }, [finishRecording]);
+
+  const fallbackServerVadRef = useRef<typeof fallbackServerVadTurnToLegacy | null>(null);
+  fallbackServerVadRef.current = fallbackServerVadTurnToLegacy;
+
+  const finishServerVadTurn = useCallback(async (turn: number, reason: string) => {
+    const active = teardownServerVadTurn(turn);
+    if (!active) return; // stale or duplicate turn_finalized
+    voiceClientLog("server_vad_finalize", { turn_id: turn, reason });
+
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    let spokenMs = 0;
+    if (recorder) {
+      spokenMs = speechMs(recorder);
+      stopRecorderTurn(recorder, { reason: `server_vad_${reason}`, releaseStream: false });
+    }
+    active.streamer.flush();
+    isRecordingFlagRef.current = false;
+    setIsRecording(false);
+    setAutoStopProgress(0);
+
+    // "Listening" → "Hearing you" flips ONLY on server turn_finalized.
+    voiceLoopRef.current.transition("thinking", "utterance_submitted");
+    orbStateRef.current = "processing";
+    setOrbState("processing");
+    setStatusText("Hearing you");
+    setService("SAARAS");
+    turnTimingRef.current = emptyTurnTiming();
+
+    const sttSession = browserSttRef.current;
+    browserSttRef.current = null;
+    let browserTranscript = "";
+    if (sttSession) {
+      try {
+        browserTranscript = await sttSession.stop();
+      } catch {
+        debugLog("[browser-stt] stop failed");
+      }
+    }
+    if (browserTranscript) setTranscript(browserTranscript);
+
+    try {
+      const result = await active.promise;
+      await processVoiceTurnResult(result, { spokenMs, voiceStarted: active.voiceStarted });
+    } catch (error) {
+      if (error instanceof Error && error.message === "cancelled") {
+        setService(null);
+        return;
+      }
+      setService(null);
+      setOrbState("idle");
+      const message = error instanceof Error ? error.message : "Something went wrong";
+      setStatusText(`${message} — tap to continue`);
+      logTurnTiming(turnTimingRef.current);
+    }
+  }, [processVoiceTurnResult]);
+
+  const armServerVadTurn = useCallback(async (recorder: RecorderSession, turn: number) => {
+    const session = voiceSessionRef.current;
+    const manager = voiceV2Ref.current;
+    if (!(await session.connect())) return; // no socket → legacy local endpointing
+    if (!manager.serverVadActive) {
+      // voice_v2_ready is awaited ONCE per session startup; ready locks us in.
+      const ready = await session.whenVadReady(VAD_READY_TIMEOUT_MS);
+      if (!ready) {
+        if (session.serverTurnMode && session.serverTurnMode !== "server_vad_v1") {
+          manager.noteModeMismatch(session.serverTurnMode);
+        } else {
+          manager.noteStartupTimeout();
+        }
+        return;
+      }
+    }
+    // Stale: the turn already ended while awaiting readiness.
+    if (recorderRef.current !== recorder || !isRecordingFlagRef.current) return;
+
+    recorder.localEndpointSuppressed = true;
+    let sequence = 0;
+    const streamer = new PcmChunkStreamer({
+      inputSampleRate: recorder.sampleRate,
+      send: (pcmBase64) => {
+        sequence += 1;
+        session.sendAudioChunk(turn, sequence, pcmBase64);
+      },
+    });
+    recorder.onPcm = (samples) => streamer.push(samples);
+
+    const controller = new ServerVadTurnController(turn, {
+      onFinalized: (turnId, reason) => { void finishServerVadTurn(turnId, reason); },
+    });
+    session.setVadEventHandler((msg) => controller.handleEvent(msg));
+
+    const promise = session.beginServerVadTurn({
+      onStatus: (stage, text) => {
+        if (stage === "stt") setService("SAARAS");
+        else if (stage === "think") setService("105B");
+        else if (stage === "tts") setService("BULBUL");
+        if (text) setStatusText(text);
+      },
+      onTranscript: (text) => { if (text) setTranscript(text); },
+    });
+    promise.catch(() => undefined); // rejection handled by finish/fallback paths
+
+    // Emergency-only: confirmed local speech with no server turn_finalized.
+    const speechWatch = window.setInterval(() => {
+      if (!recorder.heardSpeech) return;
+      window.clearInterval(speechWatch);
+      const active = serverVadTurnRef.current;
+      if (active && active.turn === turn) {
+        active.deadlineTimer = window.setTimeout(() => {
+          if (serverVadTurnRef.current?.turn === turn) {
+            fallbackServerVadTurnToLegacy(turn, "finalize_deadline");
+          }
+        }, FINALIZE_DEADLINE_MS);
+      }
+    }, 250);
+
+    serverVadTurnRef.current = {
+      turn,
+      controller,
+      streamer,
+      promise,
+      voiceStarted: performance.now(),
+      deadlineTimer: 0,
+      speechWatch,
+    };
+    voiceClientLog("server_vad_armed", { turn_id: turn, engine: session.vadEngine });
+  }, [fallbackServerVadTurnToLegacy, finishServerVadTurn]);
+
+  useEffect(() => {
+    voiceClientLog("barge_in_gate", { enabled: BARGE_IN_ENABLED });
+    voiceSessionRef.current.setLifecycleHandler({
+      onVadReady: (engine) => voiceV2Ref.current.noteReady(engine),
+      onModeMismatch: (mode) => voiceV2Ref.current.noteModeMismatch(mode),
+      onSocketDrop: () => {
+        voiceV2Ref.current.noteWsError();
+        const active = serverVadTurnRef.current;
+        if (active) fallbackServerVadRef.current?.(active.turn, "ws_error");
+      },
+    });
+  }, []);
 
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     const loop = voiceLoopRef.current;
@@ -2289,7 +2485,18 @@ export default function Home() {
           onAutoStopProgress: setAutoStopProgress,
           onFinish: (cancelled, meta) => {
             if (recorderRef.current && recorderRef.current.turnId === openTurnId) {
-              void finishRecording(cancelled, meta);
+              const serverTurnActive = serverVadTurnRef.current?.turn === openTurnId;
+              if (serverTurnActive && !cancelled) {
+                // Local safety cap fired while server owns endpointing → legacy submit.
+                fallbackServerVadTurnToLegacy(openTurnId, meta?.reason === "max_recording" ? "max_recording" : "finalize_deadline");
+              } else {
+                if (serverTurnActive) {
+                  const active = teardownServerVadTurn(openTurnId);
+                  voiceSessionRef.current.abandonServerVadTurn();
+                  void active?.promise.catch(() => undefined);
+                }
+                void finishRecording(cancelled, meta);
+              }
             } else {
               voiceClientLog("recorder_lifecycle", { event: "stale_ignored", turn_id: openTurnId, reason: meta?.reason });
             }
@@ -2323,7 +2530,13 @@ export default function Home() {
       browserSttRef.current?.abort();
       browserSttRef.current = null;
       if (browserSttSupported() && !loop.browserSttDisabled) {
-        const stt = startBrowserStt(languageRef.current);
+        const stt = startBrowserStt(languageRef.current, (partial) => {
+          // server_vad_v1 semantic hint only — browser STT never finalizes a turn.
+          const active = serverVadTurnRef.current;
+          if (active && active.turn === openTurnId) {
+            voiceSessionRef.current.sendPartialTranscript(openTurnId, partial);
+          }
+        });
         browserSttRef.current = stt;
         if (stt?.unavailable()) loop.noteBrowserSttUnavailable();
       } else if (!browserSttSupported()) {
@@ -2336,6 +2549,10 @@ export default function Home() {
       setStatusText("Listening…");
       setAutoStopProgress(0);
       startingTurnRef.current = null;
+      // server_vad_v1: local endpointing stays live until the server takes over.
+      if (VOICE_TURN_MODE === "server_vad_v1") {
+        void armServerVadTurn(recorder, openTurnId);
+      }
     } catch (error) {
       startingTurnRef.current = null;
       console.error("[Setu mic] start failed", error);
@@ -2359,7 +2576,7 @@ export default function Home() {
       setIsRecording(false);
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
     }
-  }, [finishRecording, hasStarted]);
+  }, [armServerVadTurn, fallbackServerVadTurnToLegacy, finishRecording, hasStarted]);
 
 
   useEffect(() => {
