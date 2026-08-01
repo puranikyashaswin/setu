@@ -9,9 +9,9 @@ import {
   computeSpeechThreshold,
   resolveNoSpeechOutcome,
 } from "@/lib/audio/vad-threshold";
-import { EndpointDetector } from "@/lib/audio/endpoint";
+import { TurnEndpoint } from "@/lib/audio/endpoint";
 
-export const SILENCE_MS = 850;
+export const SILENCE_MS = 900;
 export const MIN_RECORDING_MS = 900;
 export const MAX_RECORDING_MS = 15000;
 export const NO_SPEECH_MS = 7000;
@@ -59,8 +59,9 @@ export type RecorderSession = {
   rmsMax: number;
   /** Max RMS since speech started — drives peak-relative silence endpointing. */
   peakRms: number;
-  endpoint: EndpointDetector;
+  controller: TurnEndpoint;
   lastEndpointStateLogAt: number;
+  frameSeenLogged: boolean;
   vadTelemetry: VadLevelTelemetry;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
@@ -90,7 +91,9 @@ let activeMicTurnId: number | null = null;
 export function claimMicTurn(turnId: number): boolean {
   if (activeMicTurnId === turnId) {
     console.info(`[audio] mic_open_skipped reason=turn_already_active turn_id=${turnId}`);
+    console.info(`[audio] recorder_start_skipped turn_id=${turnId} reason=turn_already_active`);
     voiceClientLog("mic_open_skipped", { reason: "turn_already_active", turn_id: turnId });
+    voiceClientLog("recorder_start_skipped", { turn_id: turnId, reason: "turn_already_active" });
     return false;
   }
   activeMicTurnId = turnId;
@@ -195,10 +198,25 @@ export async function startVoiceRecorder(
     ambientRms: VAD_THRESHOLD_FLOOR,
     rmsMax: 0,
     peakRms: 0,
-    endpoint: new EndpointDetector({ ambientBaseline: VAD_THRESHOLD_FLOOR }),
+    controller: null as unknown as TurnEndpoint,
     lastEndpointStateLogAt: 0,
+    frameSeenLogged: false,
     vadTelemetry: new VadLevelTelemetry(turnId),
   };
+  recorder.controller = new TurnEndpoint(turnId, (reason) => {
+    finishOnce(recorder, callbacks, false, reason);
+  });
+  recorder.controller.startedAtMs = startedAt;
+
+  console.info(
+    `[audio] endpoint_runtime_verified turn_id=${turnId} detector_created=true frame_hook=worklet callback_bound=true`,
+  );
+  voiceClientLog("endpoint_runtime_verified", {
+    turn_id: turnId,
+    detector_created: true,
+    frame_hook: "worklet",
+    callback_bound: true,
+  });
 
   console.info(`[audio] recorder_lifecycle event=start turn_id=${turnId}`);
   console.info(`[audio] utterance_window_start turn_id=${turnId}`);
@@ -267,16 +285,38 @@ export async function startVoiceRecorder(
 
     recorder.onFrame?.({ rms, threshold: recorder.speechThreshold });
 
-    if (recorder.thresholdLocked && recorder.ambientCount > 0 && !recorder.endpoint.confirmedSpeech) {
-      recorder.endpoint.ambientBaseline = recorder.ambientRms;
+    if (!recorder.frameSeenLogged && elapsed <= 1000) {
+      recorder.frameSeenLogged = true;
+      console.info(
+        `[audio] endpoint_frame_seen turn_id=${recorder.turnId} rms=${rms.toFixed(4)} detector_active=true`,
+      );
+      voiceClientLog("endpoint_frame_seen", {
+        turn_id: recorder.turnId,
+        rms: Number(rms.toFixed(4)),
+        detector_active: true,
+      });
     }
-    const decision = recorder.endpoint.onFrame(rms, now, recorder.speechThreshold);
+
+    // ONE authoritative endpoint owner — fed every RMS frame.
+    recorder.controller.handleAudioFrame(recorder.turnId, rms, now);
+    if (recorder.finished) return; // finishTurnOnce fired inside handleAudioFrame
 
     if (now - recorder.lastEndpointStateLogAt >= 1000) {
       recorder.lastEndpointStateLogAt = now;
+      const quietMs = Math.round(recorder.controller.quietMs(now));
+      const gapMs = Math.round(recorder.controller.sinceLastMeaningfulSpeechMs(now));
       console.info(
-        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.endpoint.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.endpoint.smoothedEnergy.toFixed(4)} speech_peak=${recorder.endpoint.speechPeak.toFixed(4)} silence_floor=${recorder.endpoint.silenceFloor.toFixed(4)} confirmed_speech=${recorder.endpoint.confirmedSpeech} silence_ms=${Math.round(recorder.endpoint.silenceMs)}`,
+        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.controller.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.controller.smoothedRms.toFixed(4)} quiet_ceiling=${recorder.controller.quietCeiling.toFixed(4)} confirmed_speech=${recorder.controller.confirmedSpeech} quiet_ms=${quietMs} since_last_meaningful_speech_ms=${gapMs}`,
       );
+      voiceClientLog("vad_endpoint_state", {
+        turn_id: recorder.turnId,
+        ambient_rms: Number(recorder.controller.ambientBaseline.toFixed(4)),
+        smoothed_rms: Number(recorder.controller.smoothedRms.toFixed(4)),
+        quiet_ceiling: recorder.controller.quietCeiling,
+        confirmed_speech: recorder.controller.confirmedSpeech,
+        quiet_ms: quietMs,
+        since_last_meaningful_speech_ms: gapMs,
+      });
     }
 
     const loud = rms >= recorder.speechThreshold;
@@ -286,7 +326,7 @@ export async function startVoiceRecorder(
     if (loud) {
       recorder.speechRunFrames += 1;
       if (recorder.speechRunFrames >= SPEECH_FRAMES_TO_CONFIRM) {
-        if (!recorder.heardSpeech) recorder.endpoint.noteSpeechConfirmed(now);
+        if (!recorder.heardSpeech) recorder.controller.noteSpeechConfirmed(now);
         recorder.heardSpeech = true;
         recorder.speechFrames += 1;
         recorder.silentSince = null;
@@ -295,26 +335,7 @@ export async function startVoiceRecorder(
     } else {
       recorder.speechRunFrames = 0;
       if (recorder.heardSpeech) {
-        callbacks.onAutoStopProgress?.(decision ? 1 : recorder.endpoint.silenceProgress);
-        if (decision) {
-          const silenceMs = Math.round(decision.silenceMs);
-          const ageMs = Math.round(elapsed);
-          console.info(
-            `[audio] endpoint_decision turn_id=${recorder.turnId} reason=${decision.reason} ambient_rms=${recorder.endpoint.ambientBaseline.toFixed(4)} speech_peak=${recorder.endpoint.speechPeak.toFixed(4)} smoothed_rms=${recorder.endpoint.smoothedEnergy.toFixed(4)} silence_floor=${decision.silenceFloor.toFixed(4)} silence_ms=${silenceMs} recording_age_ms=${ageMs}`,
-          );
-          voiceClientLog("endpoint_decision", {
-            turn_id: recorder.turnId,
-            reason: decision.reason,
-            ambient_rms: Number(recorder.endpoint.ambientBaseline.toFixed(4)),
-            speech_peak: Number(recorder.endpoint.speechPeak.toFixed(4)),
-            smoothed_rms: Number(recorder.endpoint.smoothedEnergy.toFixed(4)),
-            silence_floor: decision.silenceFloor,
-            silence_ms: silenceMs,
-            recording_age_ms: ageMs,
-          });
-          finishOnce(recorder, callbacks, false, decision.reason);
-          return;
-        }
+        callbacks.onAutoStopProgress?.(recorder.controller.quietProgress(now));
       } else if (elapsed >= NO_SPEECH_MS) {
         const outcome = resolveNoSpeechOutcome({
           heardSpeech: recorder.heardSpeech,
@@ -345,7 +366,7 @@ export async function startVoiceRecorder(
     }
 
     if (elapsed >= MAX_RECORDING_MS) {
-      finishOnce(recorder, callbacks, false, "max_recording");
+      recorder.controller.finishTurnOnce(recorder.turnId, "max_recording", now);
     }
   };
 
@@ -370,9 +391,9 @@ export async function startVoiceRecorder(
     }
   }, 250);
 
-  // Hard max also armed at stream ready (not at request).
+  // Hard max also armed at stream ready (not at request). Safety fallback only.
   recorder.maxTimer = window.setTimeout(() => {
-    if (!recorder.finished) finishOnce(recorder, callbacks, false, "max_recording");
+    recorder.controller.finishTurnOnce(recorder.turnId, "max_recording", performance.now());
   }, MAX_RECORDING_MS + 500);
 
   return recorder;
@@ -400,6 +421,7 @@ export function stopRecorderTurn(
   }
   recorder.detached = true;
   recorder.finished = true;
+  recorder.controller.invalidate();
   releaseMicTurn(recorder.turnId);
   console.info(`[audio] recorder_lifecycle event=detach turn_id=${recorder.turnId}`);
   voiceClientLog("recorder_lifecycle", { event: "detach", turn_id: recorder.turnId });

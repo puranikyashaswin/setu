@@ -1,158 +1,204 @@
 /**
- * Adaptive utterance endpoint detection — separate from speech-start.
+ * Authoritative per-turn endpoint owner.
  *
- * Speech-start stays on the raw 24-frame threshold crossing (recorder.ts).
- * Speech-end uses an ambient-aware, peak-aware silence floor applied to a
- * smoothed energy EMA, so ordinary room hum (~0.02–0.03 RMS) never keeps a
- * turn alive until the 15s max_recording cap.
+ * ONE instance per turn. The recorder's worklet RMS callback feeds
+ * handleAudioFrame(turnId, rms, nowMs); the max-recording timer and all
+ * silence/gap detection finish ONLY through finishTurnOnce(turnId, reason).
+ *
+ * Endpoint rule (after the existing 24-frame speech-start confirmation):
+ *   ambientBaseline — mean RMS of the first 500ms before confirmed speech, then FROZEN.
+ *   quietCeiling    = max(ambientBaseline * 1.6, 0.045)
+ *   meaningful      = smoothedRms > max(ambientBaseline * 2.2, 0.07)
+ *                     (stricter than quietCeiling so steady noise above the
+ *                      quiet ceiling cannot masquerade as speech forever —
+ *                      that is what last_speech_gap rescues)
+ *   post_speech_quiet — smoothedRms < quietCeiling continuously for 900ms
+ *   last_speech_gap   — 2500ms since lastMeaningfulSpeechAt
+ *   Never endpoint before 1200ms after confirmed speech begins.
+ *   max_recording (15s) stays emergency-only.
+ *
+ * All events go to BOTH console.info and voiceClientLog (the on-device ring
+ * the phone exports) — console-only logs are invisible in production captures.
  */
 
-export const ENDPOINT_SILENCE_MS = 850;
-export const ENDPOINT_RELATIVE_DROP_MS = 1000;
-export const ENDPOINT_MIN_AFTER_SPEECH_MS = 900;
-export const ENDPOINT_POST_SPEECH_FALLBACK_MS = 4500;
-export const SILENCE_FLOOR_MIN = 0.006;
-export const SILENCE_FLOOR_MAX = 0.06;
-/** Time constant for the smoothed speech-energy EMA. */
-export const SPEECH_ENERGY_WINDOW_MS = 100;
-/** EMA step for ambient baseline while frames are quiet. */
-export const AMBIENT_EMA_ALPHA = 0.05;
+import { voiceClientLog } from "@/lib/debug";
 
-export type EndpointReason = "primary" | "relative_drop" | "post_speech_fallback";
+export const QUIET_AFTER_SPEECH_MS = 900;
+export const LAST_SPEECH_GAP_MS = 2500;
+export const MIN_AFTER_CONFIRM_MS = 1200;
+export const AMBIENT_WINDOW_MS = 500;
+export const SMOOTH_WINDOW_MS = 100;
+export const QUIET_AMBIENT_MULT = 1.6;
+export const QUIET_RMS_FLOOR = 0.045;
+export const MEANINGFUL_AMBIENT_MULT = 2.2;
+export const MEANINGFUL_RMS_FLOOR = 0.07;
 
-export type EndpointDecision = {
-  reason: EndpointReason;
-  silenceMs: number;
-  silenceFloor: number;
-};
+export type EndpointReason = "post_speech_quiet" | "last_speech_gap" | "max_recording";
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+type ActiveTurn = { turnId: number; generation: number };
+let activeTurn: ActiveTurn | null = null;
+let generationCounter = 0;
+
+/** Test helper — clears the generation token between tests. */
+export function __resetEndpointTurnForTests(): void {
+  activeTurn = null;
 }
 
-/** Silence floor derived from BOTH the pre-speech ambient baseline and the speech peak. */
-export function computeEndpointSilenceFloor(ambientBaseline: number, speechPeak: number): number {
-  const raw = Math.max(
-    ambientBaseline * 1.25,
-    Math.min(speechPeak * 0.2, ambientBaseline * 2.5),
-  );
-  return Number(clamp(raw, SILENCE_FLOOR_MIN, SILENCE_FLOOR_MAX).toFixed(4));
-}
+export class TurnEndpoint {
+  readonly turnId: number;
+  private readonly generation: number;
+  private readonly onFinish: (reason: EndpointReason) => void;
 
-/** Relative-drop ceiling: energy below this counts as "dropped toward ambient". */
-export function computeRelativeDropCeiling(ambientBaseline: number, speechPeak: number): number {
-  return Math.max(ambientBaseline * 1.35, speechPeak * 0.35);
-}
-
-export class EndpointDetector {
-  ambientBaseline: number;
-  speechPeak = 0;
-  smoothedEnergy = 0;
+  startedAtMs = 0;
+  ambientBaseline = 0;
+  smoothedRms = 0;
   confirmedSpeech = false;
-  private confirmedAtMs = 0;
-  private lastMeaningfulSpeechMs = 0;
-  private silentSinceMs: number | null = null;
-  private dropSinceMs: number | null = null;
-  private lastFrameMs: number | null = null;
-  private smoothingInitialized = false;
+  finished = false;
 
-  constructor(options: { ambientBaseline: number }) {
-    this.ambientBaseline = options.ambientBaseline;
+  private ambientSum = 0;
+  private ambientCount = 0;
+  private ambientFrozen = false;
+  private firstFrameAtMs: number | null = null;
+  private lastFrameAtMs: number | null = null;
+  private smoothingInitialized = false;
+  private confirmedAtMs = 0;
+  private quietSinceMs: number | null = null;
+  private lastMeaningfulSpeechAtMs = 0;
+
+  constructor(turnId: number, onFinish: (reason: EndpointReason) => void) {
+    this.turnId = turnId;
+    this.onFinish = onFinish;
+    generationCounter += 1;
+    activeTurn = { turnId, generation: generationCounter };
+    this.generation = generationCounter;
   }
 
-  /** Recorder calls this when its existing 24-frame speech-start confirms. */
+  private isCurrent(): boolean {
+    return activeTurn?.generation === this.generation;
+  }
+
+  /** Called on recorder detach — frames/completions after this are stale. */
+  invalidate(): void {
+    if (this.isCurrent()) activeTurn = null;
+  }
+
+  get quietCeiling(): number {
+    return Math.max(this.ambientBaseline * QUIET_AMBIENT_MULT, QUIET_RMS_FLOOR);
+  }
+
+  private get meaningfulFloor(): number {
+    return Math.max(this.ambientBaseline * MEANINGFUL_AMBIENT_MULT, MEANINGFUL_RMS_FLOOR);
+  }
+
+  quietMs(nowMs: number): number {
+    return this.quietSinceMs == null ? 0 : Math.max(0, nowMs - this.quietSinceMs);
+  }
+
+  sinceLastMeaningfulSpeechMs(nowMs: number): number {
+    if (!this.confirmedSpeech) return 0;
+    return Math.max(0, nowMs - this.lastMeaningfulSpeechAtMs);
+  }
+
+  /** 0..1 quiet progress toward post_speech_quiet (UI auto-stop ring). */
+  quietProgress(nowMs: number): number {
+    return Math.min(1, this.quietMs(nowMs) / QUIET_AFTER_SPEECH_MS);
+  }
+
+  /** Recorder calls this when the existing 24-frame start confirmation succeeds. */
   noteSpeechConfirmed(nowMs: number): void {
     if (this.confirmedSpeech) return;
     this.confirmedSpeech = true;
     this.confirmedAtMs = nowMs;
-    this.lastMeaningfulSpeechMs = nowMs;
-    this.silentSinceMs = null;
-    this.dropSinceMs = null;
-  }
-
-  get silenceFloor(): number {
-    return computeEndpointSilenceFloor(this.ambientBaseline, Math.max(this.speechPeak, this.ambientBaseline));
-  }
-
-  /** Silence progress 0..1 for UI; 0 when no silence streak. */
-  get silenceProgress(): number {
-    if (this.silentSinceMs == null || this.lastFrameMs == null) return 0;
-    return Math.min(1, (this.lastFrameMs - this.silentSinceMs) / ENDPOINT_SILENCE_MS);
-  }
-
-  get silenceMs(): number {
-    if (this.silentSinceMs == null || this.lastFrameMs == null) return 0;
-    return Math.max(0, this.lastFrameMs - this.silentSinceMs);
+    this.lastMeaningfulSpeechAtMs = nowMs;
+    this.quietSinceMs = null;
+    this.ambientFrozen = true;
+    if (this.ambientCount > 0) this.ambientBaseline = this.ambientSum / this.ambientCount;
   }
 
   /**
-   * Feed one worklet frame. Returns an EndpointDecision exactly once per turn
-   * (caller stops feeding after a decision).
+   * ONE authoritative frame handler, fed by the recorder's worklet callback.
+   * Stale frames (old turn / invalidated generation / finished) are rejected.
    */
-  onFrame(rms: number, nowMs: number, speechThreshold: number): EndpointDecision | null {
-    const dtMs = this.lastFrameMs == null ? 0 : Math.min(50, Math.max(0, nowMs - this.lastFrameMs));
-    this.lastFrameMs = nowMs;
+  handleAudioFrame(turnId: number, rms: number, nowMs: number): void {
+    if (turnId !== this.turnId || !this.isCurrent() || this.finished) return;
+
+    if (this.firstFrameAtMs == null) this.firstFrameAtMs = nowMs;
+    const dtMs = this.lastFrameAtMs == null ? 0 : Math.min(50, Math.max(0, nowMs - this.lastFrameAtMs));
+    this.lastFrameAtMs = nowMs;
     if (!this.smoothingInitialized) {
       this.smoothingInitialized = true;
-      this.smoothedEnergy = rms;
+      this.smoothedRms = rms;
     } else {
-      const alpha = 1 - Math.exp(-dtMs / SPEECH_ENERGY_WINDOW_MS);
-      this.smoothedEnergy += alpha * (rms - this.smoothedEnergy);
+      const alpha = 1 - Math.exp(-dtMs / SMOOTH_WINDOW_MS);
+      this.smoothedRms += alpha * (rms - this.smoothedRms);
     }
 
     if (!this.confirmedSpeech) {
-      // Pre-speech: track ambient only from quiet frames.
-      if (rms < speechThreshold) {
-        this.ambientBaseline += AMBIENT_EMA_ALPHA * (rms - this.ambientBaseline);
+      // Ambient baseline: first 500ms before confirmed speech, then frozen.
+      // Outlier rejection keeps the ~64ms speech run-up (and bumps) out of the mean.
+      if (!this.ambientFrozen && nowMs - this.firstFrameAtMs <= AMBIENT_WINDOW_MS) {
+        const cap = this.ambientCount === 0 ? Infinity : Math.max(this.ambientBaseline * 2, 0.02);
+        if (rms <= cap) {
+          this.ambientSum += rms;
+          this.ambientCount += 1;
+          this.ambientBaseline = this.ambientSum / this.ambientCount;
+        }
+      } else {
+        this.ambientFrozen = true;
       }
-      return null;
+      return;
     }
 
-    if (rms > this.speechPeak) this.speechPeak = rms;
-    if (rms >= speechThreshold) this.lastMeaningfulSpeechMs = nowMs;
-
-    const floor = this.silenceFloor;
-    // Ambient adapts only during frames that are confirmed silence.
-    if (this.smoothedEnergy < floor) {
-      this.ambientBaseline += AMBIENT_EMA_ALPHA * (Math.min(rms, floor) - this.ambientBaseline);
+    if (this.smoothedRms > this.meaningfulFloor) {
+      this.lastMeaningfulSpeechAtMs = nowMs;
     }
-
-    // Never endpoint during the first 900ms after confirmed speech begins.
-    if (nowMs - this.confirmedAtMs < ENDPOINT_MIN_AFTER_SPEECH_MS) {
-      this.silentSinceMs = null;
-      this.dropSinceMs = null;
-      return null;
-    }
-
-    if (this.smoothedEnergy < floor) {
-      if (this.silentSinceMs == null) this.silentSinceMs = nowMs;
-      const silenceMs = nowMs - this.silentSinceMs;
-      if (silenceMs >= ENDPOINT_SILENCE_MS) {
-        return { reason: "primary", silenceMs, silenceFloor: floor };
-      }
+    if (this.smoothedRms < this.quietCeiling) {
+      if (this.quietSinceMs == null) this.quietSinceMs = nowMs;
     } else {
-      this.silentSinceMs = null;
+      this.quietSinceMs = null;
     }
 
-    const dropCeiling = computeRelativeDropCeiling(this.ambientBaseline, this.speechPeak);
-    if (this.smoothedEnergy <= dropCeiling) {
-      if (this.dropSinceMs == null) this.dropSinceMs = nowMs;
-      const silenceMs = nowMs - this.dropSinceMs;
-      if (silenceMs >= ENDPOINT_RELATIVE_DROP_MS) {
-        return { reason: "relative_drop", silenceMs, silenceFloor: floor };
-      }
-    } else {
-      this.dropSinceMs = null;
-    }
+    if (nowMs - this.confirmedAtMs < MIN_AFTER_CONFIRM_MS) return;
 
-    if (nowMs - this.lastMeaningfulSpeechMs > ENDPOINT_POST_SPEECH_FALLBACK_MS) {
-      return {
-        reason: "post_speech_fallback",
-        silenceMs: nowMs - this.lastMeaningfulSpeechMs,
-        silenceFloor: floor,
-      };
+    if (this.quietSinceMs != null && nowMs - this.quietSinceMs >= QUIET_AFTER_SPEECH_MS) {
+      this.finishTurnOnce(turnId, "post_speech_quiet", nowMs);
+      return;
     }
+    if (nowMs - this.lastMeaningfulSpeechAtMs >= LAST_SPEECH_GAP_MS) {
+      this.finishTurnOnce(turnId, "last_speech_gap", nowMs);
+    }
+  }
 
-    return null;
+  /**
+   * THE only way a turn ends. Idempotent; stale/duplicate attempts are
+   * blocked and logged as finish_turn_ignored.
+   */
+  finishTurnOnce(turnId: number, reason: EndpointReason, nowMs?: number): boolean {
+    if (this.finished) {
+      console.info(`[audio] finish_turn_ignored turn_id=${turnId} reason=${reason} cause=already_finished`);
+      voiceClientLog("finish_turn_ignored", { turn_id: turnId, reason, cause: "already_finished" });
+      return false;
+    }
+    if (turnId !== this.turnId || !this.isCurrent()) {
+      console.info(`[audio] finish_turn_ignored turn_id=${turnId} reason=${reason} cause=stale_turn`);
+      voiceClientLog("finish_turn_ignored", { turn_id: turnId, reason, cause: "stale_turn" });
+      return false;
+    }
+    this.finished = true;
+    const now = nowMs ?? this.lastFrameAtMs ?? 0;
+    const ageMs = Math.round(now - this.startedAtMs);
+    console.info(
+      `[audio] endpoint_decision turn_id=${turnId} reason=${reason} ambient_rms=${this.ambientBaseline.toFixed(4)} smoothed_rms=${this.smoothedRms.toFixed(4)} quiet_ceiling=${this.quietCeiling.toFixed(4)} recording_age_ms=${ageMs}`,
+    );
+    voiceClientLog("endpoint_decision", {
+      turn_id: turnId,
+      reason,
+      ambient_rms: Number(this.ambientBaseline.toFixed(4)),
+      smoothed_rms: Number(this.smoothedRms.toFixed(4)),
+      quiet_ceiling: this.quietCeiling,
+      recording_age_ms: ageMs,
+    });
+    this.onFinish(reason);
+    return true;
   }
 }
