@@ -2,12 +2,18 @@ import { debugLog, voiceClientLog } from "@/lib/debug";
 import { ensureMicSession, releaseMicSession } from "@/lib/audio/mic-session";
 import { encodeWav } from "@/lib/audio/wav";
 import { ensureVadWorklet, getVadProcessorName } from "@/lib/audio/worklet-vad";
+import { VadLevelTelemetry } from "@/lib/audio/vad-levels";
+import {
+  VAD_THRESHOLD_FLOOR,
+  computeSpeechThreshold,
+  resolveNoSpeechOutcome,
+} from "@/lib/audio/vad-threshold";
 
 export const SILENCE_MS = 1100;
 export const MIN_RECORDING_MS = 900;
 export const MAX_RECORDING_MS = 15000;
 export const NO_SPEECH_MS = 7000;
-export const SPEECH_LEVEL = 0.014;
+export const SPEECH_LEVEL = VAD_THRESHOLD_FLOOR;
 export const AMBIENT_MS = 350;
 /** ~80ms of loud frames at 128-sample worklet quantum (~48kHz). */
 export const SPEECH_FRAMES_TO_CONFIRM = 24;
@@ -46,6 +52,9 @@ export type RecorderSession = {
   acquireMs: number;
   reusedStream: boolean;
   finished: boolean;
+  ambientRms: number;
+  rmsMax: number;
+  vadTelemetry: VadLevelTelemetry;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
 
@@ -144,6 +153,9 @@ export async function startVoiceRecorder(
     acquireMs,
     reusedStream: reused,
     finished: false,
+    ambientRms: VAD_THRESHOLD_FLOOR,
+    rmsMax: 0,
+    vadTelemetry: new VadLevelTelemetry(turnId),
   };
 
   console.info(`[audio] utterance_window_start turn_id=${turnId}`);
@@ -190,15 +202,22 @@ export async function startVoiceRecorder(
     }
 
     const rms = data.rms ?? 0;
+    recorder.rmsMax = Math.max(recorder.rmsMax, rms);
+    recorder.vadTelemetry.onFrame(rms, recorder.speechThreshold, now);
+
     if (!recorder.thresholdLocked && elapsed < AMBIENT_MS) {
       recorder.ambientSum += rms;
       recorder.ambientCount += 1;
       if (recorder.ambientCount > 0) {
         const ambient = recorder.ambientSum / recorder.ambientCount;
-        recorder.speechThreshold = Math.min(0.05, Math.max(SPEECH_LEVEL, ambient * 2.4 + 0.008));
+        recorder.ambientRms = ambient;
+        recorder.speechThreshold = computeSpeechThreshold(ambient);
       }
     } else if (!recorder.thresholdLocked) {
       recorder.thresholdLocked = true;
+      if (recorder.ambientCount > 0) {
+        recorder.ambientRms = recorder.ambientSum / recorder.ambientCount;
+      }
       debugLog("[Setu mic] ambient lock", { threshold: recorder.speechThreshold.toFixed(4) });
     }
 
@@ -224,6 +243,29 @@ export async function startVoiceRecorder(
           return;
         }
       } else if (elapsed >= NO_SPEECH_MS) {
+        const outcome = resolveNoSpeechOutcome({
+          heardSpeech: recorder.heardSpeech,
+          elapsedMs: elapsed,
+          noSpeechMs: NO_SPEECH_MS,
+          ambientRms: recorder.ambientRms,
+          rmsMax: recorder.rmsMax,
+          threshold: recorder.speechThreshold,
+        });
+        if (outcome === "delta_weak") {
+          console.info(
+            `[audio] vad_trigger=delta_weak turn_id=${recorder.turnId} rms_max=${recorder.rmsMax.toFixed(4)} ambient=${recorder.ambientRms.toFixed(4)} threshold=${recorder.speechThreshold.toFixed(4)}`,
+          );
+          voiceClientLog("vad_trigger", {
+            turn_id: recorder.turnId,
+            kind: "delta_weak",
+            rms_max: Number(recorder.rmsMax.toFixed(4)),
+            ambient_rms: Number(recorder.ambientRms.toFixed(4)),
+            threshold: Number(recorder.speechThreshold.toFixed(4)),
+          });
+          recorder.heardSpeech = true;
+          finishOnce(recorder, callbacks, false, "delta_weak");
+          return;
+        }
         finishOnce(recorder, callbacks, true, "no_speech");
         return;
       }
@@ -275,6 +317,7 @@ export function stopRecorderTurn(
     return { trackCount: 0, early: false, ageMs: 0, turnId: 0, reason: options?.reason || "none" };
   }
   recorder.finished = true;
+  recorder.vadTelemetry.flush(recorder.speechThreshold);
   window.clearInterval(recorder.watchdog);
   recorder.watchdog = 0;
   window.clearTimeout(recorder.maxTimer);

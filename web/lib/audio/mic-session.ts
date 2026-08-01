@@ -21,7 +21,7 @@ export const PREFERRED_MIC_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     echoCancellation: false,
     noiseSuppression: false,
-    autoGainControl: false,
+    autoGainControl: true,
     channelCount: 1,
   },
 };
@@ -42,7 +42,7 @@ let sharedContext: AudioContext | null = null;
 let sessionArmed = false;
 let getUserMediaCalls = 0;
 let routeModeLogged = false;
-let constraintsPath: "processing_off" | "audio_true_fallback" = "processing_off";
+let constraintsPath: "agc_only" | "audio_true_fallback" = "agc_only";
 
 /** True only while a real getUserMedia promise is pending. */
 let openingInFlight = false;
@@ -208,12 +208,12 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 
 async function acquireGetUserMedia(): Promise<{
   stream: MediaStream;
-  path: "processing_off" | "audio_true_fallback";
+  path: "agc_only" | "audio_true_fallback";
 }> {
   try {
     getUserMediaCalls += 1;
     const stream = await navigator.mediaDevices.getUserMedia(PREFERRED_MIC_CONSTRAINTS);
-    return { stream, path: "processing_off" };
+    return { stream, path: "agc_only" };
   } catch {
     getUserMediaCalls += 1;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -397,7 +397,7 @@ export function __resetMicSessionForTests(): void {
   sessionArmed = false;
   getUserMediaCalls = 0;
   routeModeLogged = false;
-  constraintsPath = "processing_off";
+  constraintsPath = "agc_only";
   setSession = () => false;
   openingInFlight = false;
   openingStartedAt = 0;

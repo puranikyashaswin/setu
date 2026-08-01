@@ -1110,6 +1110,8 @@ export default function Home() {
   const languageLockedRef = useRef(false);
   /** Consecutive turns thrown away as noise — stops a hot re-listen loop in a loud room. */
   const noiseDiscardsRef = useRef(0);
+  const noSpeechTimeoutsRef = useRef(0);
+  const vadHintShownRef = useRef(false);
   const docIdRef = useRef<string | null>(null);
   const sessionsRef = useRef<Session[]>([]);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -1305,6 +1307,8 @@ export default function Home() {
     setMicLevel(0);
     earlyReopenUsedRef.current = false;
     deadMicRecoveryUsedRef.current = false;
+    noSpeechTimeoutsRef.current = 0;
+    vadHintShownRef.current = false;
     utteranceWindowStartedRef.current = false;
     listeningWatchdogRef.current?.clear();
     listeningWatchdogRef.current = null;
@@ -1343,6 +1347,8 @@ export default function Home() {
     setMicLevel(0);
     earlyReopenUsedRef.current = false;
     deadMicRecoveryUsedRef.current = false;
+    noSpeechTimeoutsRef.current = 0;
+    vadHintShownRef.current = false;
     utteranceWindowStartedRef.current = false;
     listeningWatchdogRef.current?.clear();
     listeningWatchdogRef.current = null;
@@ -1995,6 +2001,15 @@ export default function Home() {
         return;
       }
       noiseDiscardsRef.current = 0;
+      if (meta?.reason === "no_speech") {
+        noSpeechTimeoutsRef.current += 1;
+        if (noSpeechTimeoutsRef.current >= 2 && !vadHintShownRef.current) {
+          vadHintShownRef.current = true;
+          voiceClientLog("vad_hint_shown", { count: noSpeechTimeoutsRef.current });
+          setStatusText("Speak closer to the phone");
+          return;
+        }
+      }
       setStatusText("Tap to continue");
       return;
     }
