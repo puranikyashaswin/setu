@@ -11,9 +11,9 @@ import {
   stopAllPlayback,
   TTS_ROUTE,
   ttsUsesWebAudioGraph,
-} from "./playback.ts";
-import { __resetAudioOwnerForTests, isAssistantSpeaking } from "./audio-owner.ts";
-import { createVoiceLoop } from "../voice-loop.ts";
+} from "./playback";
+import { __resetAudioOwnerForTests, isAssistantSpeaking } from "./audio-owner";
+import { createVoiceLoop } from "../voice-loop";
 
 const webRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 

@@ -3,7 +3,7 @@
  * Never touches AudioContext / BufferSource / GainNode for TTS bytes.
  */
 
-import { createPlaybackQueue, type PlaybackQueue } from "./playback-queue.ts";
+import { createPlaybackQueue, type PlaybackQueue } from "./playback-queue";
 import {
   beginAssistantTts,
   endAssistantTts,
@@ -13,7 +13,7 @@ import {
   setAudioOwnerLogger,
   stopNonTtsAudio,
   type PlaybackOutcome,
-} from "./audio-owner.ts";
+} from "./audio-owner";
 
 type PlaybackLog = (event: string, data?: Record<string, unknown>) => void;
 let playbackLog: PlaybackLog = () => undefined;
@@ -51,7 +51,7 @@ type ActiveElement = {
   audio: HTMLAudioElement;
   url: string;
   raf: number;
-  healthTimer: number;
+  healthTimer: ReturnType<typeof setInterval> | 0;
   stopped: boolean;
 };
 
@@ -432,5 +432,5 @@ export function __resetPlaybackForTests(): void {
   endAssistantTts();
 }
 
-export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, isAssistantSpeaking } from "./audio-owner.ts";
-export type { PlaybackOutcome } from "./audio-owner.ts";
+export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, isAssistantSpeaking } from "./audio-owner";
+export type { PlaybackOutcome } from "./audio-owner";

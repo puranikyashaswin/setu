@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createVoiceLoop } from "./voice-loop.ts";
-import { playPartsSerially, createPlaybackQueue } from "./audio/playback-queue.ts";
+import { createVoiceLoop } from "./voice-loop";
+import { playPartsSerially, createPlaybackQueue } from "./audio/playback-queue";
 
 describe("voice-loop single-flight", () => {
   it("three rapid resumeListening create one mic claim only", () => {

@@ -6,8 +6,8 @@ import {
   getGetUserMediaCallCount,
   releaseMicSession,
   setMicSessionAudioSession,
-} from "./mic-session.ts";
-import { micOpenBlockReason, prepareAssistantPlayback } from "./audio-session.ts";
+} from "./mic-session";
+import { micOpenBlockReason, prepareAssistantPlayback } from "./audio-session";
 
 type FakeSession = { type?: string };
 

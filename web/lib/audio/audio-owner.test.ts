@@ -10,8 +10,8 @@ import {
   getTtsVolume,
   isAssistantSpeaking,
   stopNonTtsAudio,
-} from "./audio-owner.ts";
-import { createVoiceLoop } from "../voice-loop.ts";
+} from "./audio-owner";
+import { createVoiceLoop } from "../voice-loop";
 
 const webRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 

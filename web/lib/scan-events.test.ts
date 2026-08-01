@@ -5,7 +5,7 @@ import {
   initialScanUiState,
   parseScanNdjsonLine,
   reduceScanNdjson,
-} from "./scan-events.ts";
+} from "./scan-events";
 
 describe("scan-events parser", () => {
   it("handles done and clears analyzing", () => {

@@ -5,7 +5,7 @@ import {
   micOpenBlockReason,
   prepareAssistantPlayback,
   setAudioSession,
-} from "./audio-session.ts";
+} from "./audio-session";
 
 type FakeSession = { type?: string };
 
