@@ -1035,7 +1035,7 @@ export default function Home() {
   const [authEmail, setAuthEmail] = useState("");
   const [authStatus, setAuthStatus] = useState("");
   const [voices, setVoices] = useState<string[]>([]);
-  const [speaker, setSpeaker] = useState("setu");
+  const [speaker, setSpeaker] = useState("shubh");
   const [pace, setPace] = useState(1);
   const userIdRef = useRef<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -1435,7 +1435,7 @@ export default function Home() {
       setStatusText("Tap to continue");
       return;
     }
-    setService("VOICE");
+    setService("BULBUL");
     orbStateRef.current = "processing";
     setOrbState("processing");
     setStatusText("Preparing a response");
@@ -1648,7 +1648,7 @@ export default function Home() {
             detail?: string;
           };
           if (event.type === "progress") {
-            if (event.provider === "openrouter") setService("VISION");
+            if (event.provider === "sarvam" || event.provider === "pdf-text") setService("VISION");
             if (event.message) {
               progressLabel = event.message;
               const elapsed = Math.floor((performance.now() - started) / 1000);
@@ -1689,7 +1689,7 @@ export default function Home() {
       const readyAudioPromise = postSpeak({
         text: readyText,
         language: activeLanguage,
-        speaker: "setu",
+        speaker: "shubh",
         pace,
       }).catch(() => null);
 
@@ -1718,7 +1718,7 @@ export default function Home() {
       });
       setStatusText("Ready — ask me anything");
       const readyBuf = summary ? undefined : (await readyAudioPromise) || undefined;
-      await playSpeech(spoken, activeLanguage, true, "setu", undefined, undefined, 220, readyBuf || undefined, undefined, false);
+      await playSpeech(spoken, activeLanguage, true, "shubh", undefined, undefined, 220, readyBuf || undefined, undefined, false);
       logTurnTiming(turnTimingRef.current);
     } catch (error) {
       setService(null);
@@ -1831,7 +1831,7 @@ export default function Home() {
     const browserTranscript = sttSession ? await sttSession.stop() : "";
     if (browserTranscript) debugLog("[browser-stt]", { chars: browserTranscript.length, text: browserTranscript.slice(0, 80) });
     playCue([660, 440], 0.12, 0.07);
-    setOrbState("processing"); setStatusText("Hearing you"); setService("LISTEN");
+    setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     turnTimingRef.current = emptyTurnTiming();
     try {
       const wav = recorderToWav(recorder);
@@ -1859,9 +1859,9 @@ export default function Home() {
           wav,
           {
             onStatus: (stage, text) => {
-              if (stage === "stt") setService("LISTEN");
-              else if (stage === "think") setService("CHAT");
-              else if (stage === "tts") setService("VOICE");
+              if (stage === "stt") setService("SAARAS");
+              else if (stage === "think") setService("105B");
+              else if (stage === "tts") setService("BULBUL");
               if (text) setStatusText(text);
             },
             onTranscript: (text) => {
@@ -1883,7 +1883,7 @@ export default function Home() {
           history,
           memory,
           onboarded: Boolean(activeSession?.onboarded),
-          speaker: "setu",
+          speaker: "shubh",
           pace,
           transcript: browserTranscript || null,
         });
@@ -1931,7 +1931,7 @@ export default function Home() {
         addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
         patchActiveSession({ onboarded: true, language: resolvedLanguage });
         setHasStarted(true);
-        await playSpeech(introText, resolvedLanguage, true, "setu", undefined, undefined, 160, audioBuffer, audioParts, false);
+        await playSpeech(introText, resolvedLanguage, true, "shubh", undefined, undefined, 160, audioBuffer, audioParts, false);
         logTurnTiming(turnTimingRef.current);
         return;
       }
@@ -1943,12 +1943,12 @@ export default function Home() {
           addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
           patchActiveSession({ onboarded: true, language: resolvedLanguage });
           setHasStarted(true);
-          await playSpeech(introText, resolvedLanguage, true, "setu", undefined, undefined, 160, undefined, undefined, false);
+          await playSpeech(introText, resolvedLanguage, true, "shubh", undefined, undefined, 160, undefined, undefined, false);
           logTurnTiming(turnTimingRef.current);
           return;
         }
         addTurn({ userText: heard, setuText: result.reply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-        await playSpeech(result.reply, resolvedLanguage, true, "setu", undefined, undefined, 200, audioBuffer, audioParts);
+        await playSpeech(result.reply, resolvedLanguage, true, "shubh", undefined, undefined, 200, audioBuffer, audioParts);
         logTurnTiming(turnTimingRef.current);
         return;
       }
@@ -1962,7 +1962,7 @@ export default function Home() {
 
       if (result.route === "ask" && result.ask) {
         const answer = result.ask;
-        setService("CHAT");
+        setService("105B");
         setAnswerSheet({
           answer: answer.answer,
           status: answer.status,
@@ -2093,7 +2093,7 @@ export default function Home() {
       setStatusText("Welcome to Setu");
       try {
         await getAudioContext().resume();
-        await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true, "setu", undefined, undefined, 200, undefined, undefined, false);
+        await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true, "shubh", undefined, undefined, 200, undefined, undefined, false);
       } catch {
         setOrbState("idle");
         setStatusText("Tap to start");
@@ -2171,7 +2171,7 @@ export default function Home() {
       setHasStarted(false);
       setTranscript("");
       setAnswerSheet(null);
-      setSpeaker("setu");
+      setSpeaker("shubh");
       setStatusText("Tap to start");
       setSessionsLoaded(true);
     };
@@ -2399,7 +2399,7 @@ export default function Home() {
                 {isExportingActionSheet ? "…" : actionSheetLabels.download}
               </button>
             )}
-            <footer className="flex shrink-0 items-center justify-center gap-2 pb-1 text-[9px] font-semibold tracking-[0.16em]">{(["VISION", "CHAT", "VOICE", "LISTEN"] as StackService[]).map((service, index) => <span key={service} className={activeService === service ? "text-[#ff6b00]" : "text-slate-500"}>{index > 0 && <span className="mr-2 text-slate-400">·</span>}{service}</span>)}</footer>
+            <footer className="flex shrink-0 items-center justify-center gap-2 pb-1 text-[9px] font-semibold tracking-[0.16em]">{(["VISION", "105B", "BULBUL", "SAARAS"] as StackService[]).map((service, index) => <span key={service} className={activeService === service ? "text-[#ff6b00]" : "text-slate-500"}>{index > 0 && <span className="mr-2 text-slate-400">·</span>}{service}</span>)}</footer>
           </>
         )}
       </div>
@@ -2611,7 +2611,7 @@ export default function Home() {
             </div>
             <div className="mt-8 min-h-0 flex-1">
               <p className="text-xs font-semibold tracking-[0.14em] text-slate-400">VOICE</p>
-              <p className="mt-3 text-sm text-slate-600">OpenRouter Indic TTS — one consistent Setu voice.</p>
+              <p className="mt-3 text-sm text-slate-600">Locked to <span className="font-medium text-slate-800">shubh</span> for a consistent demo voice.</p>
             </div>
           </motion.aside>
         )}

@@ -246,7 +246,7 @@ export class VoiceSession {
         model_used: typeof msg.model_used === "string" ? msg.model_used : null,
         ask: (msg.ask as VoiceTurnResponse["ask"]) ?? null,
         audio_base64: audio,
-        audio_mime: typeof msg.audio_mime === "string" ? msg.audio_mime : "audio/mpeg",
+        audio_mime: typeof msg.audio_mime === "string" ? msg.audio_mime : "audio/wav",
         audio_parts_base64: pending.parts,
         tools_used: Array.isArray(msg.tools_used) ? (msg.tools_used as string[]) : [],
       } as VoiceTurnResponse & { audio_parts_base64?: string[]; tools_used?: string[] };

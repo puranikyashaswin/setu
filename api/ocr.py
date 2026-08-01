@@ -1,4 +1,4 @@
-"""Document OCR via OpenRouter vision models (+ PDF text-layer fast path)."""
+"""Document OCR providers — OpenRouter (fast/free) primary, Sarvam Vision fallback."""
 
 from __future__ import annotations
 
@@ -18,14 +18,8 @@ logger = logging.getLogger("setu")
 
 ProgressFn = Callable[[dict], None] | None
 
-# Free multimodal models currently available on OpenRouter (Jul 2026).
-# Prefer Gemma 4 26B — verified ~20s OCR on sample notice vs Sarvam Vision ~100s+.
-DEFAULT_OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
-OPENROUTER_FALLBACK_MODELS = (
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "openrouter/free",
-)
+# OCRBench-strong free VL model; override with OPENROUTER_OCR_MODEL.
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _OCR_PROMPT = """Extract ALL readable text from this image for a voice assistant.
@@ -41,9 +35,14 @@ Rules:
 
 
 def resolve_ocr_provider() -> str:
-    """OpenRouter-only OCR (Sarvam removed)."""
+    """auto → openrouter when key present, else sarvam."""
+    configured = (os.getenv("OCR_PROVIDER") or "auto").strip().lower()
     has_or = bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
-    return "openrouter" if has_or else "none"
+    if configured == "openrouter":
+        return "openrouter" if has_or else "sarvam"
+    if configured == "sarvam":
+        return "sarvam"
+    return "openrouter" if has_or else "sarvam"
 
 
 def _emit(progress: ProgressFn, event: dict) -> None:
@@ -66,26 +65,17 @@ def _pdf_text_layer(file_bytes: bytes) -> str:
         return ""
 
 
-def _candidate_models() -> list[str]:
-    preferred = (os.getenv("OPENROUTER_OCR_MODEL") or DEFAULT_OPENROUTER_MODEL).strip()
-    ordered: list[str] = []
-    for model in (preferred, *OPENROUTER_FALLBACK_MODELS):
-        if model and model not in ordered:
-            ordered.append(model)
-    return ordered
-
-
 def _openrouter_ocr_image(
     file_bytes: bytes,
     *,
     mime: str,
     language: str,
-) -> tuple[str, str]:
-    """Returns (text, model_id_used)."""
+) -> str:
     api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set")
 
+    model = (os.getenv("OPENROUTER_OCR_MODEL") or DEFAULT_OPENROUTER_MODEL).strip()
     lang_hint = (language or "en").split("-", 1)[0]
     data_url = f"data:{mime};base64,{base64.b64encode(file_bytes).decode('ascii')}"
     prompt = (
@@ -93,72 +83,52 @@ def _openrouter_ocr_image(
         f"Preferred reading language hint: {lang_hint}. "
         f"Still extract every script you see."
     )
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": os.getenv("FRONTEND_ORIGIN") or "http://localhost:3000",
         "X-Title": "Setu",
     }
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    }
 
-    last_error: Exception | None = None
-    for model in _candidate_models():
-        payload = {
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 1800,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
-        }
-        t0 = time.perf_counter()
-        try:
-            with httpx.Client(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
-                response = client.post(OPENROUTER_URL, headers=headers, json=payload)
-            body = response.json()
-            if response.status_code == 429:
-                last_error = RuntimeError(f"OpenRouter rate limited: {model}")
-                logger.warning("[ocr] rate limited model=%s", model)
-                continue
-            if response.status_code >= 400:
-                detail = str(body.get("error") or response.text)[:300]
-                last_error = RuntimeError(f"OpenRouter OCR {response.status_code}: {detail}")
-                logger.warning("[ocr] model=%s failed: %s", model, detail)
-                continue
+    t0 = time.perf_counter()
+    with httpx.Client(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
+        response = client.post(OPENROUTER_URL, headers=headers, json=payload)
+        if response.status_code >= 400:
+            detail = response.text[:400]
+            raise RuntimeError(f"OpenRouter OCR {response.status_code}: {detail}")
+        body = response.json()
 
-            content = (
-                (((body.get("choices") or [{}])[0].get("message") or {}).get("content"))
-                or ""
-            )
-            if isinstance(content, list):
-                content = " ".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
-            text = str(content).strip()
-            used = str(body.get("model") or model)
-            elapsed = time.perf_counter() - t0
-            logger.info(
-                "[ocr] openrouter model=%s chars=%s in %.2fs",
-                used,
-                len(text),
-                elapsed,
-            )
-            if not text:
-                last_error = RuntimeError(f"OpenRouter empty OCR from {used}")
-                continue
-            return text, used
-        except Exception as exc:
-            last_error = exc
-            logger.warning("[ocr] model=%s error: %s", model, exc)
-            continue
-
-    raise RuntimeError(f"OpenRouter OCR failed: {last_error}")
+    content = (
+        (((body.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+    )
+    if isinstance(content, list):
+        # Some providers return content parts.
+        content = " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+        )
+    text = str(content).strip()
+    logger.info(
+        "[ocr] openrouter model=%s chars=%s in %.2fs",
+        model,
+        len(text),
+        time.perf_counter() - t0,
+    )
+    return text
 
 
 def _mime_for_format(fmt: str) -> str:
@@ -221,7 +191,6 @@ def extract_document(
     text = ""
     pages = 1
     used = provider
-    model_used: str | None = None
 
     # Digital PDF text layer — usually <100ms.
     if actual == "pdf":
@@ -235,19 +204,31 @@ def extract_document(
             used = "pdf-text"
             logger.info("[ocr] pdf text-layer pages=%s chars=%s", pages, len(text))
 
-    if not text and actual in {"png", "jpeg"}:
-        if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
-            raise RuntimeError("OPENROUTER_API_KEY required for document OCR")
-        text, model_used = _openrouter_ocr_image(
+    if not text and provider == "openrouter" and actual in {"png", "jpeg"}:
+        try:
+            text = _openrouter_ocr_image(
+                file_bytes,
+                mime=_mime_for_format(actual),
+                language=lang,
+            )
+            used = "openrouter"
+        except Exception:
+            logger.warning("[ocr] openrouter failed — falling back to Sarvam", exc_info=True)
+            used = "sarvam"
+
+    if not text:
+        # Sarvam Vision (slow) — last resort / PDF scans without text layer.
+        result = sarvam.extract_document(
             file_bytes,
-            mime=_mime_for_format(actual),
+            filename,
             language=lang,
+            progress=progress,
         )
-        used = "openrouter"
-    elif not text and actual == "pdf":
-        raise RuntimeError(
-            "This PDF has no extractable text layer. Export pages as JPG/PNG and scan again."
-        )
+        if result.get("status") == "unclear_scan":
+            return {**result, "provider": "sarvam", "preview": (result.get("text") or "")[:500]}
+        result = {**result, "provider": result.get("provider") or "sarvam"}
+        result["preview"] = (result.get("text") or "")[:500]
+        return result
 
     unclear = text.strip().upper() == "UNCLEAR_SCAN" or sarvam._is_unclear(text)  # noqa: SLF001
     if unclear:
@@ -258,7 +239,6 @@ def extract_document(
             "cached": False,
             "status": "unclear_scan",
             "provider": used,
-            "model": model_used,
             "preview": (text or "")[:500],
         }
 
@@ -267,7 +247,6 @@ def extract_document(
         "text": text,
         "pages": pages,
         "provider": used,
-        "model": model_used,
     }
     sarvam._set_cached_document(doc_id, entry)  # noqa: SLF001
     return {

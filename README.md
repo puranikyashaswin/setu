@@ -1,11 +1,11 @@
 # Setu
 
-Setu is a voice-first document assistant. Scan a notice or upload a file, ask questions in your language, and hear answers spoken back to you. The stack uses OpenRouter for vision OCR, chat, and Indic TTS, with Chrome browser speech recognition for free Indian-language STT.
+Setu is a voice-first document assistant. Scan a notice or upload a file, ask questions in your language, and hear answers spoken back to you. The stack uses Sarvam for STT, TTS, chat, agent routing, and Vision OCR.
 
 ## Features
 
 - Voice conversations in Indian languages (Telugu, Hindi, English, and more)
-- Document scanning with OpenRouter free vision OCR
+- Document scanning with Sarvam Vision OCR
 - Hands-free Q&A after the first tap
 - Progressive Web App (PWA) installable on desktop and mobile
 - Guest mode with optional email magic-link sign-in
@@ -15,7 +15,7 @@ Setu is a voice-first document assistant. Scan a notice or upload a file, ask qu
 
 ```
 setu/
-├── api/          FastAPI backend (main.py, sarvam.py, db.py, auth.py)
+├── api/          FastAPI backend (Sarvam STT/TTS/chat/Vision + optional fast OCR)
 ├── web/          Next.js PWA frontend
 ├── samples/      Demo documents for testing
 ├── render.yaml   Render deployment blueprint
@@ -26,8 +26,8 @@ setu/
 
 - Python 3.12+
 - Node.js 18+
-- An [OpenRouter API key](https://openrouter.ai/keys)
-- Chrome (required for browser Indic STT; also recommended for PWA install)
+- A [Sarvam API key](https://dashboard.sarvam.ai)
+- Chrome (recommended for local development and PWA install)
 
 ## Local development
 
@@ -39,11 +39,10 @@ From the repository root:
 cp .env.example .env
 ```
 
-Edit `.env` and set your OpenRouter key:
+Edit `.env` and set your Sarvam key:
 
 ```
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-OCR_PROVIDER=openrouter
+SARVAM_API_KEY=your_sarvam_api_key_here
 ```
 
 For the frontend:
@@ -105,8 +104,7 @@ Verify the API is running: [http://localhost:8000/health](http://localhost:8000/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENROUTER_API_KEY` | Yes | OpenRouter key for OCR, chat, and Indic TTS |
-| `OCR_PROVIDER` | No | `openrouter` (default when key is set) |
+| `SARVAM_API_KEY` | Yes | Sarvam API key (STT / TTS / chat / Vision) |
 | `FRONTEND_ORIGIN` | For production | Deployed frontend URL, used for CORS and magic links |
 | `RESEND_API_KEY` | No | Resend API key for email magic links |
 | `RESEND_FROM` | No | Sender address for magic-link emails |
@@ -195,7 +193,7 @@ git push origin main
 
    | Key | Value |
    |-----|-------|
-   | `OPENROUTER_API_KEY` | Your OpenRouter key |
+   | `SARVAM_API_KEY` | Your Sarvam key |
    | `FRONTEND_ORIGIN` | Your Vercel URL (set after frontend deploy) |
    | `EXPOSE_MAGIC_LINK` | `1` (optional, for demo login links) |
 

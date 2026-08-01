@@ -9,10 +9,11 @@ import time
 import uuid
 from pathlib import Path
 
-# Set SETU_DB_PATH to a mounted disk (e.g. /var/data/setu.db on Render) so chat history
-# survives restarts; the default lives beside the code and is lost on ephemeral hosts.
+# Prefer DB_PATH (Render disk: /data/setu.db). SETU_DB_PATH kept as legacy alias.
 _DB_PATH = Path(
-    os.getenv("SETU_DB_PATH") or Path(__file__).resolve().parent / "cache" / "setu.db"
+    os.getenv("DB_PATH")
+    or os.getenv("SETU_DB_PATH")
+    or "./cache/setu.db"
 )
 
 

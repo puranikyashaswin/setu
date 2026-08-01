@@ -1,4 +1,4 @@
-"""Setu voice/doc helpers — OpenRouter chat/TTS/STT + local OCR cache (legacy module name)."""
+"""Sarvam API helpers for Setu. Logic reused from sarvam_reference.py."""
 
 from __future__ import annotations
 
@@ -19,13 +19,14 @@ logger = logging.getLogger("setu")
 
 import httpx
 from dotenv import load_dotenv
+from sarvamai import SarvamAI
+from sarvamai.core.api_error import ApiError
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-import openrouter_ai
-
 _cache: dict[str, dict] = {}
-_CACHE_DIR = Path(__file__).resolve().parent / "cache"
+# Prefer CACHE_PATH (Render disk: /data/cache). Relative default is CWD (api/ on Render).
+_CACHE_DIR = Path(os.getenv("CACHE_PATH") or "./cache/")
 _CACHE_FILE = _CACHE_DIR / "ocr_cache.json"
 _CORRECTIONS_FILE = _CACHE_DIR / "session_corrections.json"
 # session_id -> field -> {field, value, timestamp}
@@ -215,13 +216,16 @@ def _tts_to_wav(resp) -> bytes:
 
 
 def resolve_speaker(speaker: str | None) -> str:
-    """Legacy speaker name — OpenRouter Fish TTS uses a single default voice."""
-    s = (speaker or "setu").strip().lower() or "setu"
+    s = (speaker or "shubh").strip().lower()
+    if s in _V2_SPEAKERS or s not in _V3_SPEAKERS:
+        raise ValueError(
+            f"Invalid speaker '{speaker}'. Must be a bulbul:v3 speaker."
+        )
     return s
 
 
 def v3_speakers() -> list[str]:
-    return ["setu"]
+    return sorted(_V3_SPEAKERS)
 
 
 _TTS_CACHE_DIR = _CACHE_DIR / "tts"
@@ -239,18 +243,17 @@ def _tts_cache_get(key: str) -> bytes | None:
     if hit is not None:
         _TTS_MEMORY.move_to_end(key)
         return hit
-    for ext in (".mp3", ".wav"):
-        path = _TTS_CACHE_DIR / f"{key}{ext}"
-        try:
-            if path.is_file():
-                data = path.read_bytes()
-                _TTS_MEMORY[key] = data
-                _TTS_MEMORY.move_to_end(key)
-                while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
-                    _TTS_MEMORY.popitem(last=False)
-                return data
-        except OSError:
-            logger.warning("[speak] cache read failed key=%s", key, exc_info=True)
+    path = _TTS_CACHE_DIR / f"{key}.wav"
+    try:
+        if path.is_file():
+            data = path.read_bytes()
+            _TTS_MEMORY[key] = data
+            _TTS_MEMORY.move_to_end(key)
+            while len(_TTS_MEMORY) > _TTS_MEMORY_MAX:
+                _TTS_MEMORY.popitem(last=False)
+            return data
+    except OSError:
+        logger.warning("[speak] cache read failed key=%s", key, exc_info=True)
     return None
 
 
@@ -261,52 +264,83 @@ def _tts_cache_put(key: str, data: bytes) -> None:
         _TTS_MEMORY.popitem(last=False)
     try:
         _TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        ext = ".mp3" if data[:3] == b"ID3" or data[:2] == b"\xff\xfb" else ".mp3"
-        (_TTS_CACHE_DIR / f"{key}{ext}").write_bytes(data)
+        (_TTS_CACHE_DIR / f"{key}.wav").write_bytes(data)
     except OSError:
         logger.warning("[speak] cache write failed key=%s", key, exc_info=True)
 
 
 def speak(
-    text: str, language: str, speaker: str = "setu", pace: float = 1.0
+    text: str, language: str, speaker: str = "shubh", pace: float = 1.0
 ) -> bytes:
-    """OpenRouter free Fish TTS (MP3) for Indian languages."""
+    client = get_client()
     voice = resolve_speaker(speaker)
-    lang = _lang_base(language) or "en"
+    lang = _lang_code(language)
+    # Intros and confirmations repeat constantly; synthesizing them again costs seconds.
     key = _tts_cache_key(text, lang, voice, pace)
     cached = _tts_cache_get(key)
     if cached is not None:
         logger.info("[speak] cache hit language=%s chars=%s", lang, len(text))
         return cached
 
-    try:
-        audio = _with_backoff(
-            lambda: openrouter_ai.speak_mp3(text, language=lang, pace=pace)
+    def call():
+        return client.text_to_speech.convert(
+            text=text,
+            target_language_code=lang,
+            model="bulbul:v3",
+            speaker=voice,
+            pace=pace,
+            # Do NOT pass pitch/loudness — v3 rejects those v2 params
         )
+
+    try:
+        resp = _with_backoff(call)
     except Exception as exc:
-        logger.error("[speak] TTS failed language=%s: %s", lang, exc)
+        logger.error(
+            "[speak] TTS failed language=%s speaker=%s: %s",
+            lang,
+            voice,
+            exc,
+        )
         raise
+    audio = _tts_to_wav(resp)
     _tts_cache_put(key, audio)
     return audio
 
 
 def listen(audio_bytes: bytes, filename: str, language: str | None = None) -> dict:
-    """OpenRouter STT (Whisper). Needs OpenRouter credits; browser STT is the free path."""
-    lang = _lang_base(language) if language else None
-    try:
-        return _with_backoff(
-            lambda: openrouter_ai.transcribe(
-                audio_bytes, filename=filename, language=lang
-            )
+    client = get_client()
+
+    def call():
+        kwargs = {
+            "file": (filename, io.BytesIO(audio_bytes)),
+            "model": "saaras:v3",
+            "mode": "codemix",
+        }
+        if language:
+            kwargs["language_code"] = _lang_code(language)
+        return client.speech_to_text.transcribe(
+            **kwargs,
         )
-    except Exception as exc:
-        logger.error("[listen] STT failed: %s", exc)
-        raise
+
+    resp = _with_backoff(call)
+    return {
+        "transcript": resp.transcript,
+        "language_code": resp.language_code or "",
+    }
 
 
-def get_client():
-    """Deprecated Sarvam client accessor — kept so old imports do not crash."""
-    raise RuntimeError("Sarvam client removed — Setu uses OpenRouter now")
+# One client for the process — constructing SarvamAI() per call costs ~2s TLS.
+_client: SarvamAI | None = None
+
+
+def get_client() -> SarvamAI:
+    global _client
+    if _client is None:
+        key = (os.getenv("SARVAM_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("SARVAM_API_KEY not set")
+        _client = SarvamAI(api_subscription_key=key)
+    return _client
 
 
 def get_document(doc_id: str) -> dict | None:
@@ -825,7 +859,7 @@ def chat_reply(
     history: list[dict] | None = None,
     memory_context: str | None = None,
 ) -> dict:
-    """Fast chat path via OpenRouter — no document, no JSON schema."""
+    """Fast path: sarvam-105b, no document, no JSON schema. Target <1.5s."""
     language_name = _language_name(language)
     if has_document:
         doc_rule = (
@@ -905,15 +939,19 @@ def chat_reply(
     _log_messages("/converse", messages)
 
     def call():
-        return openrouter_ai.chat_completions(
-            messages, max_tokens=140, temperature=0.2
+        return get_client().chat.completions(
+            model="sarvam-105b",
+            messages=messages,
+            reasoning_effort=None,  # required — thinking + low max_tokens → empty content
+            max_tokens=140,
+            temperature=0.2,
         )
 
     resp = _with_backoff(call)
-    content = openrouter_ai.message_text(resp)
+    content = (resp.choices[0].message.content or "").strip()
     if not content:
         raise RuntimeError("Empty model response")
-    # Models sometimes reply in English even when Indic was requested — retry once.
+    # Sarvam sometimes replies in English even when Telugu/Hindi was requested — retry once.
     if _lang_base(language) != "en" and _is_mostly_latin(content):
         retry_messages = [
             *messages,
@@ -927,17 +965,20 @@ def chat_reply(
             },
         ]
         retry = _with_backoff(
-            lambda: openrouter_ai.chat_completions(
-                retry_messages, max_tokens=80, temperature=0.1
+            lambda: get_client().chat.completions(
+                model="sarvam-105b",
+                messages=retry_messages,
+                reasoning_effort=None,
+                max_tokens=60,
+                temperature=0.1,
             )
         )
-        retry_content = openrouter_ai.message_text(retry)
+        retry_content = (retry.choices[0].message.content or "").strip()
         if retry_content and not _is_mostly_latin(retry_content):
             content = retry_content
     return {
         "reply": content,
         "intent": _chat_intent(message, has_document),
-        "model_used": openrouter_ai.chat_model(),
     }
 
 
@@ -981,6 +1022,8 @@ def ask_document(
     history: list[dict] | None = None,
     corrections: list[dict] | None = None,
 ) -> dict:
+    client = get_client()
+    # Cap context — full docs on every /ask burn tokens and invite 429s.
     clipped = (doc_text or "")[:6000]
     lang_name = _language_name(answer_language)
     history_msgs = _cap_chat_history(history, requested_language=answer_language)
@@ -1003,19 +1046,13 @@ def ask_document(
                 + "\n".join(lines)
                 + "\n\n"
             )
-    schema_hint = (
-        "Return ONLY valid JSON matching this shape: "
-        '{"answer":"string","language":"te|hi|en|...","status":"verified_document|not_found|unclear_scan",'
-        '"action_items":["..."],"evidence":[{"page":1,"quote":"..."}],"abstain":false}'
-    )
     user_content = (
         f"Answer language (mandatory): {answer_language} — write the answer in {lang_name} only.\n\n"
         f"Document text:\n\n{clipped}\n\n"
         f"{corr_block}"
         f"Question: {question}\n"
         f"Answer language code: {answer_language}\n"
-        f"{schema_hint}\n"
-        f"(Reply in {lang_name} JSON only.)"
+        f"(Reply in {lang_name}.)"
     )
     messages = [
         {"role": "system", "content": _ask_system_prompt(answer_language)},
@@ -1026,18 +1063,27 @@ def ask_document(
     _log_messages("/ask", messages)
     stats = {"attempts": 0, "call_ms": 0}
     t_total = time.perf_counter()
-    model = openrouter_ai.chat_model()
-    max_tokens = 768 if _is_short_factual_question(question) else 1200
+    use_fast = _is_short_factual_question(question)
+    model = "sarvam-105b"
+    max_tokens = 768 if use_fast else 1536
 
     def call():
         stats["attempts"] += 1
         t0 = time.perf_counter()
         try:
-            return openrouter_ai.chat_completions(
-                messages,
+            return client.chat.completions(
+                model=model,
+                messages=messages,
+                reasoning_effort=None,
                 max_tokens=max_tokens,
-                temperature=0.1,
-                response_format={"type": "json_object"},
+                request_options={
+                    "additional_body_parameters": {
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": _ANSWER_SCHEMA,
+                        }
+                    }
+                },
             )
         finally:
             stats["call_ms"] += int((time.perf_counter() - t0) * 1000)
@@ -1047,10 +1093,10 @@ def ask_document(
     finally:
         total_ms = int((time.perf_counter() - t_total) * 1000)
         print(
-            f"[ask] model={model} call={stats['call_ms']}ms "
+            f"[ask] model={model} sarvam_call={stats['call_ms']}ms "
             f"attempts={stats['attempts']} total={total_ms}ms"
         )
-    content = openrouter_ai.message_text(resp)
+    content = resp.choices[0].message.content
     if not content:
         raise RuntimeError("Empty model response")
     result = _parse_answer_json(content)
@@ -1060,7 +1106,8 @@ def ask_document(
 
 
 def summarize_document(doc_text: str, answer_language: str) -> str:
-    """Fast post-scan overview — OpenRouter free chat, 1–2 spoken sentences."""
+    """Fast post-scan overview — sarvam-105b, 2–3 sentences, no verification schema."""
+    client = get_client()
     clipped = (doc_text or "")[:6000]
     lang_name = _language_name(answer_language)
     messages = [
@@ -1074,21 +1121,36 @@ def summarize_document(doc_text: str, answer_language: str) -> str:
         },
         {
             "role": "user",
-            "content": f"Summarize this document in one short sentence:\n\n{clipped}",
+            "content": f"Summarize this document in 2–3 sentences:\n\n{clipped}",
         },
     ]
+    stats = {"attempts": 0, "call_ms": 0}
     t_total = time.perf_counter()
-    resp = _with_backoff(
-        lambda: openrouter_ai.chat_completions(messages, max_tokens=120, temperature=0.2)
-    )
+
+    def call():
+        stats["attempts"] += 1
+        t0 = time.perf_counter()
+        try:
+            return client.chat.completions(
+                model="sarvam-105b",
+                messages=messages,
+                reasoning_effort=None,
+                max_tokens=400,
+                temperature=0.2,
+            )
+        finally:
+            stats["call_ms"] += int((time.perf_counter() - t0) * 1000)
+
+    resp = _with_backoff(call)
+    total_ms = int((time.perf_counter() - t_total) * 1000)
     print(
-        f"[summarize] model={openrouter_ai.chat_model()} "
-        f"total={int((time.perf_counter() - t_total) * 1000)}ms"
+        f"[summarize] model=sarvam-105b sarvam_call={stats['call_ms']}ms "
+        f"attempts={stats['attempts']} total={total_ms}ms"
     )
-    content = openrouter_ai.message_text(resp)
+    content = (resp.choices[0].message.content or "").strip()
     if not content:
         raise RuntimeError("Empty summarize response")
-    return cap_answer_sentences(content, 2)
+    return cap_answer_sentences(content, 3)
 
 
 def _detect_format(data: bytes) -> str | None:
@@ -1108,11 +1170,10 @@ def _correct_filename(filename: str, actual: str) -> str:
 
 def _retryable(exc: BaseException) -> bool:
     """Retry rate limits and transient network / DNS failures."""
+    if isinstance(exc, ApiError):
+        return exc.status_code in (429, 503)
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (429, 503)
-    msg_lower = str(exc).lower()
-    if "429" in msg_lower or "rate limit" in msg_lower or "503" in msg_lower:
-        return True
     if isinstance(
         exc,
         (
@@ -1138,6 +1199,8 @@ def _retryable(exc: BaseException) -> bool:
 
 
 def _error_status(exc: BaseException) -> object:
+    if isinstance(exc, ApiError):
+        return exc.status_code
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return type(exc).__name__
@@ -1201,9 +1264,49 @@ def _pdf_slice(file_bytes: bytes, start: int, end: int) -> bytes:
 
 
 def _run_vision(file_bytes: bytes, filename: str, language: str = "te-IN") -> tuple[str, int]:
-    raise RuntimeError(
-        "Sarvam Vision removed — set OPENROUTER_API_KEY for OCR (see api/ocr.py)"
-    )
+    actual = _detect_format(file_bytes)
+    if actual not in _FORMAT_EXT:
+        raise ValueError("Unsupported file format; accepts PDF, PNG, JPG")
+
+    upload_name = _correct_filename(filename, actual)
+    client = get_client()
+    lang = language or "te-IN"
+
+    def create_job():
+        return client.document_intelligence.create_job(language=lang, output_format="md")
+
+    job = _with_backoff(create_job)
+
+    with tempfile.NamedTemporaryFile(suffix=Path(upload_name).suffix, delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        _with_backoff(lambda: job.upload_file(tmp_path))
+        _with_backoff(job.start)
+        status = _with_backoff(job.wait_until_complete)
+        if status.job_state == "Failed":
+            raise RuntimeError(f"Vision job failed: {status.job_state}")
+
+        out_fd, out_path = tempfile.mkstemp(suffix=".md")
+        os.close(out_fd)
+        try:
+            _with_backoff(lambda: job.download_output(out_path))
+            raw = Path(out_path).read_bytes()
+            if raw[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    md = next(n for n in zf.namelist() if n.endswith(".md"))
+                    text = zf.read(md).decode("utf-8")
+            else:
+                text = raw.decode("utf-8")
+        finally:
+            os.unlink(out_path)
+
+        metrics = job.get_page_metrics()
+        pages = int(metrics["total_pages"]) if metrics and metrics.get("total_pages") else 1
+        return text, pages
+    finally:
+        os.unlink(tmp_path)
 
 
 # Vision sometimes describes a photo/scene instead of reading document text.

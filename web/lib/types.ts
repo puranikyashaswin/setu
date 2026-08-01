@@ -1,6 +1,6 @@
 export type Language = "te" | "hi" | "en" | "mr" | "ta" | "kn" | "bn" | "gu" | "ml" | "pa" | "or";
 export type OrbState = "idle" | "listening" | "processing" | "speaking";
-export type StackService = "VISION" | "CHAT" | "VOICE" | "LISTEN";
+export type StackService = "VISION" | "105B" | "BULBUL" | "SAARAS";
 export type ChatRole = "user" | "setu";
 export type EvidenceItem = { page: number; quote: string; verified: boolean };
 export type Correction = { field: string; value: string; timestamp: number };

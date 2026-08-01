@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -35,6 +36,9 @@ logger = logging.getLogger("setu")
 
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
+# Last request stage timings for GET /debug/last-turn.
+_LAST_TURN: dict = {}
+
 # Demo docs — Vision runs at startup so /ask after pick is instant.
 _SAMPLE_DEFS: list[dict] = [
     {
@@ -59,6 +63,32 @@ def _frontend_origins() -> list[str]:
             if part and part not in origins:
                 origins.append(part)
     return origins
+
+
+def _ensure_data_dirs() -> None:
+    """Create DB parent + CACHE_PATH so SQLite/OCR/TTS survive on a mounted disk."""
+    cache_dir = Path(os.getenv("CACHE_PATH") or "./cache/")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    db_path = Path(os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "./cache/setu.db")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
+
+
+def _ms_since(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
+
+
+def _record_timing(route: str, status: int, **stages_ms: int) -> None:
+    """Log one [timing] line and stash it for /debug/last-turn."""
+    order = ("stt_ms", "route_ms", "llm_ms", "tts_ms", "ocr_ms", "total_ms")
+    parts = [f"route={route}"]
+    for key in order:
+        if key in stages_ms:
+            parts.append(f"{key}={int(stages_ms[key])}")
+    parts.append(f"status={status}")
+    logger.info("[timing] %s", " ".join(parts))
+    global _LAST_TURN
+    _LAST_TURN = {"route": route, "status": status, **{k: int(v) for k, v in stages_ms.items()}}
 
 
 def _memory_context(user_id: str | None, session_id: str | None = None) -> str | None:
@@ -113,7 +143,7 @@ def _warm_fixed_tts() -> None:
         t0 = time.perf_counter()
         sarvam.speak(text, language)
         logger.info(
-            "Warmed TTS language=%s chars=%s in %.2fs",
+            "Warm-up complete: TTS language=%s chars=%s in %.2fs",
             language,
             len(text),
             time.perf_counter() - t0,
@@ -126,15 +156,13 @@ def _warm_fixed_tts() -> None:
                 fut.result()
             except Exception:
                 logger.warning("TTS warm item failed", exc_info=True)
+    logger.info("Warm-up complete: intro-TTS")
 
 
 def _warm_client() -> None:
-    try:
-        t0 = time.perf_counter()
-        sarvam.chat_reply("hi", "en", False)
-        logger.info("Warmed /converse client in %.3fs", time.perf_counter() - t0)
-    except Exception:
-        logger.exception("Client warm-up failed")
+    t0 = time.perf_counter()
+    sarvam.chat_reply("hi", "en", False)
+    logger.info("Warm-up complete: converse client in %.3fs", time.perf_counter() - t0)
 
 
 def _warm_samples() -> None:
@@ -154,21 +182,13 @@ def _warm_samples() -> None:
                 continue
             sample["doc_id"] = result["doc_id"]
             logger.info(
-                "Pre-cached sample %s -> %s (cached=%s)",
+                "Warm-up complete: sample OCR %s -> %s (cached=%s)",
                 sample["file"],
                 sample["doc_id"][:12],
                 result.get("cached"),
             )
         except Exception:
             logger.exception("Failed to pre-cache sample %s", sample["file"])
-
-
-def _start_background_warms() -> None:
-    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
-        return
-    threading.Thread(target=_warm_client, name="client-warm", daemon=True).start()
-    threading.Thread(target=_warm_samples, name="sample-warm", daemon=True).start()
-    threading.Thread(target=_warm_fixed_tts, name="tts-warm", daemon=True).start()
 
 
 def _hydrate_sample_ids_from_cache() -> None:
@@ -190,17 +210,45 @@ def _hydrate_sample_ids_from_cache() -> None:
             logger.warning("Sample cache hydrate failed for %s", sample["file"], exc_info=True)
 
 
+async def _warmup_background() -> None:
+    """Sample OCR + intro TTS + converse client — never raises; runs off the event loop."""
+    loop = asyncio.get_running_loop()
+
+    async def _one(label: str, fn) -> None:
+        try:
+            await loop.run_in_executor(None, fn)
+        except Exception:
+            logger.warning("Warm-up failed: %s", label, exc_info=True)
+
+    await _one("sample OCR", _warm_samples)
+    await _one("intro-TTS", _warm_fixed_tts)
+    await _one("converse client", _warm_client)
+    logger.info("Warm-up complete: all items")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _ensure_data_dirs()
     db.init_db()
     sarvam.load_ocr_cache()
     sarvam.load_session_corrections()
     _hydrate_sample_ids_from_cache()
-    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
-        logger.warning("OPENROUTER_API_KEY not set — OCR / chat / TTS will fail")
+    origins = _frontend_origins()
+    print(f"[startup] CORS allow_origins={origins}", flush=True)
+    logger.info("CORS allow_origins=%s", origins)
+    warm_task: asyncio.Task | None = None
+    if not os.getenv("SARVAM_API_KEY"):
+        logger.warning("SARVAM_API_KEY not set — API calls will fail")
     else:
-        _start_background_warms()
+        # Schedule warm-up then yield immediately so /health is not blocked.
+        warm_task = asyncio.create_task(_warmup_background())
     yield
+    if warm_task is not None and not warm_task.done():
+        warm_task.cancel()
+        try:
+            await warm_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Setu API", lifespan=lifespan)
@@ -281,7 +329,7 @@ class SummarizeBody(BaseModel):
 class SpeakBody(BaseModel):
     text: str
     language: str = "en"
-    speaker: str = Field(default="setu")
+    speaker: str = Field(default="shubh")
     pace: float = Field(default=1.0, ge=0.5, le=2.0)
 
 
@@ -291,16 +339,22 @@ def health():
         "status": "ok",
         "ocr_provider": ocr.resolve_ocr_provider(),
         "openrouter_configured": bool((os.getenv("OPENROUTER_API_KEY") or "").strip()),
-        "stack": "openrouter",
     }
+
+
+@app.get("/debug/last-turn")
+def debug_last_turn():
+    """Last request stage timings (foundation for latency work)."""
+    return dict(_LAST_TURN) if _LAST_TURN else {}
 
 
 @app.get("/warm")
 def warm():
-    """Keep-alive that touches OpenRouter TTS so TLS + cache stay hot."""
-    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+    """Keep-alive that also touches the Sarvam client so TLS stays hot."""
+    if not os.getenv("SARVAM_API_KEY"):
         return {"status": "ok", "warmed": False}
     try:
+        # Cheap fixed-phrase TTS hits disk/memory cache after first warm.
         sarvam.speak(sarvam.brief_ack_for_language("en"), "en")
         return {"status": "ok", "warmed": True}
     except Exception:
@@ -441,12 +495,13 @@ async def scan(
     _ = user_id
 
     def event_stream():
-        vision_s = 0.0
+        ocr_ms = 0
+        http_status = 200
         cached = None
         yield_buf: list[dict] = []
         result_holder: dict = {}
         error_holder: list[BaseException] = []
-        t_vision = time.perf_counter()
+        t_ocr = time.perf_counter()
 
         def run():
             try:
@@ -471,16 +526,16 @@ async def scan(
                 if worker.is_alive():
                     time.sleep(0.15)
             worker.join()
-            vision_s = time.perf_counter() - t_vision
+            ocr_ms = _ms_since(t_ocr)
 
             if error_holder:
                 exc = error_holder[0]
                 if isinstance(exc, ValueError):
-                    status, detail = 400, str(exc)
+                    http_status, detail = 400, str(exc)
                 else:
                     logger.error("scan failed: %s", exc, exc_info=exc)
-                    status, detail = 502, sarvam._friendly_vision_error(exc)
-                yield json.dumps({"type": "error", "detail": detail, "status": status}) + "\n"
+                    http_status, detail = 502, sarvam._friendly_vision_error(exc)
+                yield json.dumps({"type": "error", "detail": detail, "status": http_status}) + "\n"
                 return
 
             result = result_holder["value"]
@@ -500,13 +555,13 @@ async def scan(
                 }
             ) + "\n"
         finally:
-            logger.info(
-                "[timing] /scan total=%.3fs vision=%.3fs cached=%s",
-                time.perf_counter() - t0,
-                vision_s,
-                cached,
+            _record_timing(
+                "/scan",
+                http_status,
+                ocr_ms=ocr_ms,
+                total_ms=_ms_since(t0),
             )
-            logger.info("[scan] vision=%.3fs", vision_s)
+            logger.info("[scan] ocr_ms=%s cached=%s", ocr_ms, cached)
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
@@ -524,13 +579,19 @@ async def listen(
     rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
     filename = file.filename or "audio.wav"
     _ = user_id
+    stt_ms = 0
+    status = 200
     try:
-        return sarvam.listen(data, filename, language=language)
+        t_stt = time.perf_counter()
+        result = sarvam.listen(data, filename, language=language)
+        stt_ms = _ms_since(t_stt)
+        return result
     except Exception as exc:
+        status = 502
         logger.exception("listen failed")
         raise HTTPException(502, f"STT failed: {exc}") from exc
     finally:
-        logger.info("[timing] /listen %.3fs", time.perf_counter() - t0)
+        _record_timing("/listen", status, stt_ms=stt_ms, total_ms=_ms_since(t0))
 
 
 @app.post("/voice")
@@ -543,18 +604,20 @@ async def voice(
     history: str = Form(default="[]"),
     memory: str | None = Form(default=None),
     onboarded: bool = Form(default=False),
-    speaker: str = Form(default="setu"),
+    speaker: str = Form(default="shubh"),
     pace: float = Form(default=1.0),
     force_route: str | None = Form(default=None),
     transcript: str | None = Form(default=None),
     user_id: str = Depends(_require_ai_user),
 ):
-    """STT → route → LLM → TTS. Prefer client `transcript` (browser Indic STT); else Whisper."""
+    """One-shot STT → route → LLM → TTS. Returns transcript, reply metadata, and WAV."""
     t0 = time.perf_counter()
     data = await file.read()
-    if not data:
+    browser_transcript = (transcript or "").strip()
+    if not data and not browser_transcript:
         raise HTTPException(400, "Empty audio")
-    rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
+    if data:
+        rate_limit.enforce_size(data, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
     filename = file.filename or "audio.wav"
 
     try:
@@ -564,30 +627,30 @@ async def voice(
     except json.JSONDecodeError:
         history_msgs = []
 
-    client_transcript = (transcript or "").strip()
-    stt: dict = {"transcript": client_transcript, "language_code": language}
-    if client_transcript:
-        logger.info("[voice] using browser transcript chars=%s", len(client_transcript))
+    language_code = ""
+    if browser_transcript:
+        # Chrome Web Speech already heard the user — skip server STT latency.
+        heard = browser_transcript
     else:
         try:
             stt = sarvam.listen(data, filename, language=None)
         except Exception as exc:
             logger.exception("voice STT failed")
-            raise HTTPException(
-                502,
-                f"STT failed: {exc}. Use Chrome browser speech, or add OpenRouter credits.",
-            ) from exc
+            raise HTTPException(502, f"STT failed: {exc}") from exc
+        heard = (stt.get("transcript") or "").strip()
+        language_code = stt.get("language_code") or ""
 
-    transcript_text = (stt.get("transcript") or "").strip()
-    if not transcript_text:
+    if not heard:
         raise HTTPException(400, "I could not understand that. Try again.")
+    transcript = heard
 
     result: agent.AgentResult | None = None
     spoken = ""
     wav = b""
+    audio_parts_b64: list[str] = []
     try:
         result = agent.run_agent_turn(
-            transcript_text,
+            transcript,
             language=language,
             has_document=has_document,
             doc_id=doc_id,
@@ -602,7 +665,8 @@ async def voice(
             result.reply = sarvam.camera_phrase(result.language, "show")
         spoken = sarvam.spoken_text(result.reply, result.max_spoken)
         # Demo: one consistent voice — ignore client speaker switches.
-        wav, _parts = agent.synthesize_turn_audio(result, pace=pace)
+        wav, parts = agent.synthesize_turn_audio(result, pace=pace)
+        audio_parts_b64 = [base64.b64encode(p).decode("ascii") for p in parts]
     except HTTPException:
         raise
     except Exception as exc:
@@ -619,8 +683,8 @@ async def voice(
 
     assert result is not None
     return {
-        "transcript": transcript_text,
-        "language_code": stt.get("language_code"),
+        "transcript": transcript,
+        "language_code": language_code,
         "language": result.language,
         "route": result.route,
         "intent": result.intent,
@@ -632,7 +696,8 @@ async def voice(
         "ask": result.ask,
         "tools_used": result.tools_used,
         "audio_base64": base64.b64encode(wav).decode("ascii"),
-        "audio_mime": "audio/mpeg",
+        "audio_mime": "audio/wav",
+        "audio_parts_base64": audio_parts_b64,
         "user_id": user_id,
     }
 
@@ -643,10 +708,16 @@ def converse(body: ConverseBody, user_id: str = Depends(_require_ai_user)):
         raise HTTPException(400, "message required")
     t0 = time.perf_counter()
     effective_user = body.user_id or user_id
+    route_ms = 0
+    llm_ms = 0
+    status = 200
     try:
         # Only redirect to /ask when a document is actually loaded. With no document
         # an empty reply leaves the voice loop silent, so always answer instead.
-        if body.has_document and not sarvam.is_converse_allowed(body.message):
+        t_route = time.perf_counter()
+        redirect = body.has_document and not sarvam.is_converse_allowed(body.message)
+        route_ms = _ms_since(t_route)
+        if redirect:
             return {
                 "redirect": True,
                 "route_to": "ask",
@@ -654,6 +725,7 @@ def converse(body: ConverseBody, user_id: str = Depends(_require_ai_user)):
                 "reply": "",
             }
         client_memory = (body.memory or "").strip()
+        t_llm = time.perf_counter()
         result = sarvam.chat_reply(
             body.message,
             body.language,
@@ -661,18 +733,26 @@ def converse(body: ConverseBody, user_id: str = Depends(_require_ai_user)):
             history=[m.model_dump() for m in body.history],
             memory_context=client_memory or _memory_context(effective_user, body.session_id),
         )
+        llm_ms = _ms_since(t_llm)
         return {
             "redirect": False,
             "route_to": None,
             "reply": result.get("reply", ""),
             "intent": result.get("intent", "chat"),
-            "model_used": result.get("model_used") or "openrouter",
+            "model_used": "sarvam-105b",
         }
     except Exception as exc:
+        status = 502
         logger.exception("converse failed")
         raise HTTPException(502, f"Chat failed: {exc}") from exc
     finally:
-        logger.info("[timing] /converse %.3fs", time.perf_counter() - t0)
+        _record_timing(
+            "/converse",
+            status,
+            route_ms=route_ms,
+            llm_ms=llm_ms,
+            total_ms=_ms_since(t0),
+        )
 
 
 @app.post("/ask")
@@ -681,9 +761,21 @@ def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
         raise HTTPException(400, "question required")
     t0 = time.perf_counter()
     _ = user_id
+    route_ms = 0
+    llm_ms = 0
+    status = 200
+    t_route = time.perf_counter()
     doc = sarvam.get_document(body.doc_id)
     if not doc:
-        logger.info("[timing] /ask %.3fs status=404", time.perf_counter() - t0)
+        route_ms = _ms_since(t_route)
+        status = 404
+        _record_timing(
+            "/ask",
+            status,
+            route_ms=route_ms,
+            llm_ms=0,
+            total_ms=_ms_since(t0),
+        )
         raise HTTPException(404, "Unknown doc_id — scan the document first")
     try:
         session_id = (body.session_id or "").strip()
@@ -695,6 +787,8 @@ def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
         from doc_retrieve import retrieve_chunks
 
         context = retrieve_chunks(doc["text"], body.question)
+        route_ms = _ms_since(t_route)
+        t_llm = time.perf_counter()
         result = sarvam.ask_document(
             context or doc["text"],
             body.question,
@@ -702,18 +796,19 @@ def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
             history=[m.model_dump() for m in body.history],
             corrections=corrections,
         )
+        llm_ms = _ms_since(t_llm)
         evidence = sarvam.verify_citations(result.get("evidence") or [], doc["text"])
-        status = result.get("status", "not_found")
+        answer_status = result.get("status", "not_found")
         if any(not item.get("verified") for item in evidence):
-            if status == "verified_document":
-                status = "not_found"
+            if answer_status == "verified_document":
+                answer_status = "not_found"
         all_verified = bool(evidence) and all(
             item.get("verified") for item in evidence
-        ) and status == "verified_document"
+        ) and answer_status == "verified_document"
         return {
             "answer": result.get("answer", ""),
             "language": result.get("language", body.answer_language),
-            "status": status,
+            "status": answer_status,
             "action_items": result.get("action_items") or [],
             "evidence": evidence,
             "abstain": bool(result.get("abstain", False)),
@@ -722,28 +817,43 @@ def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
             "model_used": result.get("model_used"),
         }
     except Exception as exc:
+        status = 502
         logger.exception("ask failed")
         raise HTTPException(502, f"Ask failed: {exc}") from exc
     finally:
-        logger.info("[timing] /ask %.3fs", time.perf_counter() - t0)
+        if status != 404:
+            _record_timing(
+                "/ask",
+                status,
+                route_ms=route_ms,
+                llm_ms=llm_ms,
+                total_ms=_ms_since(t0),
+            )
 
 
 @app.post("/summarize")
 def summarize(body: SummarizeBody, user_id: str = Depends(_require_ai_user)):
     t0 = time.perf_counter()
     _ = user_id
+    llm_ms = 0
+    status = 200
     doc = sarvam.get_document(body.doc_id)
     if not doc:
-        logger.info("[timing] /summarize %.3fs status=404", time.perf_counter() - t0)
+        status = 404
+        _record_timing("/summarize", status, llm_ms=0, total_ms=_ms_since(t0))
         raise HTTPException(404, "Unknown doc_id — scan the document first")
     try:
+        t_llm = time.perf_counter()
         summary = sarvam.summarize_document(doc["text"], body.answer_language)
-        return {"summary": summary, "model_used": "openrouter"}
+        llm_ms = _ms_since(t_llm)
+        return {"summary": summary, "model_used": "sarvam-105b"}
     except Exception as exc:
+        status = 502
         logger.exception("summarize failed")
         raise HTTPException(502, f"Summarize failed: {exc}") from exc
     finally:
-        logger.info("[timing] /summarize %.3fs", time.perf_counter() - t0)
+        if status != 404:
+            _record_timing("/summarize", status, llm_ms=llm_ms, total_ms=_ms_since(t0))
 
 
 @app.post("/speak")
@@ -752,16 +862,22 @@ def speak(body: SpeakBody, user_id: str = Depends(_require_ai_user)):
         raise HTTPException(400, "text required")
     t0 = time.perf_counter()
     _ = user_id
+    tts_ms = 0
+    status = 200
     try:
+        t_tts = time.perf_counter()
         wav = sarvam.speak(
             body.text, body.language, speaker=body.speaker, pace=body.pace
         )
+        tts_ms = _ms_since(t_tts)
     except ValueError as exc:
+        status = 400
         logger.error("[speak] bad request language=%s speaker=%s: %s", body.language, body.speaker, exc)
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
+        status = 502
         logger.exception("[speak] failed language=%s speaker=%s", body.language, body.speaker)
         raise HTTPException(502, f"TTS failed for {body.language}/{body.speaker}: {exc}") from exc
     finally:
-        logger.info("[timing] /speak %.3fs language=%s", time.perf_counter() - t0, body.language)
-    return Response(content=wav, media_type="audio/mpeg")
+        _record_timing("/speak", status, tts_ms=tts_ms, total_ms=_ms_since(t0))
+    return Response(content=wav, media_type="audio/wav")

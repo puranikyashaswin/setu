@@ -1,160 +1,112 @@
-# Setu — Verified Sarvam Stack Context
+# Setu — Product & Architecture Context (v2)
 
-All facts below were verified by direct API testing on 24 July 2026.
-Do NOT rely on training data for Sarvam APIs — it is outdated.
-Use ONLY the model IDs, parameters, and patterns documented here.
+## What Setu is
+A voice-first AI assistant for Indian people who may be non-technical or low-literacy.
+Two capabilities inside ONE continuous voice conversation:
+1. **Talk** — free conversation in the user's own language (questions, daily help,
+   general knowledge).
+2. **Documents** — user shows a paper (govt notice/form, bank letter, medical
+   prescription, land record, school document); Setu scans it once, speaks a short
+   summary of what it is, then answers questions about it spoken aloud, grounded
+   ONLY in the scanned text, abstaining rather than inventing.
 
-## Model IDs — use these EXACTLY
+Reference UX: ChatGPT voice mode. Hands-free, interruptible, context-holding.
+NOT: a chatbot with a mic button. NOT: a one-trick Rythu Bharosa demo.
 
-| Purpose | Model ID |
-|---|---|
-| Chat / reasoning | `sarvam-105b` |
-| Speech-to-text | `saaras:v3` |
-| Text-to-speech | `bulbul:v3` |
-| Translation | `sarvam-translate:v1` |
-| Document OCR | Sarvam Vision via `client.document_intelligence` |
+## Users
+Non-technical Indian phone users. Android Chrome AND iPhone Safari must both work.
+No literacy assumptions: primary I/O is voice; the on-screen transcript is secondary.
+This is no longer a hackathon demo — it is being built for real users.
 
-## DEPRECATED — never use these
-`sarvam-m`, `saarika:v1`, `saarika:v2`, `saarika:v2.5`, `saaras:v2.5`,
-`bulbul:v1`, `bulbul:v2`
+## Current repo map (do not restructure)
+- `api/` — flat FastAPI stack: main.py (routes), sarvam.py (Sarvam SDK wrapper:
+  Saaras STT / Bulbul TTS / Vision OCR / chat), agent.py (voice router),
+  voice_ws.py (/ws/voice persistent sessions + progressive audio + barge-in cancel),
+  ocr.py (OCR routing), doc_retrieve.py (keyword chunking for doc QA),
+  db.py (SQLite), auth.py (guest + magic link), rate_limit.py, cache/ (runtime).
+- `web/` — Next.js PWA: app/page.tsx (whole UI — KEEP the design), SetuOrb,
+  lib/voice-session.ts (WS client), lib/audio/* (recorder, browser-stt, playback,
+  barge-in, wav, worklet-vad), lib/session-storage.ts (IndexedDB history).
+- `samples/` — demo documents (currently only Rythu Bharosa — must generalize).
+- Root: render.yaml, .env, keep-api-warm cron workflow.
 
-## Auth
-```python
-from sarvamai import SarvamAI
-client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
-```
+## Hard requirements (priority order)
+- P0 Both phone browsers work. iOS Safari has NO webkitSpeechRecognition and
+  suspends AudioContext without a user gesture — server STT (Saaras) and Web Audio
+  unlock handling are mandatory, browser STT is only an optimization.
+- P0 Persistent state survives redeploys. Render free tier = ephemeral disk:
+  SQLite and OCR/TTS caches MUST live on a mounted disk (or hosted DB). Today's
+  data loss on restart is a primary reason "nothing works deployed."
+- P0 Lifespan never blocks serving: warmup (sample OCR, TTS cache) runs in a
+  background task AFTER the app responds; /health answers immediately.
+- P0 Observability before behavior changes: every stage logs timings server-side
+  and client-side; /debug/last-turn returns the last turn's stage-timing JSON.
+  Capture one real phone session's logs before touching pipeline logic.
+- P0 Voice-native onboarding: user speaks their language ("I speak Telugu") →
+  session.language is set → intro plays IN that language. No popups, no pickers.
+- P0 Continuous hands-free loop: after Setu finishes speaking, mic reopens
+  automatically. No tap per turn. ~30s silence → soft "I'm still here" prompt.
+- P1 Barge-in: user speaks during TTS → audio stops immediately, interruption is
+  treated as the new turn. Echo-guarded (300ms grace + echoCancellation).
+- P0 Every turn (user + Setu, text + language) persisted instantly; reopening an
+  old chat restores transcript + doc text + language WITHOUT re-running OCR and
+  WITHOUT resending full doc text to the LLM on non-doc turns.
+- P0 Document answers fail closed: quoted line not in OCR text → not_found/abstain,
+  spoken as "this isn't in the document." Never invent a notice.
+- P0 No silent failures: STT fail → localized "say again"; OCR unclear → localized
+  "retake in better light"; API/credit failure → localized apology + visible banner.
 
-## CRITICAL GOTCHAS — verified by testing
+## Stack (Sarvam only — do not add providers)
+- STT: Saaras v3 (model="saaras:v3"; use codemix-tolerant transcription — real
+  users mix languages mid-sentence).
+- TTS: Bulbul v3 (bulbul:v3). Bulbul v4 is announced but not yet the documented
+  API model — treat as a future drop-in upgrade.
+- OCR: Sarvam Vision (₹0.5/page). Cache by content hash; repeat scans are free.
+- LLM: sarvam-105b for answers; sarvam-30b for routing/classification/summaries.
+- Backend: FastAPI flat folder, uvicorn. Frontend: Next.js PWA (UI design stays).
+- Storage: SQLite on a mounted disk via DB_PATH env (or hosted Postgres later).
 
-### 1. Reasoning trap (breaks silently)
-Reasoning is ON by default. If max_tokens is low, reasoning consumes the entire
-budget and `content` comes back EMPTY with only `reasoning_content` populated
-and `finish_reason="length"`.
+## Voice turn pipeline (target, mostly built — needs hardening)
+mic audio → Saaras STT (browser STT only if available as optimization)
+→ agent.py router: regex fast path first (greeting / language switch / scan /
+doc question / ack), else sarvam-30b classifier → 105b short reply (1-2 spoken
+sentences; doc answers grounded in retrieved chunks + quote verification)
+→ persist turn → Bulbul TTS (streamed parts over /ws/voice; REST /voice as
+fallback) → playback → auto-relisten. Barge-in cancels in-flight audio anytime.
 
-ALWAYS pass:
-```python
-reasoning_effort=None, max_tokens=4096
-```
+## Language routing
+- session.language is the single source of truth, set by the first utterance
+  (Saaras language_code + explicit language-word match, codemix tolerant).
+- Mid-chat switch: "speak in English" → update session, ack in the NEW language.
+- Launch languages: Telugu, Hindi, English + Bulbul v3's other 8 (Tamil, Kannada,
+  Malayalam, Marathi, Bengali, Gujarati, Punjabi, Odia).
 
-### 2. Structured output — Python SDK quirk
-`response_format` must go through request_options, NOT as a top-level kwarg:
-```python
-client.chat.completions(
-    model="sarvam-105b",
-    messages=[...],
-    reasoning_effort=None,
-    max_tokens=4096,
-    request_options={"additional_body_parameters": {
-        "response_format": {"type": "json_schema", "json_schema": {...}}
-    }}
-)
-```
-Response arrives as a JSON **string** in `message.content` — always `json.loads()`.
+## Memory model (light, token-cheap)
+- Within session: last ~8 turns verbatim + rolling 2-sentence summary (30b,
+  refreshed every ~6 turns).
+- Doc text enters the prompt ONLY when the routed intent is doc-related.
+- Across sessions: per-user digest of last ~4 chats (title, doc name, 1-line
+  summary) — injected only when the user asks about past chats.
+- Resume cost = one normal turn. Never re-scan, never replay full transcripts.
 
-### 3. Tool calling — verified response shape
-```python
-resp.choices[0].message.tool_calls[0].function.name       # str
-resp.choices[0].message.tool_calls[0].function.arguments  # JSON STRING
-args = json.loads(resp.choices[0].message.tool_calls[0].function.arguments)
-```
-`finish_reason == "tool_calls"` when a tool is invoked.
+## Document flow
+- Scan once per document: store doc_id, OCR text, pages, content hash, owner.
+- Rythu Bharosa is REMOVED as a special case. /samples = configurable generic set
+  (govt notice, bank letter, prescription), same pre-cache mechanism.
+- After scan: SPEAK a 2-sentence summary (what it is, one key fact, "what would
+  you like to know?"), then continue the normal voice loop with doc context.
 
-### 4. TTS speakers
-Use `speaker="shubh"` — verified working for te-IN, hi-IN, en-IN.
+## Non-goals this iteration
+- No new providers, no LiveKit, no wake word, no packaging/monorepo restructure.
+- No UI redesign. No email gate (guest X-User-Id first; magic link optional).
+- WS path exists — harden it (reconnect, iOS unlock, barge-in tuning);
+  no new transport protocols.
 
-DO NOT pass `pitch` or `loudness` — those are bulbul:v2 params, v3 rejects them.
-
-The SDK's speaker Literal type MIXES v2 and v3 names. Autocomplete will suggest
-broken values. These are v2-ONLY and will error on v3:
-`anushka, abhilash, manisha, vidya, arya, karun, hitesh`
-
-### 5. Vision file format
-Vision rejects files whose extension doesn't match actual content
-("Invalid or corrupted image file"). A PNG named .jpg WILL fail.
-Validate real format before upload.
-Accepts: PDF, PNG, JPG. Max 10 pages per job.
-
-### 6. Vision flow
-```python
-job = client.document_intelligence.create_job(language=..., output_format="md")
-job.upload_file(...)
-job.start()
-job.wait_until_complete()
-job.download_output()
-```
-
-## MEASURED LATENCIES (real, from testing)
-
-| Stage | Latency |
-|---|---|
-| Vision (per doc, 2 pages) | 9–14s ← THE BOTTLENECK |
-| Vision (cache hit) | 0.00s |
-| STT (saaras:v3) | 0.3–1.2s |
-| Chat (sarvam-105b) | 0.5–3.9s |
-| TTS (bulbul:v3, short text) | 1.8–3.4s |
-| TTS (bulbul:v3, long paragraph) | 6.8s ← keep answers SHORT |
-| Translate | 0.3–0.4s |
-
-### Design consequences (non-negotiable)
-- Run Vision at UPLOAD time, never at question time
-- Cache Vision output by file SHA256 — repeat questions must be instant
-- Pre-cache all demo documents at startup
-- Keep spoken answers to 2 sentences max; show full detail on screen only
-- Target: <5s per question after document is cached
-
-## Saaras v3 modes
-`transcribe` | `translate` | `verbatim` | `translit` | `codemix`
-
-Verified: `codemix` keeps English words in Latin script inside Indic sentences.
-On pure-Indic or pure-English audio it matches `transcribe`.
-Use `codemix` for user questions.
-
-Returns `language_code` and `language_probability`.
-
-## Rate limits
-- Vision Document Digitization: **10 req/min, ALL plans** (no upgrade path)
-- Vision real-time: 30 req/min
-- sarvam-105b: 40 req/min (Starter)
-- Add exponential backoff on 429 and 503
-
-## ANSWER CONTRACT
-
-Every /ask response must match this schema exactly:
-```json
-{
-  "answer": "natural sentence in the user's language — NEVER a machine string",
-  "language": "te",
-  "status": "verified_document | not_found | unclear_scan",
-  "action_items": ["..."],
-  "evidence": [{"page": 1, "quote": "exact text from the document"}],
-  "abstain": false
-}
-```
-
-### System prompt requirements — STRICT
-1. Answer ONLY from the provided document text. Never use outside knowledge.
-2. If the document does not contain what was SPECIFICALLY asked, set
-   `status="not_found"` and `abstain=true`. Do NOT silently answer a related
-   or adjacent question instead. (Verified failure mode: asked for "last date",
-   model answered about "start date" and marked it verified.)
-3. When abstaining, `answer` must still be a natural sentence in the user's
-   language explaining what is missing and what IS available.
-4. Every `evidence.quote` must be verbatim from the document text.
-5. Keep `answer` short enough to speak aloud in ~2 sentences.
-
-### Citation verification (required)
-After every /ask, verify each `evidence.quote` appears as a substring of the
-Vision-extracted text. Normalize whitespace and newlines before comparing —
-Vision inserts line breaks mid-sentence. Reject or flag unverified quotes.
-
-## Deployment
-- Single FastAPI service, serves its own frontend via StaticFiles
-- One origin — no CORS
-- Deploy to Railway, HTTPS required for getUserMedia
-- Never split frontend/backend across origins
-
-## Browser constraints
-- `getUserMedia` requires HTTPS
-- iOS Safari: audio playback requires a user gesture
-- Record audio as WAV/PCM — avoid opus, iOS Safari breaks on it
-- Always keep upload as a fallback if camera/mic permission is denied
+## Definition of done (run before calling anything fixed)
+- Android Chrome AND iPhone Safari, on the deployed URL: language pick by voice →
+  5+ free-chat turns → scan a real Telugu notice photo → 3 doc questions →
+  interrupt one reply → close tab → reopen chat from history → continue by voice.
+  Zero taps after session start except the scan.
+- Render restart → old chats still resume with context intact.
+- First turn after idle < 5s with a visible "waking up" state, never dead air.
+- scripts/smoke.py passes end-to-end against the deployed backend with timings.

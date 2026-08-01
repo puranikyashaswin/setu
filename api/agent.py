@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from collections.abc import Callable
 from typing import Any
 
-import openrouter_ai
 import sarvam
 from doc_retrieve import retrieve_chunks
 
@@ -343,10 +342,14 @@ def _route_with_tools(
         {"role": "system", "content": system},
         {"role": "user", "content": transcript},
     ]
+    client = sarvam.get_client()
+
     def call():
-        return openrouter_ai.chat_completions(
-            messages,
+        return client.chat.completions(
+            model="sarvam-105b",
+            messages=messages,
             tools=AGENT_TOOLS,
+            reasoning_effort=None,
             max_tokens=256,
             temperature=0.0,
         )
@@ -357,31 +360,25 @@ def _route_with_tools(
         logger.warning("agent tool route failed", exc_info=True)
         return None
 
-    tool_calls = openrouter_ai.tool_calls(resp)
+    message = resp.choices[0].message
+    tool_calls = getattr(message, "tool_calls", None) or []
     if not tool_calls:
-        content = openrouter_ai.message_text(resp)
+        content = (getattr(message, "content", None) or "").strip()
         if content:
             return AgentResult(
                 route="converse",
                 reply=content,
                 language=language,
-                model_used=openrouter_ai.chat_model(),
+                model_used="sarvam-105b",
                 tools_used=["chat_direct"],
                 spoken_parts=_split_spoken_parts(content),
             )
         return None
 
     call0 = tool_calls[0]
-    # OpenAI-compatible shape: function.name / function.arguments
-    fn = call0.get("function") if isinstance(call0, dict) else getattr(call0, "function", None)
-    if isinstance(fn, dict):
-        name = fn.get("name") or ""
-        raw_args = fn.get("arguments") or "{}"
-    else:
-        name = getattr(fn, "name", "") or ""
-        raw_args = getattr(fn, "arguments", None) or "{}"
+    name = call0.function.name
     try:
-        args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+        args = json.loads(call0.function.arguments or "{}")
     except json.JSONDecodeError:
         args = {}
 
@@ -483,15 +480,15 @@ def _route_with_tools(
                 intent=intent,
                 open_camera=True,
                 continue_listening=False,
-                    model_used=openrouter_ai.chat_model(),
-                    tools_used=[name],
-                )
+                model_used="sarvam-105b",
+                tools_used=[name],
+            )
         return AgentResult(
             route="converse",
             reply=reply,
             language=language,
             intent=intent,
-            model_used=openrouter_ai.chat_model(),
+            model_used="sarvam-105b",
             tools_used=[name],
             spoken_parts=_split_spoken_parts(reply),
         )
@@ -625,7 +622,7 @@ def run_agent_turn(
             intent=intent,
             open_camera=True,
             continue_listening=False,
-            model_used="openrouter",
+            model_used="sarvam-105b",
             spoken_parts=[cam],
         )
     return AgentResult(
@@ -633,7 +630,7 @@ def run_agent_turn(
         reply=reply,
         language=reply_language,
         intent=intent,
-        model_used="openrouter",
+        model_used="sarvam-105b",
         spoken_parts=_split_spoken_parts(reply),
     )
 
@@ -644,12 +641,34 @@ def synthesize_turn_audio(
     pace: float = 1.0,
     cancelled: Callable[[], bool] | None = None,
 ) -> tuple[bytes, list[bytes]]:
-    """Return (combined_mp3, [combined_mp3]). One Fish TTS call — MP3, not WAV."""
-    if cancelled and cancelled():
-        return b"", []
+    """Return (combined_wav, per_sentence_wavs). Stops early if cancelled()."""
     parts = result.spoken_parts or _split_spoken_parts(result.reply, result.max_spoken)
-    spoken = " ".join(p.strip() for p in parts if p.strip())
-    if not spoken:
+    if not parts:
+        parts = [sarvam.spoken_text(result.reply, result.max_spoken) or result.reply]
+    wavs: list[bytes] = []
+    for part in parts:
+        if cancelled and cancelled():
+            break
+        if not part.strip():
+            continue
+        wavs.append(sarvam.speak(part, result.language, speaker="shubh", pace=pace))
+    if not wavs:
         spoken = sarvam.spoken_text(result.reply, result.max_spoken) or result.reply or "Okay."
-    audio = sarvam.speak(spoken, result.language, speaker="setu", pace=pace)
-    return audio, [audio]
+        wavs = [sarvam.speak(spoken, result.language, speaker="shubh", pace=pace)]
+    return wavs[0] if len(wavs) == 1 else _concat_wavs(wavs), wavs
+
+
+def _concat_wavs(wavs: list[bytes]) -> bytes:
+    if not wavs:
+        return b""
+    if len(wavs) == 1:
+        return wavs[0]
+    combined = wavs[0]
+    for chunk in wavs[1:]:
+        data_pos = chunk.find(b"data")
+        if data_pos >= 0:
+            combined += chunk[data_pos + 8 :]
+        else:
+            combined += chunk
+    # Best-effort: leave header from first chunk; browsers tolerate approximate sizes for PCM WAV.
+    return combined

@@ -59,11 +59,7 @@ async def voice_socket(websocket: WebSocket):
 
     await _send(websocket, {"type": "ready", "user_id": user_id})
 
-    async def run_turn(
-        audio_b64: str,
-        force_route: str | None = None,
-        client_transcript: str | None = None,
-    ) -> None:
+    async def run_turn(audio_b64: str, force_route: str | None = None) -> None:
         cancel_event.clear()
         t0 = time.perf_counter()
         try:
@@ -73,41 +69,27 @@ async def voice_socket(websocket: WebSocket):
             return
 
         try:
-            audio = base64.b64decode(audio_b64) if audio_b64 else b""
+            audio = base64.b64decode(audio_b64)
         except Exception:
             await _send(websocket, {"type": "error", "message": "Invalid audio payload"})
             return
-        if audio:
-            try:
-                rate_limit.enforce_size(audio, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
-            except Exception as exc:
-                await _send(websocket, {"type": "error", "message": str(getattr(exc, "detail", exc))})
-                return
+        if not audio:
+            await _send(websocket, {"type": "error", "message": "Empty audio"})
+            return
+        try:
+            rate_limit.enforce_size(audio, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
+        except Exception as exc:
+            await _send(websocket, {"type": "error", "message": str(getattr(exc, "detail", exc))})
+            return
 
         await _send(websocket, {"type": "status", "stage": "stt", "text": "Hearing you"})
 
-        stt: dict[str, Any] = {
-            "transcript": (client_transcript or "").strip(),
-            "language_code": session.get("language") or "en",
-        }
-        if stt["transcript"]:
-            logger.info("[ws] using browser transcript chars=%s", len(stt["transcript"]))
-        else:
-            if not audio:
-                await _send(websocket, {"type": "error", "message": "Empty audio"})
-                return
-            try:
-                stt = await asyncio.to_thread(sarvam.listen, audio, "setu-question.wav", None)
-            except Exception as exc:
-                logger.exception("ws STT failed")
-                await _send(
-                    websocket,
-                    {
-                        "type": "error",
-                        "message": f"STT failed: {exc}. Use Chrome speech, or add OpenRouter credits.",
-                    },
-                )
-                return
+        try:
+            stt = await asyncio.to_thread(sarvam.listen, audio, "setu-question.wav", None)
+        except Exception as exc:
+            logger.exception("ws STT failed")
+            await _send(websocket, {"type": "error", "message": f"STT failed: {exc}"})
+            return
 
         if cancel_event.is_set():
             await _send(websocket, {"type": "cancelled"})
@@ -182,7 +164,7 @@ async def voice_socket(websocket: WebSocket):
                     sarvam.speak,
                     part,
                     result.language,
-                    "setu",
+                    "shubh",
                     float(session.get("pace") or 1.0),
                 )
             except Exception as exc:
@@ -196,7 +178,7 @@ async def voice_socket(websocket: WebSocket):
                 {
                     "type": "audio",
                     "audio_base64": b64,
-                    "audio_mime": "audio/mpeg",
+                    "audio_mime": "audio/wav",
                     "index": index,
                     "text": part,
                     "final": index == len(parts) - 1,
@@ -223,7 +205,7 @@ async def voice_socket(websocket: WebSocket):
                 "ask": result.ask,
                 "tools_used": result.tools_used,
                 "audio_base64": combined_b64,
-                "audio_mime": "audio/mpeg",
+                "audio_mime": "audio/wav",
                 "audio_parts": len(audio_chunks),
                 "elapsed_ms": int((time.perf_counter() - t0) * 1000),
             },
@@ -272,11 +254,7 @@ async def voice_socket(websocket: WebSocket):
                     # Wait briefly for prior turn to notice cancel.
                     await asyncio.sleep(0.05)
                 async with turn_lock:
-                    await run_turn(
-                        msg.get("audio_base64") or "",
-                        force_route=msg.get("force_route"),
-                        client_transcript=msg.get("transcript"),
-                    )
+                    await run_turn(msg.get("audio_base64") or "", force_route=msg.get("force_route"))
                 continue
             await _send(websocket, {"type": "error", "message": f"Unknown message type: {msg_type}"})
     except WebSocketDisconnect:
