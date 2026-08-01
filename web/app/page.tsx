@@ -15,6 +15,10 @@ import {
   setAudioSessionLogger,
 } from "@/lib/audio/audio-session";
 import {
+  createListeningDeadMicWatchdog,
+  logMicSessionStreamState,
+  OPENING_STUCK_MS,
+  setMicOpenStuckRetry,
   setMicSessionAudioSession,
   setMicSessionLogger,
 } from "@/lib/audio/mic-session";
@@ -1091,7 +1095,9 @@ export default function Home() {
   const orbStateRef = useRef<OrbState>("idle");
   const isRecordingFlagRef = useRef(false);
   const earlyReopenUsedRef = useRef(false);
-  const micOpeningRef = useRef(false);
+  const utteranceWindowStartedRef = useRef(false);
+  const listeningWatchdogRef = useRef<{ clear: () => void } | null>(null);
+  const deadMicRecoveryUsedRef = useRef(false);
   const previewCacheRef = useRef(new Map<string, string>());
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [sampleNames, setSampleNames] = useState<Record<string, string>>({});
@@ -1298,7 +1304,10 @@ export default function Home() {
     setIsRecording(false);
     setMicLevel(0);
     earlyReopenUsedRef.current = false;
-    micOpeningRef.current = false;
+    deadMicRecoveryUsedRef.current = false;
+    utteranceWindowStartedRef.current = false;
+    listeningWatchdogRef.current?.clear();
+    listeningWatchdogRef.current = null;
     const session = makeSession("en");
     setSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
@@ -1333,7 +1342,10 @@ export default function Home() {
     setIsRecording(false);
     setMicLevel(0);
     earlyReopenUsedRef.current = false;
-    micOpeningRef.current = false;
+    deadMicRecoveryUsedRef.current = false;
+    utteranceWindowStartedRef.current = false;
+    listeningWatchdogRef.current?.clear();
+    listeningWatchdogRef.current = null;
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id;
     setDocId(session.docId);
@@ -1397,6 +1409,40 @@ export default function Home() {
     return result;
   }, []);
 
+  const armListeningDeadMicWatchdog = useCallback((turn: number) => {
+    const loop = voiceLoopRef.current;
+    listeningWatchdogRef.current?.clear();
+    listeningWatchdogRef.current = createListeningDeadMicWatchdog({
+      turnId: turn,
+      hasUtteranceWindowStarted: () => utteranceWindowStartedRef.current,
+      onDead: () => {
+        if (deadMicRecoveryUsedRef.current) {
+          loop.transition("idle", "listening_dead_mic");
+          orbStateRef.current = "idle";
+          setOrbState("idle");
+          setIsRecording(false);
+          setStatusText("Tap to speak");
+          return;
+        }
+        deadMicRecoveryUsedRef.current = true;
+        voiceClientLog("listening_dead_mic_recovery", { turn_id: turn });
+        startRecordingRef.current?.({ force: true });
+        // Re-arm once: if recovery also fails to start utterance window, drop to idle.
+        listeningWatchdogRef.current = createListeningDeadMicWatchdog({
+          turnId: turn,
+          hasUtteranceWindowStarted: () => utteranceWindowStartedRef.current,
+          onDead: () => {
+            loop.transition("idle", "listening_dead_mic");
+            orbStateRef.current = "idle";
+            setOrbState("idle");
+            setIsRecording(false);
+            setStatusText("Tap to speak");
+          },
+        });
+      },
+    });
+  }, []);
+
   const resumeListening = useCallback((fromTurnId?: number) => {
     const loop = voiceLoopRef.current;
     const turn = fromTurnId ?? speakTurnIdRef.current;
@@ -1404,13 +1450,18 @@ export default function Home() {
     const gate = loop.tryResumeListening(turn);
     if (!gate.ok) return;
     audioRef.current = null;
+    utteranceWindowStartedRef.current = false;
+    deadMicRecoveryUsedRef.current = false;
     orbStateRef.current = "listening";
     setOrbState("listening");
     setStatusText("Listening…");
+    logMicSessionStreamState("auto_relisten");
+    armListeningDeadMicWatchdog(turn);
+
     window.setTimeout(() => {
       startRecordingRef.current?.({ force: true });
     }, POST_TTS_RESUME_MS);
-  }, []);
+  }, [armListeningDeadMicWatchdog]);
 
   const playSpeech = useCallback(async (
     text: string,
@@ -2172,11 +2223,6 @@ export default function Home() {
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     const loop = voiceLoopRef.current;
     if (isRecordingFlagRef.current) { void finishRecording(); return; }
-    // Prevent overlapping getUserMedia / VAD starts while a prior open is in flight.
-    if (micOpeningRef.current) {
-      voiceClientLog("mic_open_blocked", { reason: "opening_in_flight", force: Boolean(options?.force) });
-      return;
-    }
 
     const block = micOpenBlockReason({
       voiceState: loop.state,
@@ -2200,7 +2246,8 @@ export default function Home() {
     audioRef.current?.pause();
     audioRef.current = null;
     const openTurnId = speakTurnIdRef.current || loop.beginTurn();
-    micOpeningRef.current = true;
+    // opening_in_flight is owned by ensureMicSession (GUM only; attach never sets it).
+    logMicSessionStreamState(hasStarted ? `start_recording_${openTurnId}` : "session_start");
     try {
       const recorder = await startVoiceRecorder(
         {
@@ -2226,8 +2273,18 @@ export default function Home() {
       const gated = loop.noteMicOpen(openTurnId);
       if (!gated.ok) {
         stopRecorderTurn(recorder, { reason: "gate_rejected", releaseStream: false });
+        if (loop.state === "listening") {
+          loop.transition("idle", "gate_rejected");
+          orbStateRef.current = "idle";
+          setOrbState("idle");
+          setStatusText("Tap to speak");
+        }
         return;
       }
+      // utterance_window_start is emitted inside startVoiceRecorder on success.
+      utteranceWindowStartedRef.current = true;
+      listeningWatchdogRef.current?.clear();
+      listeningWatchdogRef.current = null;
       recorderRef.current = recorder;
       browserSttRef.current?.abort();
       browserSttRef.current = null;
@@ -2244,23 +2301,33 @@ export default function Home() {
       setOrbState("listening");
       setStatusText("Listening…");
       setAutoStopProgress(0);
-      // Max/no-speech timers live inside the recorder (armed at mic_stream_ready).
     } catch (error) {
       console.error("[Setu mic] start failed", error);
+      const message = error instanceof Error ? error.message : "";
+      if (message === "opening_in_flight") {
+        voiceClientLog("mic_open_blocked", { reason: "opening_in_flight", force: Boolean(options?.force) });
+        // Stuck timer (3s) clears the flag and invokes setMicOpenStuckRetry once.
+        window.setTimeout(() => {
+          startRecordingRef.current?.({ force: true });
+        }, OPENING_STUCK_MS + 50);
+        return;
+      }
       isRecordingFlagRef.current = false;
       loop.transition("idle", "mic_start_failed");
       orbStateRef.current = "idle";
       setOrbState("idle");
       setIsRecording(false);
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
-    } finally {
-      micOpeningRef.current = false;
     }
-  }, [finishRecording]);
+  }, [finishRecording, hasStarted]);
 
 
   useEffect(() => {
     startRecordingRef.current = (options?: { force?: boolean }) => void startRecording(options);
+    setMicOpenStuckRetry(() => {
+      startRecordingRef.current?.({ force: true });
+    });
+    return () => setMicOpenStuckRetry(null);
   }, [startRecording]);
 
   const beginOrStop = async () => {
@@ -2389,7 +2456,6 @@ export default function Home() {
       stopRecorderTurn(recorderRef.current, { reason: "page_unload", releaseStream: false });
       recorderRef.current = null;
       isRecordingFlagRef.current = false;
-      micOpeningRef.current = false;
       const monitor = bargeInRef.current;
       bargeInRef.current = null;
       monitor?.stop();

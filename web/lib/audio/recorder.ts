@@ -97,7 +97,9 @@ export async function startVoiceRecorder(
   options?: { turnId?: number },
 ): Promise<RecorderSession> {
   const turnId = options?.turnId ?? 0;
-  const { stream, context, acquireMs, reused, constraintsPath } = await ensureMicSession();
+  const { stream, context, acquireMs, reused, constraintsPath } = await ensureMicSession({
+    turnId,
+  });
   await ensureWorklet(context);
 
   const source = context.createMediaStreamSource(stream);
