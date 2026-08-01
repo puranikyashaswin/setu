@@ -33,6 +33,12 @@ import {
   type PlaybackHandles,
   type PlaybackOutcome,
 } from "@/lib/audio/playback";
+import {
+  installSharedAudioUnlockListener,
+  pauseSharedAudioElement,
+  setSharedAudioLogger,
+  unlockSharedAudioElement,
+} from "@/lib/audio/shared-audio-element";
 import { browserSttSupported, startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
 import { createVoiceLoop } from "@/lib/voice-loop";
 import {
@@ -53,6 +59,7 @@ setAudioSessionLogger(voiceClientLog);
 setMicSessionLogger(voiceClientLog);
 setMicSessionAudioSession(setAudioSession);
 setPlaybackLogger(voiceClientLog);
+setSharedAudioLogger(voiceClientLog);
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
 import { SetuOrb } from "@/components/SetuOrb";
 import type {
@@ -1089,9 +1096,8 @@ export default function Home() {
     bargeInRef.current = null;
     monitor?.stop();
   };
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const voiceSessionRef = useRef(getVoiceSession());
   const startRecordingRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
+  const voiceSessionRef = useRef(getVoiceSession());
   const orbStateRef = useRef<OrbState>("idle");
   const isRecordingFlagRef = useRef(false);
   const earlyReopenUsedRef = useRef(false);
@@ -1294,7 +1300,7 @@ export default function Home() {
   }, []);
 
   const startNewChat = useCallback(() => {
-    audioRef.current?.pause();
+    pauseSharedAudioElement();
     stopBargeIn();
     playbackRef.current?.stop();
     playbackRef.current = null;
@@ -1334,7 +1340,7 @@ export default function Home() {
   const loadSession = useCallback((id: string) => {
     const session = sessionsRef.current.find((item) => item.id === id);
     if (!session) return;
-    audioRef.current?.pause();
+    pauseSharedAudioElement();
     stopBargeIn();
     playbackRef.current?.stop();
     playbackRef.current = null;
@@ -1455,7 +1461,6 @@ export default function Home() {
     voiceClientLog("auto_relisten_fired", { turn_id: turn });
     const gate = loop.tryResumeListening(turn);
     if (!gate.ok) return;
-    audioRef.current = null;
     utteranceWindowStartedRef.current = false;
     deadMicRecoveryUsedRef.current = false;
     orbStateRef.current = "listening";
@@ -1491,9 +1496,7 @@ export default function Home() {
       stopAllPlayback("cancelled");
     }
     stopNonTtsAudio("play_speech_start");
-    audioRef.current?.pause();
-    audioRef.current = null;
-
+    pauseSharedAudioElement();
     const loop = voiceLoopRef.current;
     const playTurnId = loop.beginTurn();
     speakTurnIdRef.current = playTurnId;
@@ -1575,7 +1578,6 @@ export default function Home() {
           setPreviewingVoice(null);
           setService(null);
           playbackRef.current = null;
-          audioRef.current = null;
         };
 
         const handleSettled = (outcome: PlaybackOutcome) => {
@@ -2258,8 +2260,7 @@ export default function Home() {
       recorderRef.current = null;
       isRecordingFlagRef.current = false;
     }
-    audioRef.current?.pause();
-    audioRef.current = null;
+    pauseSharedAudioElement();
     const openTurnId = speakTurnIdRef.current || loop.beginTurn();
     // opening_in_flight is owned by ensureMicSession (GUM only; attach never sets it).
     logMicSessionStreamState(hasStarted ? `start_recording_${openTurnId}` : "session_start");
@@ -2338,6 +2339,10 @@ export default function Home() {
 
 
   useEffect(() => {
+    return installSharedAudioUnlockListener();
+  }, []);
+
+  useEffect(() => {
     startRecordingRef.current = (options?: { force?: boolean }) => void startRecording(options);
     setMicOpenStuckRetry(() => {
       startRecordingRef.current?.({ force: true });
@@ -2346,13 +2351,13 @@ export default function Home() {
   }, [startRecording]);
 
   const beginOrStop = async () => {
+    unlockSharedAudioElement();
     if (isRecording) { void finishRecording(true, { reason: "user_stop" }); return; }
     if (orbState === "speaking" || voiceLoopRef.current.state === "speaking") {
       // Explicit user stop — settle once as cancelled (no auto-relisten).
       playbackRef.current?.stop("cancelled");
       playbackRef.current = null;
-      audioRef.current?.pause();
-      audioRef.current = null;
+      pauseSharedAudioElement();
       return;
     }
     setViewMode("voice");
@@ -2381,7 +2386,7 @@ export default function Home() {
   };
 
   const selectVoice = async (voice: string) => {
-    audioRef.current?.pause();
+    pauseSharedAudioElement();
     setSpeaker(voice);
     setPreviewingVoice(voice);
     const samples: Record<Language, string> = { te: "నమస్కారం, నేను సేతు", hi: "नमस्ते, मैं सेतु हूँ", en: "Hello, I am Setu", mr: "नमस्कार, मी सेतू आहे", ta: "வணக்கம், நான் சேது", kn: "ನಮಸ್ಕಾರ, ನಾನು ಸೇತು", bn: "নমস্কার, আমি সেতু", gu: "નમસ્તે, હું સેતુ છું", ml: "നമസ്കാരം, ഞാൻ സേതു", pa: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ, ਮੈਂ ਸੇਤੂ ਹਾਂ", or: "ନମସ୍କାର, ମୁଁ ସେତୁ" };
@@ -2477,8 +2482,7 @@ export default function Home() {
       playbackRef.current?.stop("cancelled");
       playbackRef.current = null;
       stopAllPlayback("cancelled");
-      audioRef.current?.pause();
-      audioRef.current = null;
+      pauseSharedAudioElement();
       releaseMicSession();
     };
     const onPageHide = () => releaseAudioSession();

@@ -52,8 +52,50 @@ describe("html_audio TTS route", () => {
     assert.equal(src.includes("createGain"), false);
     assert.equal(src.includes("decodeAudioData"), false);
     assert.equal(src.includes("shared_context"), false);
-    assert.ok(src.includes("HTMLAudioElement") || src.includes("new Audio"));
+    assert.ok(src.includes("ensureSharedAudioElement"));
+    assert.equal(src.includes("new Audio()"), false);
     assert.ok(src.includes("tts_route=html_audio") || src.includes('TTS_ROUTE = "html_audio"'));
+  });
+
+  it("reuses the same HTMLAudioElement across sequential turns", async () => {
+    const playCounts: number[] = [];
+    let audioConstructCount = 0;
+    const OriginalAudio = globalThis.Audio;
+    (globalThis as unknown as { Audio: unknown }).Audio = class {
+      volume = 1;
+      src = "";
+      currentTime = 0;
+      preload = "";
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        audioConstructCount += 1;
+      }
+      play() {
+        playCounts.push(1);
+        queueMicrotask(() => this.onended?.());
+        return Promise.resolve();
+      }
+      pause() {}
+      load() {}
+      removeAttribute() {}
+    };
+
+    try {
+      for (const turn of [1, 2]) {
+        await new Promise<void>((resolve) => {
+          void playDecodedBuffersSequential({
+            arrayBuffers: [new ArrayBuffer(8)],
+            turnId: turn,
+            onSettled: () => resolve(),
+          });
+        });
+      }
+      assert.equal(playCounts.length, 2);
+      assert.equal(audioConstructCount, 1);
+    } finally {
+      (globalThis as unknown as { Audio: unknown }).Audio = OriginalAudio;
+    }
   });
 
   it("play() failure finalizes outcome=error and leaves speaking state", async () => {
@@ -140,7 +182,9 @@ describe("mic VAD pause while HTMLAudio plays", () => {
     assert.equal(playbackSrc.includes("createBufferSource"), false);
     assert.equal(playbackSrc.includes("createGain"), false);
     assert.equal(playbackSrc.includes("decodeAudioData"), false);
-    assert.ok(playbackSrc.includes("new Audio") || playbackSrc.includes("HTMLAudioElement"));
+    assert.ok(playbackSrc.includes("ensureSharedAudioElement"));
+    assert.equal(playbackSrc.includes("new Audio()"), false);
+    assert.ok(playbackSrc.includes("audio_element_reused"));
     const pageSrc = readFileSync(join(webRoot, "app/page.tsx"), "utf8");
     assert.ok(pageSrc.includes("prepareAssistantPlayback"));
     assert.ok(pageSrc.includes("stopActiveRecording(\"prepare_tts\")") || pageSrc.includes('stopActiveRecording("prepare_tts")'));

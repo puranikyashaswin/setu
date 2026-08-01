@@ -5,6 +5,11 @@
 
 import { createPlaybackQueue, type PlaybackQueue } from "./playback-queue";
 import {
+  ensureSharedAudioElement,
+  __resetSharedAudioForTests,
+  pauseSharedAudioElement,
+} from "./shared-audio-element";
+import {
   beginAssistantTts,
   endAssistantTts,
   finalizePlayback,
@@ -48,7 +53,6 @@ export type PlayElementOptions = {
 };
 
 type ActiveElement = {
-  audio: HTMLAudioElement;
   url: string;
   raf: number;
   healthTimer: ReturnType<typeof setInterval> | 0;
@@ -97,15 +101,7 @@ function stopActiveElement(): void {
   current.stopped = true;
   cancelAnimationFrame(current.raf);
   if (current.healthTimer) globalThis.clearInterval(current.healthTimer);
-  try {
-    current.audio.onended = null;
-    current.audio.onerror = null;
-    current.audio.pause();
-    current.audio.removeAttribute("src");
-    current.audio.load();
-  } catch {
-    /* ignore */
-  }
+  pauseSharedAudioElement();
   try {
     URL.revokeObjectURL(current.url);
   } catch {
@@ -190,13 +186,17 @@ async function playOnePart(
 
     const blob = new Blob([arrayBuffer], { type: "audio/wav" });
     const url = URL.createObjectURL(blob);
-    const audio = new Audio();
+    const audio = ensureSharedAudioElement();
+    audio.onended = null;
+    audio.onerror = null;
     audio.preload = "auto";
     audio.volume = 1;
     audio.src = url;
 
+    console.info(`[audio] audio_element_reused=true turn_id=${turnId}`);
+    voiceClientLog("audio_element_reused", { turn_id: turnId, value: true });
+
     const session: ActiveElement = {
-      audio,
       url,
       raf: 0,
       healthTimer: 0,
@@ -227,6 +227,15 @@ async function playOnePart(
       if (session.healthTimer) globalThis.clearInterval(session.healthTimer);
       if (activeElement === session) activeElement = null;
       try {
+        audio.onended = null;
+        audio.onerror = null;
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      } catch {
+        /* ignore */
+      }
+      try {
         URL.revokeObjectURL(url);
       } catch {
         /* ignore */
@@ -245,6 +254,15 @@ async function playOnePart(
       if (activeElement === session) activeElement = null;
       console.info(`[audio] audio_play_error=${message} turn_id=${turnId}`);
       voiceClientLog("audio_play_error", { turn_id: turnId, message, tts_route: TTS_ROUTE });
+      try {
+        audio.onended = null;
+        audio.onerror = null;
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      } catch {
+        /* ignore */
+      }
       try {
         URL.revokeObjectURL(url);
       } catch {
@@ -430,6 +448,7 @@ export function __resetPlaybackForTests(): void {
   activeObjectUrls = [];
   turnCounter = 0;
   endAssistantTts();
+  __resetSharedAudioForTests();
 }
 
 export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, isAssistantSpeaking } from "./audio-owner";
