@@ -1082,6 +1082,7 @@ export default function Home() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraReadiness, setCameraReadiness] = useState(0);
   const recorderRef = useRef<RecorderSession | null>(null);
+  const startingTurnRef = useRef<number | null>(null);
   const browserSttRef = useRef<BrowserSttSession | null>(null);
   const playbackRef = useRef<PlaybackHandles | null>(null);
   const bargeInRef = useRef<BargeInMonitor | null>(null);
@@ -2015,6 +2016,10 @@ export default function Home() {
       setStatusText("Tap to continue");
       return;
     }
+    // Endpoint fired → leave "Listening…" immediately, before any STT round-trip.
+    voiceLoopRef.current.transition("thinking", "utterance_submitted");
+    orbStateRef.current = "processing";
+    setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     // Browser STT is optional early feedback; failures must not block server Saaras.
     let browserTranscript = "";
     if (sttSession) {
@@ -2036,8 +2041,6 @@ export default function Home() {
       // Display-only; the turn uses server STT transcript from the response.
       setTranscript(browserTranscript);
     }
-    voiceLoopRef.current.transition("thinking", "utterance_submitted");
-    setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     turnTimingRef.current = emptyTurnTiming();
     try {
       const wav = recorderToWav(recorder);
@@ -2255,13 +2258,23 @@ export default function Home() {
       return;
     }
 
+    const openTurnId = speakTurnIdRef.current || loop.beginTurn();
+    // Single-flight: one recorder + one endpoint timer per turn_id.
+    if (
+      startingTurnRef.current === openTurnId
+      || (recorderRef.current && recorderRef.current.turnId === openTurnId && !recorderRef.current.detached)
+    ) {
+      voiceClientLog("mic_open_skipped", { reason: "turn_already_active", turn_id: openTurnId });
+      console.info(`[audio] mic_open_skipped reason=turn_already_active turn_id=${openTurnId}`);
+      return;
+    }
+    startingTurnRef.current = openTurnId;
     if (recorderRef.current) {
       stopRecorderTurn(recorderRef.current, { reason: "replace_turn", releaseStream: false });
       recorderRef.current = null;
       isRecordingFlagRef.current = false;
     }
     pauseSharedAudioElement();
-    const openTurnId = speakTurnIdRef.current || loop.beginTurn();
     // opening_in_flight is owned by ensureMicSession (GUM only; attach never sets it).
     logMicSessionStreamState(hasStarted ? `start_recording_${openTurnId}` : "session_start");
     try {
@@ -2275,7 +2288,11 @@ export default function Home() {
           },
           onAutoStopProgress: setAutoStopProgress,
           onFinish: (cancelled, meta) => {
-            if (recorderRef.current) void finishRecording(cancelled, meta);
+            if (recorderRef.current && recorderRef.current.turnId === openTurnId) {
+              void finishRecording(cancelled, meta);
+            } else {
+              voiceClientLog("recorder_lifecycle", { event: "stale_ignored", turn_id: openTurnId, reason: meta?.reason });
+            }
           },
           onWatchdog: (message) => {
             setStatusText(message);
@@ -2288,6 +2305,7 @@ export default function Home() {
       );
       const gated = loop.noteMicOpen(openTurnId);
       if (!gated.ok) {
+        startingTurnRef.current = null;
         stopRecorderTurn(recorder, { reason: "gate_rejected", releaseStream: false });
         if (loop.state === "listening") {
           loop.transition("idle", "gate_rejected");
@@ -2317,9 +2335,15 @@ export default function Home() {
       setOrbState("listening");
       setStatusText("Listening…");
       setAutoStopProgress(0);
+      startingTurnRef.current = null;
     } catch (error) {
+      startingTurnRef.current = null;
       console.error("[Setu mic] start failed", error);
       const message = error instanceof Error ? error.message : "";
+      if (message === "turn_already_active") {
+        voiceClientLog("mic_open_skipped", { reason: "turn_already_active", turn_id: openTurnId });
+        return;
+      }
       if (message === "opening_in_flight") {
         voiceClientLog("mic_open_blocked", { reason: "opening_in_flight", force: Boolean(options?.force) });
         // Stuck timer (3s) clears the flag and invokes setMicOpenStuckRetry once.
