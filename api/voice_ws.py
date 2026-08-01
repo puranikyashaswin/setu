@@ -7,6 +7,8 @@ import base64
 import json
 import logging
 import time
+import uuid
+from collections import deque
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -19,6 +21,46 @@ import sarvam
 logger = logging.getLogger("setu")
 
 router = APIRouter()
+
+# Ring buffer of recent WS voice events for GET /debug/last-turn.
+_VOICE_EVENTS: deque[dict[str, Any]] = deque(maxlen=50)
+_LAST_VOICE_SESSION: str | None = None
+
+
+def voice_log(session_id: str | None, event: str, **fields: Any) -> None:
+    """One-line [voice] stage log + ring buffer (logging only; never raises)."""
+    global _LAST_VOICE_SESSION
+    sid = str(session_id or "-")[:64] or "-"
+    _LAST_VOICE_SESSION = sid
+    parts = [f"[voice] session={sid} event={event}"]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            safe = value.replace("\n", " ").replace('"', "'")
+            if len(safe) > 120:
+                safe = safe[:117] + "..."
+            parts.append(f'{key}="{safe}"' if (" " in safe or not safe) else f"{key}={safe}")
+        else:
+            parts.append(f"{key}={value}")
+    logger.info("%s", " ".join(parts))
+    entry = {"ts_ms": int(time.time() * 1000), "session_id": sid, "event": event}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and len(value) > 200:
+            entry[key] = value[:197] + "..."
+        else:
+            entry[key] = value
+    _VOICE_EVENTS.append(entry)
+
+
+def get_voice_events() -> list[dict[str, Any]]:
+    return list(_VOICE_EVENTS)
+
+
+def last_voice_session_id() -> str | None:
+    return _LAST_VOICE_SESSION
 
 
 def _ws_url_user(websocket: WebSocket) -> str | None:
@@ -44,6 +86,7 @@ async def voice_socket(websocket: WebSocket):
         return
 
     await websocket.accept()
+    conn_id = uuid.uuid4().hex[:12]
     session: dict[str, Any] = {
         "language": "en",
         "has_document": False,
@@ -57,59 +100,81 @@ async def voice_socket(websocket: WebSocket):
     cancel_event = asyncio.Event()
     turn_lock = asyncio.Lock()
 
+    def sid() -> str:
+        return str(session.get("session_id") or conn_id)
+
+    voice_log(sid(), "ws_connect")
     await _send(websocket, {"type": "ready", "user_id": user_id})
 
     async def run_turn(audio_b64: str, force_route: str | None = None) -> None:
         cancel_event.clear()
         t0 = time.perf_counter()
+        stage = "stt"
         try:
             rate_limit.check_rate_limit(user_id, bucket="ai", limit=45, window_s=60.0)
         except Exception as exc:
+            voice_log(sid(), "error", stage=stage, detail=str(getattr(exc, "detail", exc)))
             await _send(websocket, {"type": "error", "message": str(getattr(exc, "detail", exc))})
             return
 
         try:
             audio = base64.b64decode(audio_b64)
         except Exception:
+            voice_log(sid(), "error", stage=stage, detail="Invalid audio payload")
             await _send(websocket, {"type": "error", "message": "Invalid audio payload"})
             return
         if not audio:
+            voice_log(sid(), "error", stage=stage, detail="Empty audio")
             await _send(websocket, {"type": "error", "message": "Empty audio"})
             return
         try:
             rate_limit.enforce_size(audio, max_bytes=rate_limit.MAX_AUDIO_BYTES, label="audio")
         except Exception as exc:
+            voice_log(sid(), "error", stage=stage, detail=str(getattr(exc, "detail", exc)))
             await _send(websocket, {"type": "error", "message": str(getattr(exc, "detail", exc))})
             return
 
         await _send(websocket, {"type": "status", "stage": "stt", "text": "Hearing you"})
+        voice_log(sid(), "stt_start", source="server")
+        t_stt = time.perf_counter()
 
         try:
             stt = await asyncio.to_thread(sarvam.listen, audio, "setu-question.wav", None)
         except Exception as exc:
             logger.exception("ws STT failed")
+            voice_log(sid(), "error", stage="stt", detail=str(exc))
             await _send(websocket, {"type": "error", "message": f"STT failed: {exc}"})
             return
 
         if cancel_event.is_set():
+            voice_log(sid(), "barge_in_fired")
             await _send(websocket, {"type": "cancelled"})
             return
 
         transcript = (stt.get("transcript") or "").strip()
+        language_code = stt.get("language_code") or ""
+        voice_log(
+            sid(),
+            "stt_done",
+            ms=int((time.perf_counter() - t_stt) * 1000),
+            text=transcript,
+            language=language_code or session.get("language") or "",
+        )
         await _send(
             websocket,
             {
                 "type": "transcript",
                 "text": transcript,
-                "language_code": stt.get("language_code") or "",
+                "language_code": language_code,
             },
         )
         if not transcript:
+            voice_log(sid(), "error", stage="stt", detail="empty transcript")
             await _send(websocket, {"type": "error", "message": "I could not understand that. Try again."})
             return
 
         await _send(websocket, {"type": "status", "stage": "think", "text": "Thinking"})
-
+        stage = "route"
         memory = (session.get("memory") or "").strip() or None
         try:
             result = await asyncio.to_thread(
@@ -120,17 +185,19 @@ async def voice_socket(websocket: WebSocket):
                 doc_id=session.get("doc_id"),
                 history=session.get("history") or [],
                 memory=memory,
-                session_id=session.get("session_id"),
+                session_id=session.get("session_id") or sid(),
                 onboarded=bool(session.get("onboarded")),
                 force_route=force_route,
                 use_tools=True,
             )
         except Exception as exc:
             logger.exception("ws agent failed")
+            voice_log(sid(), "error", stage="route", detail=str(exc))
             await _send(websocket, {"type": "error", "message": f"Agent failed: {exc}"})
             return
 
         if cancel_event.is_set():
+            voice_log(sid(), "barge_in_fired")
             await _send(websocket, {"type": "cancelled"})
             return
 
@@ -151,10 +218,15 @@ async def voice_socket(websocket: WebSocket):
             },
         )
 
+        stage = "tts"
         parts = result.spoken_parts or [sarvam.spoken_text(result.reply, result.max_spoken) or result.reply]
+        voice_log(sid(), "tts_start")
+        t_tts = time.perf_counter()
         audio_chunks: list[str] = []
+        part_index = 0
         for index, part in enumerate(parts):
             if cancel_event.is_set():
+                voice_log(sid(), "barge_in_fired")
                 await _send(websocket, {"type": "cancelled"})
                 return
             if not (part or "").strip():
@@ -169,10 +241,13 @@ async def voice_socket(websocket: WebSocket):
                 )
             except Exception as exc:
                 logger.exception("ws TTS failed")
+                voice_log(sid(), "error", stage="tts", detail=str(exc))
                 await _send(websocket, {"type": "error", "message": f"TTS failed: {exc}"})
                 return
             b64 = base64.b64encode(wav).decode("ascii")
             audio_chunks.append(b64)
+            part_index += 1
+            voice_log(sid(), "audio_part_sent", part=part_index, bytes=len(wav))
             await _send(
                 websocket,
                 {
@@ -184,6 +259,13 @@ async def voice_socket(websocket: WebSocket):
                     "final": index == len(parts) - 1,
                 },
             )
+
+        voice_log(
+            sid(),
+            "tts_done",
+            ms=int((time.perf_counter() - t_tts) * 1000),
+            parts=len(audio_chunks),
+        )
 
         spoken = " ".join(p.strip() for p in parts if p.strip()) or result.reply
         combined_b64 = audio_chunks[0] if len(audio_chunks) == 1 else (audio_chunks[0] if audio_chunks else "")
@@ -217,6 +299,7 @@ async def voice_socket(websocket: WebSocket):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
+                voice_log(sid(), "error", stage="route", detail="Invalid JSON")
                 await _send(websocket, {"type": "error", "message": "Invalid JSON"})
                 continue
             msg_type = msg.get("type")
@@ -225,6 +308,7 @@ async def voice_socket(websocket: WebSocket):
                 continue
             if msg_type == "cancel":
                 cancel_event.set()
+                voice_log(sid(), "barge_in_fired")
                 await _send(websocket, {"type": "cancelled"})
                 continue
             if msg_type == "session.update":
@@ -251,17 +335,23 @@ async def voice_socket(websocket: WebSocket):
             if msg_type == "audio.utterance":
                 if turn_lock.locked():
                     cancel_event.set()
+                    voice_log(sid(), "barge_in_fired")
                     # Wait briefly for prior turn to notice cancel.
                     await asyncio.sleep(0.05)
                 async with turn_lock:
                     await run_turn(msg.get("audio_base64") or "", force_route=msg.get("force_route"))
                 continue
+            voice_log(sid(), "error", stage="route", detail=f"Unknown message type: {msg_type}")
             await _send(websocket, {"type": "error", "message": f"Unknown message type: {msg_type}"})
-    except WebSocketDisconnect:
-        logger.info("voice ws disconnected user=%s", user_id[:8])
-    except Exception:
+    except WebSocketDisconnect as exc:
+        code = getattr(exc, "code", None)
+        reason = getattr(exc, "reason", None) or ""
+        voice_log(sid(), "ws_disconnect", code=code if code is not None else "", reason=str(reason))
+    except Exception as exc:
         logger.exception("voice ws crashed")
+        voice_log(sid(), "error", stage="route", detail=str(exc))
         try:
             await websocket.close(code=1011)
         except Exception:
             pass
+        voice_log(sid(), "ws_disconnect", code=1011, reason="server_error")

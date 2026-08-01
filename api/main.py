@@ -344,8 +344,11 @@ def health():
 
 @app.get("/debug/last-turn")
 def debug_last_turn():
-    """Last request stage timings (foundation for latency work)."""
-    return dict(_LAST_TURN) if _LAST_TURN else {}
+    """Last REST stage timings + last WS voice event ring (up to 50)."""
+    payload = dict(_LAST_TURN) if _LAST_TURN else {}
+    payload["voice_session_id"] = voice_ws.last_voice_session_id()
+    payload["voice_events"] = voice_ws.get_voice_events()
+    return payload
 
 
 @app.get("/warm")

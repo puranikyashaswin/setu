@@ -20,7 +20,7 @@ import {
   type RecorderSession,
 } from "@/lib/audio/recorder";
 import { startBrowserStt, type BrowserSttSession } from "@/lib/audio/browser-stt";
-import { debugLog, isDebugAudio } from "@/lib/debug";
+import { debugLog, isDebugAudio, voiceClientLog } from "@/lib/debug";
 import { getVoiceSession } from "@/lib/voice-session";
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
 import { SetuOrb } from "@/components/SetuOrb";
@@ -1402,6 +1402,7 @@ export default function Home() {
   }, []);
 
   const resumeListening = useCallback(() => {
+    voiceClientLog("auto_relisten_fired");
     orbStateRef.current = "idle";
     setOrbState("idle");
     audioRef.current = null;

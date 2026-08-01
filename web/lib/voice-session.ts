@@ -2,7 +2,9 @@
 
 import { API_URL, type ApiHistoryMessage, type VoiceTurnResponse } from "@/lib/api";
 import { getStoredUserId } from "@/lib/auth";
-import { debugLog } from "@/lib/debug";
+import { debugLog, installDebugHelpers, voiceClientLog } from "@/lib/debug";
+
+installDebugHelpers();
 
 export type VoiceSessionConfig = {
   language: string;
@@ -43,6 +45,8 @@ export class VoiceSession {
   private connecting: Promise<void> | null = null;
   private pending: PendingTurn | null = null;
   private config: VoiceSessionConfig | null = null;
+  private everConnected = false;
+  private connectGeneration = 0;
 
   get isOpen(): boolean {
     return Boolean(this.socket && this.socket.readyState === WebSocket.OPEN && this.ready);
@@ -56,6 +60,11 @@ export class VoiceSession {
     }
     const userId = getStoredUserId();
     if (!userId) return false;
+
+    if (this.everConnected) {
+      this.connectGeneration += 1;
+      voiceClientLog("ws_reconnect_attempt", { attempt: this.connectGeneration });
+    }
 
     this.connecting = new Promise<void>((resolve) => {
       const url = `${wsBaseUrl()}/ws/voice?user_id=${encodeURIComponent(userId)}`;
@@ -72,6 +81,7 @@ export class VoiceSession {
 
       const timer = window.setTimeout(() => {
         debugLog("[voice-session] connect timeout");
+        voiceClientLog("ws_error", { detail: "connect_timeout" });
         try {
           socket.close();
         } catch {
@@ -94,6 +104,8 @@ export class VoiceSession {
         const type = String(msg.type || "");
         if (type === "ready") {
           this.ready = true;
+          this.everConnected = true;
+          voiceClientLog("ws_connect");
           window.clearTimeout(timer);
           finish();
           return;
@@ -103,13 +115,19 @@ export class VoiceSession {
 
       socket.onerror = () => {
         debugLog("[voice-session] error");
+        voiceClientLog("ws_error", { detail: "socket_error" });
         window.clearTimeout(timer);
         this.ready = false;
         finish();
       };
 
-      socket.onclose = () => {
+      socket.onclose = (ev) => {
         debugLog("[voice-session] close");
+        voiceClientLog("ws_error", {
+          detail: "socket_close",
+          code: ev.code,
+          reason: ev.reason || "",
+        });
         window.clearTimeout(timer);
         this.ready = false;
         this.socket = null;
@@ -164,13 +182,22 @@ export class VoiceSession {
       this.pending = null;
     }
 
+    const browserText = transcript?.trim() || "";
+    if (browserText) {
+      voiceClientLog("transcript", {
+        source: "browser-stt",
+        text: browserText.slice(0, 120),
+        chars: browserText.length,
+      });
+    }
+
     return new Promise<VoiceTurnResponse>((resolve, reject) => {
       this.pending = { resolve, reject, parts: [], handlers };
       this.send({
         type: "audio.utterance",
         audio_base64: audioBase64,
         force_route: forceRoute ?? null,
-        transcript: transcript?.trim() || null,
+        transcript: browserText || null,
       });
     });
   }
@@ -201,7 +228,13 @@ export class VoiceSession {
       return;
     }
     if (type === "transcript") {
-      pending.handlers.onTranscript?.(String(msg.text || ""), String(msg.language_code || ""));
+      const text = String(msg.text || "");
+      voiceClientLog("transcript", {
+        source: "server",
+        text: text.slice(0, 120),
+        language: String(msg.language_code || ""),
+      });
+      pending.handlers.onTranscript?.(text, String(msg.language_code || ""));
       return;
     }
     if (type === "tool") {
@@ -211,9 +244,14 @@ export class VoiceSession {
     if (type === "audio") {
       const b64 = String(msg.audio_base64 || "");
       if (b64) pending.parts.push(b64);
+      const index = Number(msg.index || 0);
+      voiceClientLog("audio_part_received", {
+        part: index + 1,
+        bytes: b64 ? Math.floor((b64.length * 3) / 4) : 0,
+      });
       pending.handlers.onAudioPart?.({
         audioBase64: b64,
-        index: Number(msg.index || 0),
+        index,
         text: typeof msg.text === "string" ? msg.text : undefined,
         final: Boolean(msg.final),
       });
@@ -221,6 +259,7 @@ export class VoiceSession {
     }
     if (type === "error") {
       const message = String(msg.message || "Voice turn failed");
+      voiceClientLog("ws_error", { detail: message });
       pending.handlers.onError?.(message);
       this.pending = null;
       pending.reject(new Error(message));

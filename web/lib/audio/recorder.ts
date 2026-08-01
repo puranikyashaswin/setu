@@ -1,4 +1,4 @@
-import { debugLog } from "@/lib/debug";
+import { debugLog, voiceClientLog } from "@/lib/debug";
 import { encodeWav } from "@/lib/audio/wav";
 import { ensureVadWorklet, getVadProcessorName } from "@/lib/audio/worklet-vad";
 
@@ -191,6 +191,7 @@ export async function startVoiceRecorder(
     }
   }, 250);
 
+  voiceClientLog("mic_open", { sampleRate: recorder.sampleRate });
   return recorder;
 }
 

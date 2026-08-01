@@ -1,5 +1,7 @@
 /** Buffer-based TTS playback — avoids iOS MediaElementSource silence bugs. */
 
+import { voiceClientLog } from "@/lib/debug";
+
 export type PlaybackHandles = {
   stop: () => void;
 };
@@ -70,6 +72,7 @@ export async function playDecodedBuffer(options: PlayBufferOptions): Promise<Pla
 
   let raf = 0;
   let stopped = false;
+  let endLogged = false;
   const data = new Uint8Array(analyser.frequencyBinCount);
 
   const animate = () => {
@@ -91,6 +94,12 @@ export async function playDecodedBuffer(options: PlayBufferOptions): Promise<Pla
     raf = requestAnimationFrame(animate);
   };
 
+  const logEnd = () => {
+    if (endLogged) return;
+    endLogged = true;
+    voiceClientLog("playback_end");
+  };
+
   const stop = () => {
     if (stopped) return;
     stopped = true;
@@ -106,6 +115,7 @@ export async function playDecodedBuffer(options: PlayBufferOptions): Promise<Pla
     } catch {
       /* ignore */
     }
+    logEnd();
   };
 
   source.onended = () => {
@@ -113,6 +123,7 @@ export async function playDecodedBuffer(options: PlayBufferOptions): Promise<Pla
     onEnded?.();
   };
 
+  voiceClientLog("playback_start");
   onPlay?.();
   animate();
   source.start(0);

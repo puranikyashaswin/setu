@@ -1,6 +1,6 @@
 /** Browser Web Speech API — free Indic STT (Chrome). OpenRouter Whisper needs credits. */
 
-import { debugLog } from "@/lib/debug";
+import { debugLog, voiceClientLog } from "@/lib/debug";
 import type { Language } from "@/lib/types";
 
 type SpeechRecognitionLike = {
@@ -89,6 +89,7 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
 
   recognition.onerror = (event) => {
     debugLog("[browser-stt] error", event.error);
+    voiceClientLog("ws_error", { detail: `browser_stt:${event.error || "unknown"}` });
   };
 
   recognition.onend = () => {

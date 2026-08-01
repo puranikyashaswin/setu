@@ -1,7 +1,7 @@
 /** Listen while TTS plays — fire when the user starts talking (barge-in). */
 
 import { SPEECH_FRAMES_TO_CONFIRM, SPEECH_LEVEL } from "@/lib/audio/recorder";
-import { debugLog } from "@/lib/debug";
+import { debugLog, voiceClientLog } from "@/lib/debug";
 
 export type BargeInMonitor = {
   stop: () => void;
@@ -59,6 +59,7 @@ export async function startBargeInMonitor(
       loudRun += 1;
       if (loudRun >= CONFIRM_FRAMES) {
         debugLog("[barge-in] detected", { rms: rms.toFixed(4) });
+        voiceClientLog("barge_in_detected", { rms: Number(rms.toFixed(4)) });
         stop();
         onBargeIn();
         return;

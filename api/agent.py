@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +14,29 @@ import sarvam
 from doc_retrieve import retrieve_chunks
 
 logger = logging.getLogger("setu")
+
+
+def _voice_log(session_id: str | None, event: str, **fields: Any) -> None:
+    """Forward to voice_ws ring buffer; never raise (avoids import cycles at module load)."""
+    try:
+        from voice_ws import voice_log
+
+        voice_log(session_id, event, **fields)
+    except Exception:
+        # Fallback so agent logs still appear if WS module is unavailable.
+        extras = " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.info("[voice] session=%s event=%s %s", session_id or "-", event, extras)
+
+
+def _route_intent_label(route: str) -> str:
+    return {
+        "language_switch": "language_switch",
+        "open_camera": "scan",
+        "ask": "ask",
+        "ack": "ack",
+        "converse": "chat",
+        "intro": "chat",
+    }.get(route, "fallback")
 
 _WANTS_DOC_RE = (
     r"(i have (a |the )?document|show (you )?(my |the )?document|"
@@ -257,13 +281,19 @@ def _run_ask(
         sarvam.ingest_corrections_from_utterance(session_key, question) if session_key else []
     )
     context = retrieve_chunks(doc["text"], question)
-    result = sarvam.ask_document(
-        context or doc["text"],
-        question,
-        language,
-        history=history,
-        corrections=corrections,
-    )
+    _voice_log(session_id, "llm_start")
+    t_llm = time.perf_counter()
+    try:
+        result = sarvam.ask_document(
+            context or doc["text"],
+            question,
+            language,
+            history=history,
+            corrections=corrections,
+        )
+    except Exception as exc:
+        _voice_log(session_id, "error", stage="llm", detail=str(exc))
+        raise
     evidence = sarvam.verify_citations(result.get("evidence") or [], doc["text"])
     status = result.get("status", "not_found")
     if any(not item.get("verified") for item in evidence):
@@ -276,6 +306,12 @@ def _run_ask(
     )
     reply = result.get("answer", "")
     model_used = result.get("model_used")
+    _voice_log(
+        session_id,
+        "llm_done",
+        ms=int((time.perf_counter() - t_llm) * 1000),
+        reply_chars=len(reply or ""),
+    )
     ask_payload = {
         "answer": reply,
         "language": result.get("language", language),
@@ -354,16 +390,25 @@ def _route_with_tools(
             temperature=0.0,
         )
 
+    _voice_log(session_id, "llm_start")
+    t_llm = time.perf_counter()
     try:
         resp = sarvam._with_backoff(call)  # noqa: SLF001 — shared retry helper
-    except Exception:
+    except Exception as exc:
         logger.warning("agent tool route failed", exc_info=True)
+        _voice_log(session_id, "error", stage="llm", detail=str(exc))
         return None
 
     message = resp.choices[0].message
     tool_calls = getattr(message, "tool_calls", None) or []
     if not tool_calls:
         content = (getattr(message, "content", None) or "").strip()
+        _voice_log(
+            session_id,
+            "llm_done",
+            ms=int((time.perf_counter() - t_llm) * 1000),
+            reply_chars=len(content or ""),
+        )
         if content:
             return AgentResult(
                 route="converse",
@@ -381,6 +426,14 @@ def _route_with_tools(
         args = json.loads(call0.function.arguments or "{}")
     except json.JSONDecodeError:
         args = {}
+
+    # Classifier call finished; tool handlers may run a second LLM (ask/chat).
+    _voice_log(
+        session_id,
+        "llm_done",
+        ms=int((time.perf_counter() - t_llm) * 1000),
+        reply_chars=0,
+    )
 
     if name == "switch_language":
         code = str(args.get("language") or language).split("-", 1)[0]
@@ -463,15 +516,27 @@ def _route_with_tools(
             session_id=session_id,
         )
     if name == "chat":
-        chat = sarvam.chat_reply(
-            str(args.get("message") or transcript),
-            language,
-            has_document,
-            history=history,
-            memory_context=memory,
-        )
+        _voice_log(session_id, "llm_start")
+        t_chat = time.perf_counter()
+        try:
+            chat = sarvam.chat_reply(
+                str(args.get("message") or transcript),
+                language,
+                has_document,
+                history=history,
+                memory_context=memory,
+            )
+        except Exception as exc:
+            _voice_log(session_id, "error", stage="llm", detail=str(exc))
+            raise
         reply = chat.get("reply", "")
         intent = chat.get("intent", "chat")
+        _voice_log(
+            session_id,
+            "llm_done",
+            ms=int((time.perf_counter() - t_chat) * 1000),
+            reply_chars=len(reply or ""),
+        )
         if not has_document and (intent == "needs_document" or wants_document(transcript)):
             return AgentResult(
                 route="open_camera",
@@ -517,49 +582,76 @@ def run_agent_turn(
     if requested:
         reply_language = requested
     route = (force_route or "").strip().lower() or None
+    t_route = time.perf_counter()
+
+    def _decided(path: str, result: AgentResult) -> AgentResult:
+        _voice_log(
+            session_id,
+            "route_decision",
+            path=path,
+            intent=_route_intent_label(result.route),
+            ms=int((time.perf_counter() - t_route) * 1000),
+        )
+        return result
 
     # Deterministic onboarding / language / camera paths (lowest latency, most reliable).
     if route == "intro" or not onboarded:
         if requested:
             reply_language = requested
         reply = sarvam.intro_for_language(reply_language)
-        return AgentResult(
-            route="intro",
-            reply=reply,
-            language=reply_language,
-            max_spoken=160,
-            spoken_parts=[reply],
+        return _decided(
+            "regex",
+            AgentResult(
+                route="intro",
+                reply=reply,
+                language=reply_language,
+                max_spoken=160,
+                spoken_parts=[reply],
+            ),
         )
 
     if route == "language_switch" or (
         not route and requested and is_language_switch_only(transcript, requested)
     ):
         reply = sarvam.language_switch_for_language(reply_language)
-        return AgentResult(
-            route="language_switch",
-            reply=reply,
-            language=reply_language,
-            max_spoken=40,
-            spoken_parts=[reply],
+        return _decided(
+            "regex",
+            AgentResult(
+                route="language_switch",
+                reply=reply,
+                language=reply_language,
+                max_spoken=40,
+                spoken_parts=[reply],
+            ),
         )
 
     if route == "open_camera" or (
         not route and wants_document(transcript) and (not has_document or not doc_id)
     ):
         reply = sarvam.camera_phrase(reply_language, "show")
-        return AgentResult(
-            route="open_camera",
-            reply=reply,
-            language=reply_language,
-            open_camera=True,
-            continue_listening=False,
-            max_spoken=80,
-            spoken_parts=[reply],
+        return _decided(
+            "regex",
+            AgentResult(
+                route="open_camera",
+                reply=reply,
+                language=reply_language,
+                open_camera=True,
+                continue_listening=False,
+                max_spoken=80,
+                spoken_parts=[reply],
+            ),
         )
 
     if route == "ask" or (
         not route and has_document and doc_id and is_substantive(transcript)
     ):
+        _voice_log(
+            session_id,
+            "route_decision",
+            path="regex",
+            intent="ask",
+            ms=int((time.perf_counter() - t_route) * 1000),
+        )
         return _run_ask(
             doc_id=doc_id or "",
             question=transcript,
@@ -572,12 +664,15 @@ def run_agent_turn(
         not route and has_document and doc_id and not is_substantive(transcript)
     ):
         reply = sarvam.brief_ack_for_language(reply_language)
-        return AgentResult(
-            route="ack",
-            reply=reply,
-            language=reply_language,
-            max_spoken=40,
-            spoken_parts=[reply],
+        return _decided(
+            "regex",
+            AgentResult(
+                route="ack",
+                reply=reply,
+                language=reply_language,
+                max_spoken=40,
+                spoken_parts=[reply],
+            ),
         )
 
     # Open-ended routing via tools (ChatGPT-style tool agent).
@@ -592,10 +687,17 @@ def run_agent_turn(
             session_id=session_id,
         )
         if tooled:
-            return tooled
+            return _decided("classifier", tooled)
 
     # Fallback converse / ask redirect.
     if has_document and not sarvam.is_converse_allowed(transcript) and doc_id:
+        _voice_log(
+            session_id,
+            "route_decision",
+            path="fallback",
+            intent="ask",
+            ms=int((time.perf_counter() - t_route) * 1000),
+        )
         return _run_ask(
             doc_id=doc_id,
             question=transcript,
@@ -604,15 +706,34 @@ def run_agent_turn(
             session_id=session_id,
         )
 
-    chat = sarvam.chat_reply(
-        transcript,
-        reply_language,
-        has_document,
-        history=history_msgs,
-        memory_context=memory,
+    _voice_log(
+        session_id,
+        "route_decision",
+        path="fallback",
+        intent="chat",
+        ms=int((time.perf_counter() - t_route) * 1000),
     )
+    _voice_log(session_id, "llm_start")
+    t_llm = time.perf_counter()
+    try:
+        chat = sarvam.chat_reply(
+            transcript,
+            reply_language,
+            has_document,
+            history=history_msgs,
+            memory_context=memory,
+        )
+    except Exception as exc:
+        _voice_log(session_id, "error", stage="llm", detail=str(exc))
+        raise
     reply = chat.get("reply", "")
     intent = chat.get("intent", "chat")
+    _voice_log(
+        session_id,
+        "llm_done",
+        ms=int((time.perf_counter() - t_llm) * 1000),
+        reply_chars=len(reply or ""),
+    )
     if not has_document and (intent == "needs_document" or wants_document(transcript)):
         cam = sarvam.camera_phrase(reply_language, "show")
         return AgentResult(
