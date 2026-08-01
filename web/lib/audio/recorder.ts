@@ -3,13 +3,16 @@ import { ensureMicSession, releaseMicSession } from "@/lib/audio/mic-session";
 import { encodeWav } from "@/lib/audio/wav";
 import { ensureVadWorklet, getVadProcessorName } from "@/lib/audio/worklet-vad";
 import { VadLevelTelemetry } from "@/lib/audio/vad-levels";
+import { trimUtteranceSilence } from "@/lib/audio/trim-silence";
 import {
   VAD_THRESHOLD_FLOOR,
+  computeSilenceFloor,
   computeSpeechThreshold,
+  isSilenceRelativeToPeak,
   resolveNoSpeechOutcome,
 } from "@/lib/audio/vad-threshold";
 
-export const SILENCE_MS = 1100;
+export const SILENCE_MS = 700;
 export const MIN_RECORDING_MS = 900;
 export const MAX_RECORDING_MS = 15000;
 export const NO_SPEECH_MS = 7000;
@@ -54,6 +57,8 @@ export type RecorderSession = {
   finished: boolean;
   ambientRms: number;
   rmsMax: number;
+  /** Max RMS since speech started — drives peak-relative silence endpointing. */
+  peakRms: number;
   vadTelemetry: VadLevelTelemetry;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
@@ -155,6 +160,7 @@ export async function startVoiceRecorder(
     finished: false,
     ambientRms: VAD_THRESHOLD_FLOOR,
     rmsMax: 0,
+    peakRms: 0,
     vadTelemetry: new VadLevelTelemetry(turnId),
   };
 
@@ -224,6 +230,9 @@ export async function startVoiceRecorder(
     recorder.onFrame?.({ rms, threshold: recorder.speechThreshold });
 
     const loud = rms >= recorder.speechThreshold;
+    if (recorder.heardSpeech || recorder.speechRunFrames > 0) {
+      recorder.peakRms = Math.max(recorder.peakRms, rms);
+    }
     if (loud) {
       recorder.speechRunFrames += 1;
       if (recorder.speechRunFrames >= SPEECH_FRAMES_TO_CONFIRM) {
@@ -235,12 +244,28 @@ export async function startVoiceRecorder(
     } else {
       recorder.speechRunFrames = 0;
       if (recorder.heardSpeech) {
-        if (recorder.silentSince == null) recorder.silentSince = now;
-        const silentFor = now - recorder.silentSince;
-        callbacks.onAutoStopProgress?.(Math.min(1, silentFor / SILENCE_MS));
-        if (silentFor >= SILENCE_MS && elapsed >= MIN_RECORDING_MS) {
-          finishOnce(recorder, callbacks, false, "silence_end");
-          return;
+        const silenceFloor = computeSilenceFloor(recorder.peakRms);
+        if (isSilenceRelativeToPeak(rms, recorder.peakRms)) {
+          if (recorder.silentSince == null) recorder.silentSince = now;
+          const silentFor = now - recorder.silentSince;
+          callbacks.onAutoStopProgress?.(Math.min(1, silentFor / SILENCE_MS));
+          if (silentFor >= SILENCE_MS && elapsed >= MIN_RECORDING_MS) {
+            const silenceMs = Math.round(silentFor);
+            console.info(
+              `[audio] endpoint_decision turn_id=${recorder.turnId} peak_rms=${recorder.peakRms.toFixed(4)} silence_floor=${silenceFloor.toFixed(4)} silence_ms=${silenceMs}`,
+            );
+            voiceClientLog("endpoint_decision", {
+              turn_id: recorder.turnId,
+              peak_rms: Number(recorder.peakRms.toFixed(4)),
+              silence_floor: silenceFloor,
+              silence_ms: silenceMs,
+            });
+            finishOnce(recorder, callbacks, false, "silence_end");
+            return;
+          }
+        } else {
+          recorder.silentSince = null;
+          callbacks.onAutoStopProgress?.(0);
         }
       } else if (elapsed >= NO_SPEECH_MS) {
         const outcome = resolveNoSpeechOutcome({
@@ -372,7 +397,10 @@ export function teardownRecorder(recorder: RecorderSession | null): number {
 }
 
 export function recorderToWav(recorder: RecorderSession): Blob {
-  return encodeWav(recorder.chunks, recorder.sampleRate);
+  const trimmed = trimUtteranceSilence(recorder.chunks, recorder.sampleRate, {
+    speechThreshold: recorder.speechThreshold,
+  });
+  return encodeWav(trimmed, recorder.sampleRate);
 }
 
 export function speechMs(recorder: RecorderSession): number {

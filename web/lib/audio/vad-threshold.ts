@@ -16,6 +16,18 @@ export function shouldDeltaWeakTrigger(ambientRms: number, rmsMax: number, thres
   return rmsMax < threshold && rmsMax > VAD_DELTA_WEAK_RATIO * ambientRms;
 }
 
+/** Peak-relative silence floor for utterance endpointing (not speech-start). */
+export const SILENCE_PEAK_RATIO = 0.25;
+
+export function computeSilenceFloor(peakRms: number): number {
+  return Number(Math.max(VAD_THRESHOLD_FLOOR, peakRms * SILENCE_PEAK_RATIO).toFixed(4));
+}
+
+/** True when RMS is below the peak-relative silence floor. */
+export function isSilenceRelativeToPeak(rms: number, peakRms: number): boolean {
+  return rms < computeSilenceFloor(peakRms);
+}
+
 export type UtteranceWindowOutcome = "continue" | "no_speech" | "delta_weak";
 
 /** End-of-window decision when no confirmed speech yet (testable). */
