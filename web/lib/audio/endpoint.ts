@@ -36,7 +36,8 @@ export const QUIET_NOISE_MULT = 1.5;
 export const QUIET_ABSOLUTE_FLOOR = 0.008;
 /** Speech onset: RMS > max(absolute_floor, noise_floor × SNR). */
 export const ONSET_SNR = 3;
-export const ONSET_ABSOLUTE_FLOOR = 0.02;
+/** Quiet-room absolute gate; loud rooms use noiseFloor × ONSET_SNR instead. */
+export const ONSET_ABSOLUTE_FLOOR = 0.012;
 /** Sustain above onset threshold before confirming speech. */
 export const ONSET_HOLD_MS = 250;
 /** Rolling window for onset variance / burstiness check. */
@@ -48,7 +49,7 @@ export const ONSET_VARIANCE_WINDOW_MS = 250;
 export const ONSET_MIN_VARIANCE = 0.000008;
 /** Meaningful speech after confirm — relative to noise floor. */
 export const MEANINGFUL_NOISE_MULT = 2.2;
-export const MEANINGFUL_ABSOLUTE_FLOOR = 0.03;
+export const MEANINGFUL_ABSOLUTE_FLOOR = 0.018;
 
 /** @deprecated Use NOISE_FLOOR_WINDOW_MS */
 export const AMBIENT_WINDOW_MS = NOISE_FLOOR_WINDOW_MS;
@@ -90,9 +91,9 @@ export class TurnEndpoint {
   private ambientSum = 0;
   private ambientCount = 0;
   private firstFrameAtMs: number | null = null;
-  private lastFrameAtMs: number | null = null;
+  lastFrameAtMs: number | null = null;
   private smoothingInitialized = false;
-  private confirmedAtMs = 0;
+  confirmedAtMs = 0;
   private quietSinceMs: number | null = null;
   private lastMeaningfulSpeechAtMs = 0;
 
@@ -127,7 +128,7 @@ export class TurnEndpoint {
     return Math.max(this.ambientBaseline * QUIET_NOISE_MULT, QUIET_ABSOLUTE_FLOOR);
   }
 
-  private get onsetFloor(): number {
+  get onsetFloor(): number {
     return Math.max(ONSET_ABSOLUTE_FLOOR, this.ambientBaseline * ONSET_SNR);
   }
 

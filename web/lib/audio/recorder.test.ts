@@ -18,11 +18,14 @@ import {
   type EndpointReason,
 } from "./endpoint";
 import {
+  MIN_SPEECH_MS,
   NO_SPEECH_MS,
   SILENCE_MS,
   claimMicTurn,
   isMicTurnCurrent,
   releaseMicTurn,
+  speechMs,
+  type RecorderSession,
 } from "./recorder";
 
 describe("VAD threshold math", () => {
@@ -365,23 +368,13 @@ describe("utterance silence trim", () => {
   });
 });
 
-describe("delta_weak fallback", () => {
-  it("quiet speech below threshold but above 1.5x ambient triggers delta_weak", () => {
+describe("no_speech window (delta_weak disabled for adaptive onset)", () => {
+  it("near-ambient energy no longer promotes delta_weak submissions", () => {
     const ambient = 0.004;
     const threshold = 0.012;
     const rmsMax = 0.009;
+    // Helper may still classify delta_weak, but recorder ignores it (no_speech only).
     assert.equal(shouldDeltaWeakTrigger(ambient, rmsMax, threshold), true);
-    assert.equal(
-      resolveNoSpeechOutcome({
-        heardSpeech: false,
-        elapsedMs: NO_SPEECH_MS,
-        noSpeechMs: NO_SPEECH_MS,
-        ambientRms: ambient,
-        rmsMax,
-        threshold,
-      }),
-      "delta_weak",
-    );
   });
 
   it("no energy above ambient delta stays no_speech", () => {
@@ -396,6 +389,24 @@ describe("delta_weak fallback", () => {
       }),
       "no_speech",
     );
+  });
+});
+
+describe("speechMs after adaptive confirm", () => {
+  it("confirmed speech duration is not collapsed to a single frame", () => {
+    __resetEndpointTurnForTests();
+    const controller = new TurnEndpoint(99, () => undefined);
+    controller.startedAtMs = 1000;
+    controller.noteSpeechConfirmed(1400);
+    controller.lastFrameAtMs = 2800;
+    const recorder = {
+      speechFrames: 1,
+      frameMs: 2.67,
+      controller,
+    } as unknown as RecorderSession;
+    const ms = speechMs(recorder);
+    assert.ok(ms >= 1000, `expected >=1000ms of speech, got ${ms}`);
+    assert.ok(ms >= MIN_SPEECH_MS, "must clear MIN_SPEECH_MS so finishRecording submits");
   });
 });
 

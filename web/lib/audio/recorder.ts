@@ -7,7 +7,6 @@ import { trimUtteranceSilence } from "@/lib/audio/trim-silence";
 import {
   VAD_THRESHOLD_FLOOR,
   computeSpeechThreshold,
-  resolveNoSpeechOutcome,
 } from "@/lib/audio/vad-threshold";
 import { TurnEndpoint } from "@/lib/audio/endpoint";
 
@@ -317,19 +316,24 @@ export async function startVoiceRecorder(
     }
 
     // Sync legacy heardSpeech from adaptive onset inside TurnEndpoint.
-    if (recorder.controller.confirmedSpeech && !recorder.heardSpeech) {
-      recorder.heardSpeech = true;
+    // Count EVERY post-confirm frame — speechMs() uses speechFrames, and a
+    // single +1 made every real utterance look like ~3ms → silent noise_discard.
+    if (recorder.controller.confirmedSpeech) {
+      if (!recorder.heardSpeech) {
+        recorder.heardSpeech = true;
+        callbacks.onAutoStopProgress?.(0);
+      }
       recorder.speechFrames += 1;
       recorder.silentSince = null;
-      callbacks.onAutoStopProgress?.(0);
     }
 
     if (now - recorder.lastEndpointStateLogAt >= 1000) {
       recorder.lastEndpointStateLogAt = now;
       const quietMs = Math.round(recorder.controller.quietMs(now));
       const gapMs = Math.round(recorder.controller.sinceLastMeaningfulSpeechMs(now));
+      const onsetFloor = recorder.controller.onsetFloor;
       console.info(
-        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.controller.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.controller.smoothedRms.toFixed(4)} quiet_ceiling=${recorder.controller.quietCeiling.toFixed(4)} confirmed_speech=${recorder.controller.confirmedSpeech} quiet_ms=${quietMs} since_last_meaningful_speech_ms=${gapMs}`,
+        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.controller.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.controller.smoothedRms.toFixed(4)} quiet_ceiling=${recorder.controller.quietCeiling.toFixed(4)} onset_floor=${onsetFloor.toFixed(4)} confirmed_speech=${recorder.controller.confirmedSpeech} onset_rejected=${recorder.controller.lastOnsetRejectedReason ?? "none"} quiet_ms=${quietMs} since_last_meaningful_speech_ms=${gapMs}`,
       );
       voiceClientLog("vad_endpoint_state", {
         turn_id: recorder.turnId,
@@ -351,29 +355,15 @@ export async function startVoiceRecorder(
     if (recorder.heardSpeech) {
       callbacks.onAutoStopProgress?.(recorder.controller.quietProgress(now));
     } else if (elapsed >= NO_SPEECH_MS) {
-      const outcome = resolveNoSpeechOutcome({
-        heardSpeech: recorder.heardSpeech,
-        elapsedMs: elapsed,
-        noSpeechMs: NO_SPEECH_MS,
-        ambientRms: recorder.controller.ambientBaseline || recorder.ambientRms,
-        rmsMax: recorder.rmsMax,
-        threshold: Math.max(recorder.speechThreshold, recorder.controller.ambientBaseline * 3),
+      // Adaptive TurnEndpoint owns speech confirmation — do NOT promote
+      // near-ambient energy via legacy delta_weak (ghost turns / listen loops).
+      voiceClientLog("utterance_timeout", {
+        turn_id: recorder.turnId,
+        reason: "no_speech",
+        rms_max: Number(recorder.rmsMax.toFixed(4)),
+        vad_noise_floor: Number(recorder.controller.ambientBaseline.toFixed(4)),
+        onset_rejected_reason: recorder.controller.lastOnsetRejectedReason,
       });
-      if (outcome === "delta_weak") {
-        console.info(
-          `[audio] vad_trigger=delta_weak turn_id=${recorder.turnId} rms_max=${recorder.rmsMax.toFixed(4)} ambient=${recorder.ambientRms.toFixed(4)} threshold=${recorder.speechThreshold.toFixed(4)}`,
-        );
-        voiceClientLog("vad_trigger", {
-          turn_id: recorder.turnId,
-          kind: "delta_weak",
-          rms_max: Number(recorder.rmsMax.toFixed(4)),
-          ambient_rms: Number(recorder.ambientRms.toFixed(4)),
-          threshold: Number(recorder.speechThreshold.toFixed(4)),
-        });
-        recorder.heardSpeech = true;
-        finishOnce(recorder, callbacks, false, "delta_weak");
-        return;
-      }
       finishOnce(recorder, callbacks, true, "no_speech");
       return;
     }
@@ -500,6 +490,13 @@ export function recorderToWav(recorder: RecorderSession): Blob {
 }
 
 export function speechMs(recorder: RecorderSession): number {
+  // Prefer authoritative confirm→now duration when available (frame counting
+  // alone can under-count if the worklet quantum differs from frameMs).
+  const confirmedAt = recorder.controller?.confirmedAtMs ?? 0;
+  if (recorder.controller?.confirmedSpeech && confirmedAt > 0) {
+    const last = recorder.controller.lastFrameAtMs ?? confirmedAt;
+    return Math.max(0, last - confirmedAt);
+  }
   return recorder.speechFrames * recorder.frameMs;
 }
 
