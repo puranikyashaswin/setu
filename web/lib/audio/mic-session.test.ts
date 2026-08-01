@@ -95,12 +95,17 @@ describe("persistent mic session", () => {
     assert.ok(b.acquireMs < 20, `reused acquire should be fast, got ${b.acquireMs}`);
   });
 
-  it("audioSession stays play-and-record; no per-turn playback flip", async () => {
+  it("listening uses play-and-record; TTS prepare flips to playback without new getUserMedia", async () => {
     const nav = installNavigator({ audioSession: { type: "auto" } });
     await ensureMicSession();
     assert.equal(nav.session.type, "play-and-record");
+    assert.equal(nav.gumCalls, 1);
     await prepareAssistantPlayback({ platformIsIos: true });
+    assert.equal(nav.session.type, "playback");
+    assert.equal(nav.gumCalls, 1);
+    await ensureMicSession();
     assert.equal(nav.session.type, "play-and-record");
+    assert.equal(nav.gumCalls, 1);
   });
 
   it("timers arm at stream ready, not at getUserMedia request (2s delay sim)", async () => {

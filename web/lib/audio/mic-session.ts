@@ -3,7 +3,8 @@
  * Turns only attach/detach VAD; tracks stay live so turn 2+ mic_acquire_ms stays low.
  */
 
-export const AUDIO_ROUTE_MODE = "shared_context_play_and_record" as const;
+/** Mic is analysis-only; TTS is always HTMLAudioElement (decoupled). */
+export const AUDIO_ROUTE_MODE = "html_audio_persistent_mic" as const;
 
 type AudioSessionSetter = (type: "playback" | "play-and-record" | "auto") => boolean;
 
@@ -88,6 +89,13 @@ export async function ensureMicSession(): Promise<{
 }> {
   const t0 = performance.now();
 
+  // Listening always prefers play-and-record (safe no-op when unsupported).
+  setSession("play-and-record");
+  if (!sessionArmed) {
+    sessionArmed = true;
+    logRouteModeOnce();
+  }
+
   if (streamAlive(sharedStream) && sharedContext && sharedContext.state !== "closed") {
     try {
       if (sharedContext.state !== "running") await sharedContext.resume();
@@ -104,13 +112,6 @@ export async function ensureMicSession(): Promise<{
       reused: true,
       constraintsPath,
     };
-  }
-
-  // Fresh acquire — set session ONCE for the whole voice session.
-  if (!sessionArmed) {
-    setSession("play-and-record");
-    sessionArmed = true;
-    logRouteModeOnce();
   }
 
   const AudioContextConstructor = audioContextConstructor();

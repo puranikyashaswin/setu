@@ -58,28 +58,25 @@ export function setAudioSession(type: AudioSessionType): boolean {
 }
 
 /**
- * Shared-context route keeps play-and-record for the whole voice session.
- * No per-turn flip / settle delay (that caused 1.8s getUserMedia stalls).
+ * Before HTMLAudioElement TTS: prefer playback session (no AudioContext involved).
+ * Stop VAD first via afterTeardown; keep mic tracks alive.
  */
 export async function prepareAssistantPlayback(options?: {
   afterTeardown?: () => void | Promise<void>;
   platformIsIos?: boolean;
 }): Promise<{ settleMs: number }> {
   if (options?.afterTeardown) await options.afterTeardown();
-  // Sticky: do not switch to "playback" between turns.
-  sessionLog("audio_session", {
-    requested: "play-and-record",
-    applied: true,
-    reason: "sticky_shared_context",
-  });
+  setAudioSession("playback");
   return { settleMs: 0 };
 }
 
-/** @deprecated settle delay removed for sticky play-and-record route */
+/** Optional short settle — unused by HTMLAudioElement path (kept for tests/compat). */
 export async function settleBeforeTtsPlayback(
-  _platformIsIos: boolean = isIosPlatform(),
+  platformIsIos: boolean = isIosPlatform(),
 ): Promise<number> {
-  return 0;
+  if (!platformIsIos) return 0;
+  await new Promise<void>((resolve) => setTimeout(resolve, IOS_TTS_SETTLE_MS));
+  return IOS_TTS_SETTLE_MS;
 }
 
 /** Guard: mic must not open while thinking/speaking or TTS is active. */

@@ -5,7 +5,6 @@ import {
   micOpenBlockReason,
   prepareAssistantPlayback,
   setAudioSession,
-  settleBeforeTtsPlayback,
 } from "./audio-session.ts";
 
 type FakeSession = { type?: string };
@@ -49,19 +48,16 @@ describe("audio-session helper", () => {
     });
   });
 
-  it("sticky shared-context path does not apply iOS settle delay", async () => {
+  it("prepareAssistantPlayback sets playback before HTMLAudio TTS", async () => {
     fakeSession!.type = "play-and-record";
-    const started = Date.now();
     const { settleMs } = await prepareAssistantPlayback({
-      afterTeardown: async () => undefined,
+      afterTeardown: async () => {
+        assert.equal(fakeSession?.type, "play-and-record");
+      },
       platformIsIos: true,
     });
-    const elapsed = Date.now() - started;
     assert.equal(settleMs, 0);
-    assert.ok(elapsed < 80, `must not wait 150ms, elapsed=${elapsed}`);
-    // Must not flip away from play-and-record between turns.
-    assert.equal(fakeSession?.type, "play-and-record");
-    assert.equal(await settleBeforeTtsPlayback(true), 0);
+    assert.equal(fakeSession?.type, "playback");
   });
 
   it("isIosPlatform detects iPhone UA", () => {

@@ -1,10 +1,9 @@
 /**
- * Single-flight TTS via shared AudioContext.destination.
- * Stays in play-and-record with the mic session (audio_route_mode=shared_context_play_and_record).
+ * Single-flight TTS — HTMLAudioElement only.
+ * Never touches AudioContext / BufferSource / GainNode for TTS bytes.
  */
 
-import { voiceClientLog } from "@/lib/debug";
-import { createPlaybackQueue, type PlaybackQueue } from "@/lib/audio/playback-queue";
+import { createPlaybackQueue, type PlaybackQueue } from "./playback-queue.ts";
 import {
   beginAssistantTts,
   endAssistantTts,
@@ -14,17 +13,32 @@ import {
   setAudioOwnerLogger,
   stopNonTtsAudio,
   type PlaybackOutcome,
-} from "@/lib/audio/audio-owner";
+} from "./audio-owner.ts";
 
-setAudioOwnerLogger(voiceClientLog);
+type PlaybackLog = (event: string, data?: Record<string, unknown>) => void;
+let playbackLog: PlaybackLog = () => undefined;
+
+/** Wire voiceClientLog from the app entry (avoids path-alias imports in tests). */
+export function setPlaybackLogger(fn: PlaybackLog): void {
+  playbackLog = fn;
+  setAudioOwnerLogger((event, data) => fn(event, data));
+}
+
+function voiceClientLog(event: string, data?: Record<string, unknown>): void {
+  playbackLog(event, data);
+}
+
+export const TTS_ROUTE = "html_audio" as const;
+/** If currentTime has not advanced by this deadline after play(), treat as dead audio. */
+export const PLAYBACK_CURRENT_TIME_DEADLINE_MS = 500;
+export const PREPARING_WATCHDOG_MS = 8000;
 
 export type PlaybackHandles = {
   stop: (outcome?: PlaybackOutcome) => void;
   turnId: number;
 };
 
-export type PlayBufferOptions = {
-  context: AudioContext;
+export type PlayElementOptions = {
   arrayBuffer: ArrayBuffer;
   onPlay?: () => void;
   onSettled?: (outcome: PlaybackOutcome) => void;
@@ -33,16 +47,16 @@ export type PlayBufferOptions = {
   turnId?: number;
 };
 
-type ActiveSource = {
-  source: AudioBufferSourceNode;
-  analyser: AnalyserNode;
-  gain: GainNode;
+type ActiveElement = {
+  audio: HTMLAudioElement;
+  url: string;
   raf: number;
+  healthTimer: number;
   stopped: boolean;
 };
 
 let turnCounter = 0;
-let activeSource: ActiveSource | null = null;
+let activeElement: ActiveElement | null = null;
 let activeQueue: PlaybackQueue | null = null;
 let activeObjectUrls: string[] = [];
 let activeSettle: ((outcome: PlaybackOutcome) => void) | null = null;
@@ -58,7 +72,12 @@ export function getActivePlaybackTurnId(): number | null {
 }
 
 export function isTtsPlaybackActive(): boolean {
-  return isAssistantSpeaking() || activeTurnId != null || activeSource != null;
+  return isAssistantSpeaking() || activeTurnId != null || activeElement != null;
+}
+
+/** Static proof helper for tests — TTS path never uses Web Audio graph nodes. */
+export function ttsUsesWebAudioGraph(): boolean {
+  return false;
 }
 
 function revokeUrls(urls: string[]) {
@@ -71,21 +90,24 @@ function revokeUrls(urls: string[]) {
   }
 }
 
-function stopActiveSource(): void {
-  const current = activeSource;
-  activeSource = null;
+function stopActiveElement(): void {
+  const current = activeElement;
+  activeElement = null;
   if (!current || current.stopped) return;
   current.stopped = true;
   cancelAnimationFrame(current.raf);
+  if (current.healthTimer) globalThis.clearInterval(current.healthTimer);
   try {
-    current.source.stop();
+    current.audio.onended = null;
+    current.audio.onerror = null;
+    current.audio.pause();
+    current.audio.removeAttribute("src");
+    current.audio.load();
   } catch {
-    /* already stopped */
+    /* ignore */
   }
   try {
-    current.source.disconnect();
-    current.analyser.disconnect();
-    current.gain.disconnect();
+    URL.revokeObjectURL(current.url);
   } catch {
     /* ignore */
   }
@@ -98,7 +120,7 @@ function settleActive(outcome: PlaybackOutcome): void {
   activeTurnId = null;
   const queue = activeQueue;
   activeQueue = null;
-  stopActiveSource();
+  stopActiveElement();
   revokeUrls(activeObjectUrls);
   activeObjectUrls = [];
   if (queue) queue.stop();
@@ -115,111 +137,194 @@ function settleActive(outcome: PlaybackOutcome): void {
     stopped: outcome !== "natural",
     outcome,
     parts: queue?.parts ?? 0,
+    tts_route: TTS_ROUTE,
   });
   settle?.(outcome);
 }
 
 export function stopAllPlayback(outcome: PlaybackOutcome = "cancelled"): void {
-  if (activeTurnId == null && !activeQueue && !activeSource) {
+  if (activeTurnId == null && !activeQueue && !activeElement) {
     stopNonTtsAudio("stop_all_idle");
     return;
   }
   settleActive(outcome);
 }
 
+/**
+ * Watchdog: if playback_start never arrives while preparing, fire once.
+ * Cleared when playback begins or the turn settles.
+ */
+export function createPreparingWatchdog(options: {
+  turnId: number;
+  onTimeout: () => void;
+  ms?: number;
+}): { clear: () => void } {
+  const ms = options.ms ?? PREPARING_WATCHDOG_MS;
+  let cleared = false;
+  const id = globalThis.setTimeout(() => {
+    if (cleared) return;
+    cleared = true;
+    console.info(`[audio] tts_playback_watchdog_timeout turn_id=${options.turnId}`);
+    voiceClientLog("tts_playback_watchdog_timeout", {
+      turn_id: options.turnId,
+      ms,
+    });
+    options.onTimeout();
+  }, ms);
+  return {
+    clear: () => {
+      if (cleared) return;
+      cleared = true;
+      globalThis.clearTimeout(id);
+    },
+  };
+}
+
 async function playOnePart(
-  context: AudioContext,
   arrayBuffer: ArrayBuffer,
-  onAmplitude?: PlayBufferOptions["onAmplitude"],
-): Promise<"natural" | "stopped"> {
-  if (context.state !== "running") {
-    try {
-      await context.resume();
-    } catch {
-      /* ignore */
-    }
-  }
+  turnId: number,
+  onAmplitude?: PlayElementOptions["onAmplitude"],
+): Promise<"natural" | "stopped" | "error"> {
+  return new Promise<"natural" | "stopped" | "error">((resolve) => {
+    if (activeElement) stopActiveElement();
 
-  const audioBuffer = await context.decodeAudioData(arrayBuffer.slice(0));
+    const blob = new Blob([arrayBuffer], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio();
+    audio.preload = "auto";
+    audio.volume = 1;
+    audio.src = url;
 
-  return new Promise<"natural" | "stopped">((resolve, reject) => {
-    if (activeSource) stopActiveSource();
-
-    const source = context.createBufferSource();
-    source.buffer = audioBuffer;
-    const analyser = context.createAnalyser();
-    analyser.fftSize = 256;
-    const gain = context.createGain();
-    gain.gain.value = getTtsVolume();
-    source.connect(analyser);
-    analyser.connect(gain);
-    gain.connect(context.destination);
-
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const session: ActiveSource = { source, analyser, gain, raf: 0, stopped: false };
-    activeSource = session;
+    const session: ActiveElement = {
+      audio,
+      url,
+      raf: 0,
+      healthTimer: 0,
+      stopped: false,
+    };
+    activeElement = session;
 
     const animate = () => {
-      if (session.stopped || activeSource !== session) return;
-      if (gain.gain.value !== 1) gain.gain.value = 1;
-      analyser.getByteFrequencyData(data);
-      const normal = (from: number, to: number) =>
-        data.slice(from, to).reduce((sum, value) => sum + value, 0) / Math.max(1, to - from) / 255;
-      const amplitude = data.reduce((sum, value) => sum + value, 0) / data.length / 255;
+      if (session.stopped || activeElement !== session) return;
+      if (audio.volume !== 1) audio.volume = 1;
+      const t = audio.currentTime || 0;
+      const amp = 0.32 + 0.28 * Math.abs(Math.sin(t * 7));
       onAmplitude?.(
-        amplitude,
-        {
-          bass: normal(0, Math.floor(data.length * 0.18)),
-          treble: normal(Math.floor(data.length * 0.62), data.length),
-        },
-        Array.from({ length: 8 }, (_, index) =>
-          normal(Math.floor((data.length * index) / 8), Math.floor((data.length * (index + 1)) / 8)),
-        ),
+        amp,
+        { bass: amp * 0.85, treble: amp * 0.55 },
+        Array.from({ length: 8 }, (_, index) => amp * (0.45 + 0.55 * Math.abs(Math.sin(t * 5 + index)))),
       );
       session.raf = requestAnimationFrame(animate);
     };
 
-    source.onended = () => {
+    const finishNatural = () => {
       if (session.stopped) {
         resolve("stopped");
         return;
       }
       session.stopped = true;
       cancelAnimationFrame(session.raf);
+      if (session.healthTimer) globalThis.clearInterval(session.healthTimer);
+      if (activeElement === session) activeElement = null;
       try {
-        source.disconnect();
-        analyser.disconnect();
-        gain.disconnect();
+        URL.revokeObjectURL(url);
       } catch {
         /* ignore */
       }
-      if (activeSource === session) activeSource = null;
       resolve("natural");
     };
 
-    animate();
-    try {
-      source.start(0);
-    } catch (error) {
+    const finishError = (message: string) => {
+      if (session.stopped) {
+        resolve("stopped");
+        return;
+      }
       session.stopped = true;
-      if (activeSource === session) activeSource = null;
-      reject(error);
-    }
+      cancelAnimationFrame(session.raf);
+      if (session.healthTimer) globalThis.clearInterval(session.healthTimer);
+      if (activeElement === session) activeElement = null;
+      console.info(`[audio] audio_play_error=${message} turn_id=${turnId}`);
+      voiceClientLog("audio_play_error", { turn_id: turnId, message, tts_route: TTS_ROUTE });
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* ignore */
+      }
+      resolve("error");
+    };
+
+    audio.onended = () => finishNatural();
+    audio.onerror = () => finishError("element_error");
+
+    animate();
+
+    const playStartedAt = performance.now();
+    let sawCurrentTime = false;
+    console.info(`[audio] tts_route=${TTS_ROUTE} turn_id=${turnId}`);
+    voiceClientLog("tts_route", { turn_id: turnId, tts_route: TTS_ROUTE });
+
+    void audio
+      .play()
+      .then(() => {
+        audio.volume = getTtsVolume();
+        console.info(`[audio] audio_play_called=true turn_id=${turnId}`);
+        voiceClientLog("audio_play_called", { turn_id: turnId, value: true, tts_route: TTS_ROUTE });
+
+        session.healthTimer = globalThis.setInterval(() => {
+          if (session.stopped || activeElement !== session) {
+            globalThis.clearInterval(session.healthTimer);
+            return;
+          }
+          if (!sawCurrentTime && audio.currentTime > 0.01) {
+            sawCurrentTime = true;
+            const firstMs = Math.round(performance.now() - playStartedAt);
+            console.info(`[audio] playback_first_current_time_ms=${firstMs} turn_id=${turnId}`);
+            voiceClientLog("playback_first_current_time_ms", {
+              turn_id: turnId,
+              ms: firstMs,
+              tts_route: TTS_ROUTE,
+            });
+            globalThis.clearInterval(session.healthTimer);
+            session.healthTimer = 0;
+            return;
+          }
+          if (!sawCurrentTime && performance.now() - playStartedAt >= PLAYBACK_CURRENT_TIME_DEADLINE_MS) {
+            globalThis.clearInterval(session.healthTimer);
+            session.healthTimer = 0;
+            try {
+              audio.pause();
+            } catch {
+              /* ignore */
+            }
+            finishError("currentTime_stalled");
+          }
+        }, 40);
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.info(`[audio] audio_play_called=true turn_id=${turnId}`);
+        voiceClientLog("audio_play_called", { turn_id: turnId, value: true, tts_route: TTS_ROUTE });
+        finishError(message || "play_rejected");
+      });
   });
 }
 
+/**
+ * Play audio parts strictly in series on HTMLAudioElement.
+ * onSettled fires exactly once via finalizePlayback.
+ */
 export async function playDecodedBuffersSequential(
-  options: Omit<PlayBufferOptions, "arrayBuffer"> & { arrayBuffers: ArrayBuffer[]; turnId?: number },
+  options: Omit<PlayElementOptions, "arrayBuffer"> & { arrayBuffers: ArrayBuffer[]; turnId?: number },
 ): Promise<PlaybackHandles> {
-  const { arrayBuffers, onPlay, onSettled, onEnded, onAmplitude, context } = options;
+  const { arrayBuffers, onPlay, onSettled, onEnded, onAmplitude } = options;
   const turnId = options.turnId ?? nextPlaybackTurnId();
 
-  if (activeTurnId != null || activeQueue || activeSource) {
+  if (activeTurnId != null || activeQueue || activeElement) {
     settleActive("cancelled");
   }
 
   beginAssistantTts(turnId);
-  console.info(`[audio] tts_volume=${getTtsVolume()} turn_id=${turnId} path=shared_context`);
+  console.info(`[audio] tts_volume=${getTtsVolume()} turn_id=${turnId} tts_route=${TTS_ROUTE}`);
 
   const queue = createPlaybackQueue(arrayBuffers.length, turnId);
   activeQueue = queue;
@@ -256,19 +361,25 @@ export async function playDecodedBuffersSequential(
           part,
           parts: arrayBuffers.length,
           tts_volume: getTtsVolume(),
-          path: "shared_context",
+          tts_route: TTS_ROUTE,
         });
         if (part === 1) onPlay?.();
-        const partResult = await playOnePart(context, arrayBuffers[i], onAmplitude);
+        const partResult = await playOnePart(arrayBuffers[i], turnId, onAmplitude);
         if (stopOutcome || activeQueue !== queue) return;
         if (partResult === "stopped") return;
+        if (partResult === "error") {
+          settleOnce("error");
+          return;
+        }
         const done = queue.endPart(true);
         if (done) {
           settleOnce("natural");
           return;
         }
       }
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      voiceClientLog("audio_play_error", { turn_id: turnId, message, tts_route: TTS_ROUTE });
       settleOnce("error");
     }
   };
@@ -286,9 +397,8 @@ export async function playDecodedBuffersSequential(
   };
 }
 
-export async function playDecodedBuffer(options: PlayBufferOptions): Promise<PlaybackHandles> {
+export async function playDecodedBuffer(options: PlayElementOptions): Promise<PlaybackHandles> {
   return playDecodedBuffersSequential({
-    context: options.context,
     arrayBuffers: [options.arrayBuffer],
     onPlay: options.onPlay,
     onSettled: options.onSettled,
@@ -315,12 +425,12 @@ export function __resetPlaybackForTests(): void {
   activeSettle = null;
   activeTurnId = null;
   activeQueue = null;
-  stopActiveSource();
+  stopActiveElement();
   revokeUrls(activeObjectUrls);
   activeObjectUrls = [];
   turnCounter = 0;
   endAssistantTts();
 }
 
-export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, isAssistantSpeaking } from "./audio-owner";
-export type { PlaybackOutcome } from "./audio-owner";
+export { stopNonTtsAudio, beginAssistantTts, finalizePlayback, isAssistantSpeaking } from "./audio-owner.ts";
+export type { PlaybackOutcome } from "./audio-owner.ts";

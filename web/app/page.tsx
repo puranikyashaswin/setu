@@ -10,19 +10,20 @@ import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-sc
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
   micOpenBlockReason,
+  prepareAssistantPlayback,
   setAudioSession,
   setAudioSessionLogger,
 } from "@/lib/audio/audio-session";
 import {
-  ensureMicSession,
-  getSharedAudioContext,
   setMicSessionAudioSession,
   setMicSessionLogger,
 } from "@/lib/audio/mic-session";
 import {
   base64ToArrayBuffer,
+  createPreparingWatchdog,
   isTtsPlaybackActive,
   playDecodedBuffersSequential,
+  setPlaybackLogger,
   stopAllPlayback,
   stopNonTtsAudio,
   type PlaybackHandles,
@@ -47,6 +48,7 @@ import { getVoiceSession } from "@/lib/voice-session";
 setAudioSessionLogger(voiceClientLog);
 setMicSessionLogger(voiceClientLog);
 setMicSessionAudioSession(setAudioSession);
+setPlaybackLogger(voiceClientLog);
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
 import { SetuOrb } from "@/components/SetuOrb";
 import type {
@@ -1422,7 +1424,7 @@ export default function Home() {
     prefetchedParts?: ArrayBuffer[],
     _allowBargeIn = true,
   ) => {
-    // Detach VAD for this turn — keep MediaStream alive (no getUserMedia on next listen).
+    // Pause VAD only — keep MediaStream tracks alive. TTS never uses the recorder AudioContext.
     stopActiveRecording("prepare_tts");
     stopBargeIn();
     if (playbackRef.current) {
@@ -1455,6 +1457,27 @@ export default function Home() {
     setOrbState("processing");
     setStatusText("Preparing a response");
     let settled = false;
+    let playbackStarted = false;
+    const watchdog = createPreparingWatchdog({
+      turnId: playTurnId,
+      onTimeout: () => {
+        if (settled || playbackStarted) return;
+        // If HTMLAudioElement turn already owns the bus, settle via error path once.
+        if (playbackRef.current) {
+          playbackRef.current.stop("error");
+          return;
+        }
+        settled = true;
+        setService(null);
+        loop.transition("idle", "tts_playback_watchdog_timeout");
+        orbStateRef.current = "idle";
+        setOrbState("idle");
+        setStatusText("Couldn’t play that — tap to try again");
+        if (continueListening && speakTurnIdRef.current === playTurnId) {
+          resumeListening(playTurnId);
+        }
+      },
+    });
     try {
       let buffers = prefetchedParts?.filter(Boolean) ?? [];
       if (!buffers.length) {
@@ -1482,21 +1505,12 @@ export default function Home() {
         buffers = [arrayBuffer!];
       }
 
-      // TTS through shared AudioContext.destination — session stays play-and-record.
-      // Warm mic session on first speak (user gesture) so later turns reuse the stream.
-      let context = getSharedAudioContext();
-      if (!context || context.state === "closed") {
-        const warmed = await ensureMicSession();
-        context = warmed.context;
-      }
-      try {
-        if (context.state !== "running") await context.resume();
-      } catch {
-        /* playOnePart also resumes */
-      }
+      // Stop VAD + flip to playback session; HTMLAudioElement owns the speaker.
+      await prepareAssistantPlayback();
 
       await new Promise<void>((resolve, reject) => {
         const finishClean = () => {
+          watchdog.clear();
           stopBargeIn();
           setAmplitude(0.2);
           setBands({ bass: 0, treble: 0 });
@@ -1535,7 +1549,7 @@ export default function Home() {
             return;
           }
           if (outcome === "error") {
-            setStatusText("Tap to continue");
+            setStatusText("Couldn’t play that — tap to try again");
             if (continueListening) resumeListening(playTurnId);
             resolve();
             return;
@@ -1545,10 +1559,11 @@ export default function Home() {
         };
 
         void playDecodedBuffersSequential({
-          context,
           arrayBuffers: buffers,
           turnId: playTurnId,
           onPlay: () => {
+            playbackStarted = true;
+            watchdog.clear();
             loop.transition("speaking", "playback_start");
             orbStateRef.current = "speaking";
             setOrbState("speaking");
@@ -1565,6 +1580,7 @@ export default function Home() {
         }).catch(reject);
       });
     } catch (error) {
+      watchdog.clear();
       console.error(`[speak] language=${selectedLanguage} speaker=${voice}`, error);
       stopBargeIn();
       setStatusText(error instanceof Error ? error.message : "Unable to play speech");
