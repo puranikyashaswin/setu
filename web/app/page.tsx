@@ -16,12 +16,18 @@ import {
 } from "@/lib/audio/audio-session";
 import {
   createListeningDeadMicWatchdog,
+  ensureMicSession,
   logMicSessionStreamState,
   OPENING_STUCK_MS,
   setMicOpenStuckRetry,
   setMicSessionAudioSession,
   setMicSessionLogger,
 } from "@/lib/audio/mic-session";
+import {
+  planFirstOrbTap,
+  resolvePageLoadVoiceState,
+  type GreetingGate,
+} from "@/lib/voice-greeting";
 import {
   base64ToArrayBuffer,
   createPreparingWatchdog,
@@ -1075,6 +1081,10 @@ export default function Home() {
   const [activeService, setActiveService] = useState<StackService | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
+  /** Greeting plays at most once per page load (not once per chat session). */
+  const greetingPlayedRef = useRef(false);
+  /** Fresh voice session id each page load — independent of chat history id. */
+  const voiceSessionIdRef = useRef<string>("");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"voice" | "history">("voice");
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
@@ -1350,6 +1360,8 @@ export default function Home() {
     setTranscript("");
     setAnswerSheet(null);
     setHasStarted(false);
+    // New chat is a new voice session; allow greeting again only if never played this load.
+    // (greetingPlayedRef stays — once-per-page-load rule.)
     setOrbState("idle");
     setService(null);
     setStatusText("Tap to start");
@@ -2592,6 +2604,7 @@ export default function Home() {
   }, [startRecording]);
 
   const beginOrStop = async () => {
+    // iOS: unlock audio + open mic during the user gesture, before any await/TTS.
     unlockSharedAudioElement();
     if (isRecording) { void finishRecording(true, { reason: "user_stop" }); return; }
     if (orbState === "speaking" || voiceLoopRef.current.state === "speaking") {
@@ -2603,20 +2616,48 @@ export default function Home() {
     }
     setViewMode("voice");
     const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
-    if (!session?.onboarded && !(session?.turns.length)) {
+    const gate: GreetingGate = {
+      greetingPlayedThisLoad: greetingPlayedRef.current,
+      onboarded: Boolean(session?.onboarded),
+      turnCount: session?.turns.length ?? 0,
+    };
+    const plan = planFirstOrbTap(gate);
+
+    // 1) Arm persistent mic stream during the gesture (attach if already live).
+    let micArmed = false;
+    try {
+      await ensureMicSession();
+      micArmed = true;
+    } catch (error) {
+      console.error("[Setu mic] arm before greeting/listen failed", error);
+    }
+    if (plan.action === "play_greeting") {
+      voiceClientLog("mic_armed_before_greeting", { ok: micArmed });
+    }
+
+    if (plan.action === "play_greeting") {
+      greetingPlayedRef.current = true;
       setHasStarted(true);
+      voiceClientLog("greeting_played", { voice_session_id: voiceSessionIdRef.current, once: true });
       setOrbState("processing");
       setStatusText("Welcome to Setu");
       try {
+        // 3) Play greeting; 4) auto-start listening when playback ends.
         await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true, "shubh", undefined, undefined, 200, undefined, undefined, false);
+        voiceClientLog("auto_listen_after_greeting", {
+          ok: true,
+          voice_session_id: voiceSessionIdRef.current,
+        });
       } catch {
         setOrbState("idle");
         setStatusText("Tap to start");
+        voiceClientLog("auto_listen_after_greeting", { ok: false });
       }
       return;
     }
-    if (hasStarted) { void startRecording(); return; }
-    setHasStarted(true);
+
+    // Subsequent taps during an active session: start listening only (never re-greet).
+    if (!hasStarted) setHasStarted(true);
     void startRecording();
   };
 
@@ -2662,32 +2703,59 @@ export default function Home() {
           setAuthStatus("Sign-in link expired");
         }
       }
-      // Always open a fresh chat — no restored history on launch.
+      // Keep chat HISTORY visible, but always start a NEW voice session:
+      // clear stale greeting/turn flags; do not resume mid-turn voice state.
+      let restored: Session[] = [];
+      let activeId: string | null = null;
       try {
-        await Promise.all([writeSessions([]), writeActiveSessionId(null)]);
+        restored = (await readSessions<Session>()) ?? [];
+        activeId = await readActiveSessionId();
       } catch {
         try {
-          localStorage.removeItem("setu-sessions");
-          localStorage.removeItem("setu-active-session");
-          localStorage.removeItem("setu-history");
-        } catch { /* ignore */ }
+          const legacy = loadSessionsFromStorage("en");
+          restored = legacy.sessions;
+          activeId = legacy.activeId;
+        } catch { /* empty */ }
       }
       if (cancelled) return;
-      const fresh = makeSession("en");
-      setSessions([fresh]);
-      setActiveSessionId(fresh.id);
-      activeSessionIdRef.current = fresh.id;
-      sessionsRef.current = [fresh];
-      setDocId(null);
-      docIdRef.current = null;
-      setLanguage("en");
-      languageRef.current = "en";
-      languageLockedRef.current = false;
-      setHasStarted(false);
+
+      const active = restored.find((s) => s.id === activeId) ?? restored[0];
+      const sessionsList = active ? restored : [makeSession("en")];
+      const current = sessionsList.find((s) => s.id === (active?.id ?? sessionsList[0]!.id)) ?? sessionsList[0]!;
+      const boot = resolvePageLoadVoiceState({
+        historyTurnCount: current.turns?.length ?? 0,
+        onboarded: Boolean(current.onboarded),
+      });
+      voiceSessionIdRef.current = boot.voiceSessionId;
+      greetingPlayedRef.current = false;
+      voiceLoopRef.current.reset();
+      speakTurnIdRef.current = 0;
+      earlyReopenUsedRef.current = false;
+      deadMicRecoveryUsedRef.current = false;
+      noSpeechTimeoutsRef.current = 0;
+      vadHintShownRef.current = false;
+      utteranceWindowStartedRef.current = false;
+      voiceClientLog("stale_session_cleared", {
+        keep_history: boot.keepHistory,
+        voice_session_id: boot.voiceSessionId,
+        history_turns: current.turns?.length ?? 0,
+      });
+
+      setSessions(sessionsList);
+      setActiveSessionId(current.id);
+      activeSessionIdRef.current = current.id;
+      sessionsRef.current = sessionsList;
+      setDocId(current.docId ?? null);
+      docIdRef.current = current.docId ?? null;
+      setLanguage(current.language || "en");
+      languageRef.current = current.language || "en";
+      languageLockedRef.current = Boolean(current.onboarded || (current.turns?.length ?? 0) > 0);
+      setHasStarted(boot.hasStarted);
       setTranscript("");
       setAnswerSheet(null);
       setSpeaker("shubh");
-      setStatusText("Tap to start");
+      setOrbState("idle");
+      setStatusText((current.turns?.length ?? 0) > 0 ? "Tap to continue" : "Tap to start");
       setSessionsLoaded(true);
     };
     void restore();
@@ -2696,13 +2764,12 @@ export default function Home() {
 
   useEffect(() => {
     if (!sessionsLoaded) return;
-    // Persist only the active fresh session (no multi-chat history restore).
+    // Persist chat history; voice session flags are ephemeral (not stored).
     void (async () => {
       try {
         const active = sessions.find((session) => session.id === activeSessionId);
-        const only = active ? [active] : [];
         await Promise.all([
-          writeSessions(only),
+          writeSessions(sessions),
           writeActiveSessionId(activeSessionId),
         ]);
         if (active) await syncSessionToServer(active);

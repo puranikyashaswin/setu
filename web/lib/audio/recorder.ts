@@ -305,7 +305,7 @@ export async function startVoiceRecorder(
       });
     }
 
-    // ONE authoritative endpoint owner — fed every RMS frame.
+    // ONE authoritative endpoint owner — adaptive noise-floor onset + quiet end.
     // server_vad_v1: feeding stops once the server owns endpointing; the
     // max_recording timer (separately armed) remains the safety cap.
     if (!recorder.localEndpointSuppressed) {
@@ -314,6 +314,14 @@ export async function startVoiceRecorder(
     } else if (!recorder.localEndpointSuppressedLogged) {
       recorder.localEndpointSuppressedLogged = true;
       voiceClientLog("vad_local_endpoint_suppressed", { turn_id: recorder.turnId });
+    }
+
+    // Sync legacy heardSpeech from adaptive onset inside TurnEndpoint.
+    if (recorder.controller.confirmedSpeech && !recorder.heardSpeech) {
+      recorder.heardSpeech = true;
+      recorder.speechFrames += 1;
+      recorder.silentSince = null;
+      callbacks.onAutoStopProgress?.(0);
     }
 
     if (now - recorder.lastEndpointStateLogAt >= 1000) {
@@ -326,58 +334,48 @@ export async function startVoiceRecorder(
       voiceClientLog("vad_endpoint_state", {
         turn_id: recorder.turnId,
         ambient_rms: Number(recorder.controller.ambientBaseline.toFixed(4)),
+        vad_noise_floor: Number(recorder.controller.ambientBaseline.toFixed(4)),
         smoothed_rms: Number(recorder.controller.smoothedRms.toFixed(4)),
         quiet_ceiling: recorder.controller.quietCeiling,
         confirmed_speech: recorder.controller.confirmedSpeech,
+        onset_snr: recorder.controller.lastOnsetSnr,
+        onset_rejected_reason: recorder.controller.lastOnsetRejectedReason,
         quiet_ms: quietMs,
         since_last_meaningful_speech_ms: gapMs,
       });
     }
 
-    const loud = rms >= recorder.speechThreshold;
-    if (recorder.heardSpeech || recorder.speechRunFrames > 0) {
+    if (recorder.heardSpeech || recorder.controller.confirmedSpeech) {
       recorder.peakRms = Math.max(recorder.peakRms, rms);
     }
-    if (loud) {
-      recorder.speechRunFrames += 1;
-      if (recorder.speechRunFrames >= SPEECH_FRAMES_TO_CONFIRM) {
-        if (!recorder.heardSpeech) recorder.controller.noteSpeechConfirmed(now);
-        recorder.heardSpeech = true;
-        recorder.speechFrames += 1;
-        recorder.silentSince = null;
-        callbacks.onAutoStopProgress?.(0);
-      }
-    } else {
-      recorder.speechRunFrames = 0;
-      if (recorder.heardSpeech) {
-        callbacks.onAutoStopProgress?.(recorder.controller.quietProgress(now));
-      } else if (elapsed >= NO_SPEECH_MS) {
-        const outcome = resolveNoSpeechOutcome({
-          heardSpeech: recorder.heardSpeech,
-          elapsedMs: elapsed,
-          noSpeechMs: NO_SPEECH_MS,
-          ambientRms: recorder.ambientRms,
-          rmsMax: recorder.rmsMax,
-          threshold: recorder.speechThreshold,
+    if (recorder.heardSpeech) {
+      callbacks.onAutoStopProgress?.(recorder.controller.quietProgress(now));
+    } else if (elapsed >= NO_SPEECH_MS) {
+      const outcome = resolveNoSpeechOutcome({
+        heardSpeech: recorder.heardSpeech,
+        elapsedMs: elapsed,
+        noSpeechMs: NO_SPEECH_MS,
+        ambientRms: recorder.controller.ambientBaseline || recorder.ambientRms,
+        rmsMax: recorder.rmsMax,
+        threshold: Math.max(recorder.speechThreshold, recorder.controller.ambientBaseline * 3),
+      });
+      if (outcome === "delta_weak") {
+        console.info(
+          `[audio] vad_trigger=delta_weak turn_id=${recorder.turnId} rms_max=${recorder.rmsMax.toFixed(4)} ambient=${recorder.ambientRms.toFixed(4)} threshold=${recorder.speechThreshold.toFixed(4)}`,
+        );
+        voiceClientLog("vad_trigger", {
+          turn_id: recorder.turnId,
+          kind: "delta_weak",
+          rms_max: Number(recorder.rmsMax.toFixed(4)),
+          ambient_rms: Number(recorder.ambientRms.toFixed(4)),
+          threshold: Number(recorder.speechThreshold.toFixed(4)),
         });
-        if (outcome === "delta_weak") {
-          console.info(
-            `[audio] vad_trigger=delta_weak turn_id=${recorder.turnId} rms_max=${recorder.rmsMax.toFixed(4)} ambient=${recorder.ambientRms.toFixed(4)} threshold=${recorder.speechThreshold.toFixed(4)}`,
-          );
-          voiceClientLog("vad_trigger", {
-            turn_id: recorder.turnId,
-            kind: "delta_weak",
-            rms_max: Number(recorder.rmsMax.toFixed(4)),
-            ambient_rms: Number(recorder.ambientRms.toFixed(4)),
-            threshold: Number(recorder.speechThreshold.toFixed(4)),
-          });
-          recorder.heardSpeech = true;
-          finishOnce(recorder, callbacks, false, "delta_weak");
-          return;
-        }
-        finishOnce(recorder, callbacks, true, "no_speech");
+        recorder.heardSpeech = true;
+        finishOnce(recorder, callbacks, false, "delta_weak");
         return;
       }
+      finishOnce(recorder, callbacks, true, "no_speech");
+      return;
     }
 
     if (elapsed >= MAX_RECORDING_MS) {

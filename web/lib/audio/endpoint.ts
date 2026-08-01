@@ -2,16 +2,17 @@
  * Authoritative per-turn endpoint owner.
  *
  * ONE instance per turn. The recorder's worklet RMS callback feeds
- * handleAudioFrame(turnId, rms, nowMs); the max-recording timer and all
- * silence/gap detection finish ONLY through finishTurnOnce(turnId, reason).
+ * handleAudioFrame(turnId, rms, nowMs); speech onset + silence/gap detection
+ * finish ONLY through finishTurnOnce(turnId, reason).
  *
- * Endpoint rule (after the existing 24-frame speech-start confirmation):
- *   ambientBaseline — mean RMS of the first 500ms before confirmed speech, then FROZEN.
- *   quietCeiling    = max(ambientBaseline * 1.6, 0.045)
- *   meaningful      = smoothedRms > max(ambientBaseline * 2.2, 0.07)
- *                     (stricter than quietCeiling so steady noise above the
- *                      quiet ceiling cannot masquerade as speech forever —
- *                      that is what last_speech_gap rescues)
+ * Adaptive noise-floor endpoint (tracks the USER'S voice, not absolute loudness):
+ *   noiseFloor — rolling mean from the first ~400ms and continuously during
+ *                non-speech (a fan raises the floor; steady noise alone never
+ *                confirms speech).
+ *   onset      — smoothedRms > max(ABSOLUTE_FLOOR, noiseFloor × ONSET_SNR)
+ *                sustained for ≥ ONSET_HOLD_MS, AND RMS variance over the
+ *                window is above ONSET_MIN_VARIANCE (rejects steady machine noise).
+ *   quietCeiling = max(QUIET_ABSOLUTE_FLOOR, noiseFloor × QUIET_NOISE_MULT)
  *   post_speech_quiet — smoothedRms < quietCeiling continuously for 900ms
  *   last_speech_gap   — 2500ms since lastMeaningfulSpeechAt
  *   Never endpoint before 1200ms after confirmed speech begins.
@@ -26,14 +27,42 @@ import { voiceClientLog } from "@/lib/debug";
 export const QUIET_AFTER_SPEECH_MS = 900;
 export const LAST_SPEECH_GAP_MS = 2500;
 export const MIN_AFTER_CONFIRM_MS = 1200;
-export const AMBIENT_WINDOW_MS = 500;
+/** Calibrate noise floor from the first ~400ms of each recording. */
+export const NOISE_FLOOR_WINDOW_MS = 400;
 export const SMOOTH_WINDOW_MS = 100;
-export const QUIET_AMBIENT_MULT = 1.6;
-export const QUIET_RMS_FLOOR = 0.045;
-export const MEANINGFUL_AMBIENT_MULT = 2.2;
-export const MEANINGFUL_RMS_FLOOR = 0.07;
+/** End turn when RMS falls back near noise_floor × 1.5. */
+export const QUIET_NOISE_MULT = 1.5;
+/** Tiny absolute quiet floor for numerical stability only (not a speech gate). */
+export const QUIET_ABSOLUTE_FLOOR = 0.008;
+/** Speech onset: RMS > max(absolute_floor, noise_floor × SNR). */
+export const ONSET_SNR = 3;
+export const ONSET_ABSOLUTE_FLOOR = 0.02;
+/** Sustain above onset threshold before confirming speech. */
+export const ONSET_HOLD_MS = 250;
+/** Rolling window for onset variance / burstiness check. */
+export const ONSET_VARIANCE_WINDOW_MS = 250;
+/**
+ * Minimum RMS variance in the onset window. Steady fan/broadband noise is
+ * nearly flat; speech is bursty. Tuned for worklet RMS in 0..1.
+ */
+export const ONSET_MIN_VARIANCE = 0.000008;
+/** Meaningful speech after confirm — relative to noise floor. */
+export const MEANINGFUL_NOISE_MULT = 2.2;
+export const MEANINGFUL_ABSOLUTE_FLOOR = 0.03;
+
+/** @deprecated Use NOISE_FLOOR_WINDOW_MS */
+export const AMBIENT_WINDOW_MS = NOISE_FLOOR_WINDOW_MS;
+/** @deprecated Use QUIET_NOISE_MULT */
+export const QUIET_AMBIENT_MULT = QUIET_NOISE_MULT;
+/** @deprecated Fixed quiet floor removed — relative only. */
+export const QUIET_RMS_FLOOR = QUIET_ABSOLUTE_FLOOR;
+/** @deprecated Use MEANINGFUL_NOISE_MULT */
+export const MEANINGFUL_AMBIENT_MULT = MEANINGFUL_NOISE_MULT;
+/** @deprecated Use MEANINGFUL_ABSOLUTE_FLOOR */
+export const MEANINGFUL_RMS_FLOOR = MEANINGFUL_ABSOLUTE_FLOOR;
 
 export type EndpointReason = "post_speech_quiet" | "last_speech_gap" | "max_recording";
+export type OnsetRejectedReason = "below_snr" | "steady_noise" | "hold_incomplete";
 
 type ActiveTurn = { turnId: number; generation: number };
 let activeTurn: ActiveTurn | null = null;
@@ -50,20 +79,28 @@ export class TurnEndpoint {
   private readonly onFinish: (reason: EndpointReason) => void;
 
   startedAtMs = 0;
+  /** Rolling noise-floor estimate (ambient). */
   ambientBaseline = 0;
   smoothedRms = 0;
   confirmedSpeech = false;
   finished = false;
+  lastOnsetRejectedReason: OnsetRejectedReason | null = null;
+  lastOnsetSnr = 0;
 
   private ambientSum = 0;
   private ambientCount = 0;
-  private ambientFrozen = false;
   private firstFrameAtMs: number | null = null;
   private lastFrameAtMs: number | null = null;
   private smoothingInitialized = false;
   private confirmedAtMs = 0;
   private quietSinceMs: number | null = null;
   private lastMeaningfulSpeechAtMs = 0;
+
+  private onsetAboveSinceMs: number | null = null;
+  private recentRms: Array<{ t: number; rms: number }> = [];
+  private lastNoiseFloorLogAt = 0;
+  /** Latched when the onset window shows bursty energy (speech rise). */
+  private sawOnsetBurst = false;
 
   constructor(turnId: number, onFinish: (reason: EndpointReason) => void) {
     this.turnId = turnId;
@@ -82,12 +119,20 @@ export class TurnEndpoint {
     if (this.isCurrent()) activeTurn = null;
   }
 
+  get noiseFloor(): number {
+    return this.ambientBaseline;
+  }
+
   get quietCeiling(): number {
-    return Math.max(this.ambientBaseline * QUIET_AMBIENT_MULT, QUIET_RMS_FLOOR);
+    return Math.max(this.ambientBaseline * QUIET_NOISE_MULT, QUIET_ABSOLUTE_FLOOR);
+  }
+
+  private get onsetFloor(): number {
+    return Math.max(ONSET_ABSOLUTE_FLOOR, this.ambientBaseline * ONSET_SNR);
   }
 
   private get meaningfulFloor(): number {
-    return Math.max(this.ambientBaseline * MEANINGFUL_AMBIENT_MULT, MEANINGFUL_RMS_FLOOR);
+    return Math.max(this.ambientBaseline * MEANINGFUL_NOISE_MULT, MEANINGFUL_ABSOLUTE_FLOOR);
   }
 
   quietMs(nowMs: number): number {
@@ -104,15 +149,110 @@ export class TurnEndpoint {
     return Math.min(1, this.quietMs(nowMs) / QUIET_AFTER_SPEECH_MS);
   }
 
-  /** Recorder calls this when the existing 24-frame start confirmation succeeds. */
+  /**
+   * External confirm (legacy recorder path). Prefer internal adaptive onset.
+   */
   noteSpeechConfirmed(nowMs: number): void {
     if (this.confirmedSpeech) return;
     this.confirmedSpeech = true;
     this.confirmedAtMs = nowMs;
     this.lastMeaningfulSpeechAtMs = nowMs;
     this.quietSinceMs = null;
-    this.ambientFrozen = true;
+    this.onsetAboveSinceMs = null;
     if (this.ambientCount > 0) this.ambientBaseline = this.ambientSum / this.ambientCount;
+    this.logNoiseFloor(nowMs, "confirmed");
+  }
+
+  private updateNoiseFloor(rms: number, nowMs: number): void {
+    if (this.firstFrameAtMs == null) return;
+    const inCalibration = nowMs - this.firstFrameAtMs <= NOISE_FLOOR_WINDOW_MS;
+    // Reject speech-like spikes so they never inflate the floor.
+    const spikeCap = this.ambientCount === 0
+      ? Infinity
+      : Math.max(this.ambientBaseline * 1.8, this.ambientBaseline + 0.01, 0.015);
+    if (rms > spikeCap) return;
+
+    if (inCalibration || this.ambientCount < 8) {
+      this.ambientSum += rms;
+      this.ambientCount += 1;
+      this.ambientBaseline = this.ambientSum / this.ambientCount;
+      return;
+    }
+    if (this.confirmedSpeech) return;
+    // Continuous non-speech tracking: only adapt when energy is near the
+    // current floor (fan/ambient). Rising speech edges must not chase the floor up.
+    if (rms > this.ambientBaseline * 1.35) return;
+    const alpha = 0.08;
+    this.ambientBaseline += alpha * (rms - this.ambientBaseline);
+    this.ambientSum = this.ambientBaseline * this.ambientCount;
+  }
+
+  private pushRecentRms(rms: number, nowMs: number): void {
+    this.recentRms.push({ t: nowMs, rms });
+    const cutoff = nowMs - ONSET_VARIANCE_WINDOW_MS;
+    while (this.recentRms.length && this.recentRms[0]!.t < cutoff) {
+      this.recentRms.shift();
+    }
+  }
+
+  private rmsVariance(): number {
+    if (this.recentRms.length < 4) return 0;
+    const values = this.recentRms.map((r) => r.rms);
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const varSum = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
+    return varSum;
+  }
+
+  private tryConfirmSpeech(rms: number, nowMs: number): void {
+    const floor = this.onsetFloor;
+    const snr = this.ambientBaseline > 1e-9 ? this.smoothedRms / this.ambientBaseline : 0;
+    this.lastOnsetSnr = Number(snr.toFixed(3));
+    const above = this.smoothedRms > floor;
+    const variance = this.rmsVariance();
+    if (variance >= ONSET_MIN_VARIANCE) this.sawOnsetBurst = true;
+
+    if (!above) {
+      this.onsetAboveSinceMs = null;
+      this.lastOnsetRejectedReason = "below_snr";
+      return;
+    }
+    if (this.onsetAboveSinceMs == null) this.onsetAboveSinceMs = nowMs;
+    const held = nowMs - this.onsetAboveSinceMs;
+    if (held < ONSET_HOLD_MS) {
+      this.lastOnsetRejectedReason = "hold_incomplete";
+      return;
+    }
+    // Steady machine noise: elevated RMS with no burst/onset dynamics.
+    if (!this.sawOnsetBurst && variance < ONSET_MIN_VARIANCE) {
+      this.lastOnsetRejectedReason = "steady_noise";
+      voiceClientLog("onset_rejected_reason", {
+        turn_id: this.turnId,
+        reason: "steady_noise",
+        vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
+        onset_snr: this.lastOnsetSnr,
+        variance: Number(variance.toFixed(8)),
+      });
+      return;
+    }
+    this.lastOnsetRejectedReason = null;
+    voiceClientLog("vad_noise_floor", {
+      turn_id: this.turnId,
+      vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
+      onset_snr: this.lastOnsetSnr,
+      onset_floor: Number(floor.toFixed(4)),
+    });
+    this.noteSpeechConfirmed(nowMs);
+  }
+
+  private logNoiseFloor(nowMs: number, reason: string): void {
+    if (nowMs - this.lastNoiseFloorLogAt < 1000 && reason !== "confirmed") return;
+    this.lastNoiseFloorLogAt = nowMs;
+    voiceClientLog("vad_noise_floor", {
+      turn_id: this.turnId,
+      vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
+      onset_snr: this.lastOnsetSnr,
+      reason,
+    });
   }
 
   /**
@@ -133,20 +273,18 @@ export class TurnEndpoint {
       this.smoothedRms += alpha * (rms - this.smoothedRms);
     }
 
+    this.pushRecentRms(rms, nowMs);
+
     if (!this.confirmedSpeech) {
-      // Ambient baseline: first 500ms before confirmed speech, then frozen.
-      // Outlier rejection keeps the ~64ms speech run-up (and bumps) out of the mean.
-      if (!this.ambientFrozen && nowMs - this.firstFrameAtMs <= AMBIENT_WINDOW_MS) {
-        const cap = this.ambientCount === 0 ? Infinity : Math.max(this.ambientBaseline * 2, 0.02);
-        if (rms <= cap) {
-          this.ambientSum += rms;
-          this.ambientCount += 1;
-          this.ambientBaseline = this.ambientSum / this.ambientCount;
-        }
-      } else {
-        this.ambientFrozen = true;
+      this.updateNoiseFloor(rms, nowMs);
+      // Wait for initial calibration before onset decisions.
+      if (nowMs - (this.firstFrameAtMs ?? nowMs) >= Math.min(120, NOISE_FLOOR_WINDOW_MS * 0.5)) {
+        this.tryConfirmSpeech(rms, nowMs);
       }
-      return;
+      if (!this.confirmedSpeech) {
+        this.logNoiseFloor(nowMs, "calibrating");
+        return;
+      }
     }
 
     if (this.smoothedRms > this.meaningfulFloor) {
@@ -194,8 +332,10 @@ export class TurnEndpoint {
       turn_id: turnId,
       reason,
       ambient_rms: Number(this.ambientBaseline.toFixed(4)),
+      vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
       smoothed_rms: Number(this.smoothedRms.toFixed(4)),
       quiet_ceiling: this.quietCeiling,
+      onset_snr: this.lastOnsetSnr,
       recording_age_ms: ageMs,
     });
     this.onFinish(reason);
