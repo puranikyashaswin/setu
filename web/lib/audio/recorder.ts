@@ -1,3 +1,4 @@
+import { setAudioSession } from "@/lib/audio/audio-session";
 import { debugLog, voiceClientLog } from "@/lib/debug";
 import { encodeWav } from "@/lib/audio/wav";
 import { ensureVadWorklet, getVadProcessorName } from "@/lib/audio/worklet-vad";
@@ -15,6 +16,7 @@ export const MIN_SPEECH_MS = 160;
 export const POST_TTS_RESUME_MS = 700;
 
 export type RecorderSession = {
+  context: AudioContext;
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
@@ -35,6 +37,7 @@ export type RecorderSession = {
   frameMs: number;
   framesSeen: number;
   watchdog: number;
+  constraintsPath: string;
   onFrame?: (info: { rms: number; threshold: number }) => void;
 };
 
@@ -53,24 +56,62 @@ async function ensureWorklet(context: AudioContext) {
   workletReadyFor = context;
 }
 
-export async function startVoiceRecorder(
-  context: AudioContext,
-  callbacks: RecorderCallbacks,
-): Promise<RecorderSession> {
+/** Preferred mic constraints — disable voice-processing that ducks later TTS. */
+export const PREFERRED_MIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 1,
+  },
+};
+
+/**
+ * Open mic after switching audio session to play-and-record.
+ * Falls back to `{ audio: true }` when preferred constraints are unsupported.
+ */
+export async function openMicrophoneStream(): Promise<{
+  stream: MediaStream;
+  constraintsPath: "processing_off" | "audio_true_fallback";
+}> {
+  setAudioSession("play-and-record");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(PREFERRED_MIC_CONSTRAINTS);
+    voiceClientLog("mic_constraints", { path: "processing_off" });
+    console.info("[audio] mic_constraints path=processing_off");
+    return { stream, constraintsPath: "processing_off" };
+  } catch {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceClientLog("mic_constraints", { path: "audio_true_fallback" });
+    console.info("[audio] mic_constraints path=audio_true_fallback");
+    return { stream, constraintsPath: "audio_true_fallback" };
+  }
+}
+
+function audioContextConstructor(): typeof AudioContext {
+  const ctor =
+    window.AudioContext ||
+    (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!ctor) throw new Error("Web Audio is not supported in this browser");
+  return ctor;
+}
+
+export async function startVoiceRecorder(callbacks: RecorderCallbacks): Promise<RecorderSession> {
+  const AudioContextConstructor = audioContextConstructor();
+  const context = new AudioContextConstructor();
+  try {
+    await context.resume();
+  } catch {
+    /* continue — worklet may still run once running */
+  }
+
   await ensureWorklet(context);
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
+  const { stream, constraintsPath } = await openMicrophoneStream();
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
   analyser.fftSize = 256;
   const worklet = new AudioWorkletNode(context, getVadProcessorName());
   // Keep the worklet in the graph without audible output (gain 0).
-  // Never raise this gain — VAD must stay silent while analyzing.
   const silenceGain = context.createGain();
   silenceGain.gain.value = 0;
   source.connect(analyser);
@@ -79,6 +120,7 @@ export async function startVoiceRecorder(
   silenceGain.connect(context.destination);
 
   const recorder: RecorderSession = {
+    context,
     stream,
     source,
     analyser,
@@ -99,6 +141,7 @@ export async function startVoiceRecorder(
     frameMs: (128 / context.sampleRate) * 1000,
     framesSeen: 0,
     watchdog: 0,
+    constraintsPath,
   };
 
   const meterData = new Uint8Array(analyser.frequencyBinCount);
@@ -193,13 +236,19 @@ export async function startVoiceRecorder(
     }
   }, 250);
 
-  // mic_open is logged by the voice-loop gate with turn_id (avoids duplicate bursts).
-  voiceClientLog("mic_stream_ready", { sampleRate: recorder.sampleRate });
+  voiceClientLog("mic_stream_ready", {
+    sampleRate: recorder.sampleRate,
+    constraints: recorder.constraintsPath,
+  });
   return recorder;
 }
 
-export function teardownRecorder(recorder: RecorderSession | null) {
-  if (!recorder) return;
+/**
+ * Fully release the recorder graph: disconnect nodes, stop tracks, close AudioContext.
+ * Returns number of tracks stopped.
+ */
+export function teardownRecorder(recorder: RecorderSession | null): number {
+  if (!recorder) return 0;
   window.clearInterval(recorder.watchdog);
   cancelAnimationFrame(recorder.raf);
   try {
@@ -211,10 +260,39 @@ export function teardownRecorder(recorder: RecorderSession | null) {
   try {
     recorder.silenceGain.disconnect();
     recorder.source.disconnect();
+    recorder.analyser.disconnect();
   } catch {
     /* ignore */
   }
-  recorder.stream.getTracks().forEach((track) => track.stop());
+
+  let trackCount = 0;
+  try {
+    const tracks = recorder.stream.getTracks();
+    trackCount = tracks.length;
+    tracks.forEach((track) => track.stop());
+  } catch {
+    /* ignore */
+  }
+  console.info(`[audio] mic_tracks_stopped count=${trackCount}`);
+  voiceClientLog("mic_tracks_stopped", { count: trackCount });
+
+  const context = recorder.context;
+  if (workletReadyFor === context) workletReadyFor = null;
+  try {
+    // Close — do not leave suspended play-and-record graphs alive.
+    void context.close().then(() => {
+      console.info("[audio] recorder_context_closed");
+      voiceClientLog("recorder_context_closed", {});
+    }).catch(() => {
+      console.info("[audio] recorder_context_closed");
+      voiceClientLog("recorder_context_closed", { already_closed: true });
+    });
+  } catch {
+    console.info("[audio] recorder_context_closed");
+    voiceClientLog("recorder_context_closed", { already_closed: true });
+  }
+
+  return trackCount;
 }
 
 export function recorderToWav(recorder: RecorderSession): Blob {

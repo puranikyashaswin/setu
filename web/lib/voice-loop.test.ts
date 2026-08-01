@@ -56,6 +56,15 @@ describe("voice-loop single-flight", () => {
       if (!gate.ok) assert.equal(gate.reason, "not_active");
     }
   });
+
+  it("auto-relisten only after idle (post playback_finalize)", () => {
+    const loop = createVoiceLoop();
+    const turn = loop.beginTurn();
+    loop.transition("speaking", "playback_start");
+    assert.equal(loop.tryResumeListening(turn).ok, false);
+    loop.transition("idle", "playback_natural");
+    assert.equal(loop.tryResumeListening(turn).ok, true);
+  });
 });
 
 describe("playback queue serial parts", () => {

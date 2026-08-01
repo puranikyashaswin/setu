@@ -7,9 +7,16 @@ import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verify
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
 import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
-import { startBargeInMonitor, type BargeInMonitor } from "@/lib/audio/barge-in";
+import type { BargeInMonitor } from "@/lib/audio/barge-in";
+import {
+  micOpenBlockReason,
+  prepareAssistantPlayback,
+  setAudioSession,
+  setAudioSessionLogger,
+} from "@/lib/audio/audio-session";
 import {
   base64ToArrayBuffer,
+  isTtsPlaybackActive,
   playDecodedBuffersSequential,
   stopAllPlayback,
   stopNonTtsAudio,
@@ -31,6 +38,8 @@ import {
 } from "@/lib/audio/recorder";
 import { debugLog, isDebugAudio, voiceClientLog } from "@/lib/debug";
 import { getVoiceSession } from "@/lib/voice-session";
+
+setAudioSessionLogger(voiceClientLog);
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
 import { SetuOrb } from "@/components/SetuOrb";
 import type {
@@ -1052,7 +1061,6 @@ export default function Home() {
   const [docId, setDocId] = useState<string | null>(null);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraReadiness, setCameraReadiness] = useState(0);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const browserSttRef = useRef<BrowserSttSession | null>(null);
   const playbackRef = useRef<PlaybackHandles | null>(null);
@@ -1138,40 +1146,6 @@ export default function Home() {
     pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਕਿਰਪਾ ਕਰਕੇ ਦਸਤਾਵੇਜ਼ ਕੈਮਰੇ ਅੱਗੇ ਵਿਖਾਓ.", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ", timeout: "ਫੋਟੋ ਅਸਪਸ਼ਟ ਹੈ ਜਾਂ ਵਿਸ਼ਲੇਸ਼ਣ ਵਿੱਚ ਦੇਰ ਹੋਈ — ਚੰਗੀ ਰੋਸ਼ਨੀ ਵਿੱਚ ਮੁੜ ਲਓ", upload: "ਕੈਮਰਾ ਨਹੀਂ. ਦਸਤਾਵੇਜ਼ ਦੀ ਫੋਟੋ ਅੱਪਲੋਡ ਕਰੋ." },
     or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦୟାକରି ଦଲିଲ କ୍ୟାମେରା ଆଗରେ ଦେଖାନ୍ତୁ.", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ", timeout: "ଫଟୋ ଅସ୍ପଷ୍ଟ କିମ୍ବା ବିଶ୍ଳେଷଣରେ ବିଳମ୍ବ — ଭଲ ଆଲୋକରେ ପୁଣି ନିଅନ୍ତୁ", upload: "କ୍ୟାମେରା ନାହିଁ. ଦଲିଲ ଫଟୋ ଅପଲୋଡ୍ କରନ୍ତୁ." },
   })[0];
-
-  const getAudioContext = useCallback(() => {
-    const AudioContextConstructor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextConstructor) throw new Error("Web Audio is not supported in this browser");
-    if (!audioContextRef.current) audioContextRef.current = new AudioContextConstructor();
-    return audioContextRef.current;
-  }, []);
-
-  /**
-   * Resume the shared context, and rebuild it if the phone refuses. iOS will not resume a
-   * context outside a user gesture; while it stays suspended the meter gets no frames and
-   * TTS routed through it is silent. A fresh context starts running once audio is unlocked.
-   */
-  const ensureRunningAudioContext = useCallback(async () => {
-    let context = getAudioContext();
-    try {
-      await context.resume();
-    } catch { /* fall through to the rebuild below */ }
-    if (context.state === "running") return context;
-    console.warn("[Setu audio] context stuck suspended; rebuilding");
-    const AudioContextConstructor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextConstructor) return context;
-    try {
-      void context.close();
-    } catch { /* already closed */ }
-    playbackRef.current?.stop();
-    playbackRef.current = null;
-    context = new AudioContextConstructor();
-    audioContextRef.current = context;
-    try {
-      await context.resume();
-    } catch { /* caller reports the failure through the mic watchdog */ }
-    return context;
-  }, [getAudioContext]);
 
   // Visual thinking stages only — no web-audio / cue tones.
   useEffect(() => {
@@ -1430,8 +1404,9 @@ export default function Home() {
     maxSpokenChars = 240,
     prefetchedAudio?: ArrayBuffer,
     prefetchedParts?: ArrayBuffer[],
-    allowBargeIn = true,
+    _allowBargeIn = true,
   ) => {
+    // Full mic teardown before TTS so iOS leaves play-and-record voice mode.
     stopActiveRecording();
     stopBargeIn();
     // Cancel prior TTS cleanly (settles previous turn once as cancelled — no mic reopen).
@@ -1442,6 +1417,8 @@ export default function Home() {
       stopAllPlayback("cancelled");
     }
     stopNonTtsAudio("play_speech_start");
+    audioRef.current?.pause();
+    audioRef.current = null;
 
     const loop = voiceLoopRef.current;
     const playTurnId = loop.beginTurn();
@@ -1461,12 +1438,7 @@ export default function Home() {
     orbStateRef.current = "processing";
     setOrbState("processing");
     setStatusText("Preparing a response");
-    let bargedIn = false;
     let settled = false;
-    // Barge-in opens a second mic stream — skip during onboarding so welcome TTS
-    // and the first listen aren't killed by speaker echo.
-    const session = sessionsRef.current.find((item) => item.id === activeSessionIdRef.current);
-    const bargeInEnabled = Boolean(allowBargeIn && continueListening && session?.onboarded);
     try {
       let buffers = prefetchedParts?.filter(Boolean) ?? [];
       if (!buffers.length) {
@@ -1493,7 +1465,10 @@ export default function Home() {
         }
         buffers = [arrayBuffer!];
       }
-      const context = await ensureRunningAudioContext();
+
+      // recorder closed → tracks stopped → audio session playback → iOS settle → HTMLAudioElement.
+      await prepareAssistantPlayback();
+
       await new Promise<void>((resolve, reject) => {
         const finishClean = () => {
           stopBargeIn();
@@ -1503,12 +1478,15 @@ export default function Home() {
           setPreviewingVoice(null);
           setService(null);
           playbackRef.current = null;
+          audioRef.current = null;
         };
 
         const handleSettled = (outcome: PlaybackOutcome) => {
           if (settled) return;
           settled = true;
           finishClean();
+          // Keep playback session until the next getUserMedia.
+          setAudioSession("playback");
           // Never leave state=speaking after playback_end (natural or stopped).
           loop.transition("idle", `playback_${outcome}`);
           orbStateRef.current = "idle";
@@ -1545,32 +1523,14 @@ export default function Home() {
         };
 
         void playDecodedBuffersSequential({
-          context,
           arrayBuffers: buffers,
           turnId: playTurnId,
           onPlay: () => {
             loop.transition("speaking", "playback_start");
             orbStateRef.current = "speaking";
             setOrbState("speaking");
-            setStatusText(bargeInEnabled ? "Speaking — interrupt anytime" : "Speaking");
-            if (bargeInEnabled) {
-              void startBargeInMonitor(context, () => {
-                if (bargedIn || settled) return;
-                if (speakTurnIdRef.current !== playTurnId) return;
-                bargedIn = true;
-                voiceSessionRef.current.cancel();
-                // Single settle path via stop("interrupted") — no manual resume here.
-                playbackRef.current?.stop("interrupted");
-              }).then((monitor) => {
-                if (bargedIn || settled || orbStateRef.current !== "speaking") {
-                  monitor.stop();
-                  return;
-                }
-                bargeInRef.current = monitor;
-              }).catch(() => {
-                /* barge-in optional on restricted browsers */
-              });
-            }
+            // No getUserMedia barge-in during speaking — keeps audio session in playback.
+            setStatusText("Speaking — tap to interrupt");
           },
           onAmplitude: (nextAmplitude, nextBands, nextSpectrum) => {
             setAmplitude(nextAmplitude);
@@ -1593,7 +1553,7 @@ export default function Home() {
       if (continueListening && speakTurnIdRef.current === playTurnId) resumeListening(playTurnId);
       else setStatusText(error instanceof Error ? error.message : "Tap to continue");
     }
-  }, [ensureRunningAudioContext, pace, resumeListening, speaker, stopActiveRecording]);
+  }, [pace, resumeListening, speaker, stopActiveRecording]);
 
   const syncSessionToServer = useCallback(async (session: Session) => {
     const userId = userIdRef.current ?? getStoredUserId();
@@ -1902,6 +1862,8 @@ export default function Home() {
     teardownRecorder(recorder);
     isRecordingFlagRef.current = false;
     setIsRecording(false); setAmplitude(0.2); setBands({ bass: 0, treble: 0 }); setAutoStopProgress(0); setMicLevel(0);
+    // Leave play-and-record as soon as capture ends (before STT/LLM/TTS).
+    setAudioSession("playback");
     const sttSession = browserSttRef.current;
     browserSttRef.current = null;
     const spokenMs = speechMs(recorder);
@@ -2148,16 +2110,22 @@ export default function Home() {
   const startRecording = useCallback(async (options?: { force?: boolean }) => {
     const loop = voiceLoopRef.current;
     if (isRecordingFlagRef.current) { void finishRecording(); return; }
-    const playbackLive = Boolean(playbackRef.current);
-    if (!options?.force && (orbStateRef.current === "speaking" || playbackLive || loop.state === "speaking")) {
-      voiceClientLog("mic_open_skipped", { reason: "not_active", state: loop.state });
+
+    const block = micOpenBlockReason({
+      voiceState: loop.state,
+      ttsActive: isTtsPlaybackActive() || Boolean(playbackRef.current),
+    });
+    if (block) {
+      voiceClientLog("mic_open_blocked", { reason: block, state: loop.state, force: Boolean(options?.force) });
+      console.info(`[audio] mic_open_blocked reason=${block}`);
       return;
     }
-    if (options?.force && playbackLive) {
-      playbackRef.current?.stop();
-      playbackRef.current = null;
-      stopAllPlayback();
+    // Also block orb speaking even if loop briefly drifted.
+    if (!options?.force && orbStateRef.current === "speaking") {
+      voiceClientLog("mic_open_blocked", { reason: "speaking", state: "speaking" });
+      return;
     }
+
     // Always tear down any leftover mic before opening a new one.
     if (recorderRef.current) {
       teardownRecorder(recorderRef.current);
@@ -2168,8 +2136,8 @@ export default function Home() {
     audioRef.current = null;
     const openTurnId = speakTurnIdRef.current || loop.beginTurn();
     try {
-      const context = await ensureRunningAudioContext();
-      const recorder = await startVoiceRecorder(context, {
+      // play-and-record + getUserMedia happen inside startVoiceRecorder / openMicrophoneStream.
+      const recorder = await startVoiceRecorder({
         onLevel: (amp, nextBands, level, threshold) => {
           setAmplitude(amp);
           setBands(nextBands);
@@ -2221,7 +2189,7 @@ export default function Home() {
       setIsRecording(false);
       setStatusText(error instanceof Error ? "Microphone permission is required" : "Unable to start microphone");
     }
-  }, [ensureRunningAudioContext, finishRecording]);
+  }, [finishRecording]);
 
 
   useEffect(() => {
@@ -2245,7 +2213,6 @@ export default function Home() {
       setOrbState("processing");
       setStatusText("Welcome to Setu");
       try {
-        await getAudioContext().resume();
         await playSpeech(VOICE_LANGUAGE_PROMPT, "en", true, "shubh", undefined, undefined, 200, undefined, undefined, false);
       } catch {
         setOrbState("idle");
@@ -2350,16 +2317,29 @@ export default function Home() {
     })();
   }, [sessions, activeSessionId, sessionsLoaded, syncSessionToServer]);
 
-  useEffect(() => () => {
-    teardownRecorder(recorderRef.current);
-    recorderRef.current = null;
-    const monitor = bargeInRef.current;
-    bargeInRef.current = null;
-    monitor?.stop();
-    playbackRef.current?.stop();
-    audioRef.current?.pause();
-    voiceSessionRef.current.close();
-    previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url));
+  useEffect(() => {
+    const releaseAudioSession = () => {
+      teardownRecorder(recorderRef.current);
+      recorderRef.current = null;
+      isRecordingFlagRef.current = false;
+      const monitor = bargeInRef.current;
+      bargeInRef.current = null;
+      monitor?.stop();
+      playbackRef.current?.stop("cancelled");
+      playbackRef.current = null;
+      stopAllPlayback("cancelled");
+      audioRef.current?.pause();
+      audioRef.current = null;
+      setAudioSession("auto");
+    };
+    const onPageHide = () => releaseAudioSession();
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      releaseAudioSession();
+      voiceSessionRef.current.close();
+      previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url));
+    };
   }, []);
 
   // Hold a wake lock while the conversation is live so the phone cannot lock mid-answer.
