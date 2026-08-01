@@ -716,23 +716,24 @@ def _log_messages(route: str, messages: list[dict]) -> None:
     logger.info("[messages] %s %s", route, payload)
 
 
-SETU_INTRO_EN = "Great. I'm Setu. How can I help you?"
+SETU_INTRO_EN = (
+    "Hi. I am Setu. Ask me anything, or show me a document and I will explain it."
+)
 
-# After language pick — warm confirm in that language, then keep chatting.
+# After language pick — short onboarding intro in that language (< ~25 words).
 SETU_INTRO_BY_LANG: dict[str, str] = {
-    "en": "Great. I'm Setu. How can I help you?",
-    "te": "సరే. నేను సేతు. మీకు ఎలా సహాయం చేయగలను?",
-    "hi": "ठीक है. मैं सेतु हूँ. मैं आपकी कैसे मदद करूँ?",
-    "mr": "छान. मी सेतू आहे. मी तुम्हाला कशी मदत करू?",
-    "ta": "சரி. நான் சேது. நான் உங்களுக்கு எப்படி உதவட்டும்?",
-    "kn": "ಸರಿ. ನಾನು ಸೇತು. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?",
-    "bn": "ঠিক আছে. আমি সেতু. আমি কীভাবে সাহায্য করতে পারি?",
-    "gu": "સારું. હું સેતુ છું. હું તમારી કેવી રીતે મદદ કરું?",
-    "ml": "ശരി. ഞാൻ സേതു. ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
-    "pa": "ਠੀਕ ਹੈ. ਮੈਂ ਸੇਤੂ ਹਾਂ. ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
-    "or": "ଠିକ୍ ଅଛି. ମୁଁ ସେତୁ. ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
+    "en": SETU_INTRO_EN,
+    "te": "నమస్కారం. నేను సేతు. ఏదైనా అడగండి, లేదా పత్రం చూపిస్తే వివరిస్తాను.",
+    "hi": "नमस्ते. मैं सेतु हूँ. कुछ भी पूछें, या दस्तावेज़ दिखाएँ — मैं समझाऊँगा.",
+    "mr": "नमस्कार. मी सेतू. काहीही विचारा, किंवा कागद दाखवा — मी समजावीन.",
+    "ta": "வணக்கம். நான் சேது. எதையும் கேளுங்கள், அல்லது ஆவணம் காட்டுங்கள்.",
+    "kn": "ನಮಸ್ಕಾರ. ನಾನು ಸೇತು. ಏನಾದರೂ ಕೇಳಿ, ಅಥವಾ ದಾಖಲೆ ತೋರಿಸಿ.",
+    "bn": "নমস্কার. আমি সেতু. যেকোনো প্রশ্ন করুন, বা নথি দেখান.",
+    "gu": "નમસ્તે. હું સેતુ. કંઈ પણ પૂછો, અથવા દસ્તાવેજ બતાવો.",
+    "ml": "നമസ്കാരം. ഞാൻ സേതു. എന്തും ചോദിക്കൂ, അല്ലെങ്കിൽ രേഖ കാണിക്കൂ.",
+    "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ. ਮੈਂ ਸੇਤੂ ਹਾਂ. ਕੁਝ ਵੀ ਪੁੱਛੋ, ਜਾਂ ਦਸਤਾਵੇਜ਼ ਵਿਖਾਓ.",
+    "or": "ନମସ୍କାର. ମୁଁ ସେତୁ. କିଛି ପଚାରନ୍ତୁ, କିମ୍ବା ଦଲିଲ ଦେଖାନ୍ତୁ.",
 }
-
 
 def intro_for_language(language: str) -> str:
     """Warm spoken intro after the user picks a language."""
@@ -772,43 +773,48 @@ LANGUAGE_SWITCH_BY_LANG: dict[str, str] = {
 
 CAMERA_PHRASES_BY_LANG: dict[str, dict[str, str]] = {
     "en": {
-        "show": "Show me",
+        "show": "Please hold your document up to the camera so I can read it.",
+        "upload": "Camera is unavailable. Please upload a photo of the document instead.",
         "ready": "Ready.",
         "unclear": "Could not read that clearly",
         "reading": "Reading",
     },
     "te": {
-        "show": "చూపించండి",
+        "show": "దయచేసి పత్రాన్ని కెమెరా ముందు చూపించండి, నేను చదువుతాను.",
+        "upload": "కెమెరా లేదు. దయచేసి పత్రం ఫోటో అప్‌లోడ్ చేయండి.",
         "ready": "సరే.",
         "unclear": "స్పష్టంగా చదవలేకపోయాను",
         "reading": "చదువుతున్నాను",
     },
     "hi": {
-        "show": "दिखाइए",
+        "show": "कृपया दस्तावेज़ कैमरे के सामने दिखाइए, मैं पढ़ूँगा.",
+        "upload": "कैमरा उपलब्ध नहीं है. कृपया दस्तावेज़ की फ़ोटो अपलोड करें.",
         "ready": "हाँ.",
         "unclear": "साफ़ नहीं पढ़ सका",
         "reading": "पढ़ रहा हूँ",
     },
     "mr": {
-        "show": "दाखवा",
+        "show": "कृपया कागद कॅमेऱ्यासमोर दाखवा, मी वाचेन.",
+        "upload": "कॅमेरा उपलब्ध नाही. कृपया कागदाचा फोटो अपलोड करा.",
         "ready": "होय.",
         "unclear": "स्पष्ट वाचता आले नाही",
         "reading": "वाचत आहे",
     },
     "ta": {
-        "show": "காட்டுங்கள்",
+        "show": "தயவுசெய்து ஆவணத்தை கேமராவுக்குக் காட்டுங்கள், நான் படிப்பேன்.",
+        "upload": "கேமரா இல்லை. ஆவணப் படத்தைப் பதிவேற்றுங்கள்.",
         "ready": "ஆம்.",
         "unclear": "தெளிவாகப் படிக்க முடியவில்லை",
         "reading": "படிக்கிறேன்",
     },
     "kn": {
-        "show": "ತೋರಿಸಿ",
+        "show": "ದಯವಿಟ್ಟು ದಾಖಲೆಯನ್ನು ಕ್ಯಾಮೆರಾಗೆ ತೋರಿಸಿ, ನಾನು ಓದುತ್ತೇನೆ.",
+        "upload": "ಕ್ಯಾಮೆರಾ ಇಲ್ಲ. ದಾಖಲೆಯ ಫೋಟೋ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ.",
         "ready": "ಹೌದು.",
         "unclear": "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ",
         "reading": "ಓದುತ್ತಿದ್ದೇನೆ",
     },
 }
-
 
 def brief_ack_for_language(language: str) -> str:
     base = _lang_base(language) or "en"
@@ -1284,7 +1290,22 @@ def _run_vision(file_bytes: bytes, filename: str, language: str = "te-IN") -> tu
     try:
         _with_backoff(lambda: job.upload_file(tmp_path))
         _with_backoff(job.start)
-        status = _with_backoff(job.wait_until_complete)
+        # Bound polling — cancelled/stuck jobs must not flood logs forever.
+        _VISION_WAIT_S = float(os.getenv("VISION_JOB_TIMEOUT_S") or "120")
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-wait") as pool:
+            fut = pool.submit(lambda: _with_backoff(job.wait_until_complete))
+            try:
+                status = fut.result(timeout=_VISION_WAIT_S)
+            except FuturesTimeout as exc:
+                logger.error(
+                    "Vision job timed out after %.0fs — stopping poll",
+                    _VISION_WAIT_S,
+                )
+                raise RuntimeError(
+                    f"Vision job timed out after {_VISION_WAIT_S:.0f}s"
+                ) from exc
         if status.job_state == "Failed":
             raise RuntimeError(f"Vision job failed: {status.job_state}")
 

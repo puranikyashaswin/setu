@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from collections.abc import Callable
 from typing import Any
@@ -14,6 +15,20 @@ import sarvam
 from doc_retrieve import retrieve_chunks
 
 logger = logging.getLogger("setu")
+
+_BCP47: dict[str, str] = {
+    "te": "te-IN",
+    "hi": "hi-IN",
+    "en": "en-IN",
+    "mr": "mr-IN",
+    "ta": "ta-IN",
+    "kn": "kn-IN",
+    "bn": "bn-IN",
+    "gu": "gu-IN",
+    "ml": "ml-IN",
+    "pa": "pa-IN",
+    "or": "or-IN",
+}
 
 
 def _voice_log(session_id: str | None, event: str, **fields: Any) -> None:
@@ -28,7 +43,16 @@ def _voice_log(session_id: str | None, event: str, **fields: Any) -> None:
         logger.info("[voice] session=%s event=%s %s", session_id or "-", event, extras)
 
 
-def _route_intent_label(route: str) -> str:
+def _route_intent_label(route: str, intent: str | None = None) -> str:
+    if intent in {
+        "language_switch",
+        "scan",
+        "ask",
+        "chat",
+        "ack",
+        "fallback",
+    }:
+        return intent
     return {
         "language_switch": "language_switch",
         "open_camera": "scan",
@@ -37,6 +61,22 @@ def _route_intent_label(route: str) -> str:
         "converse": "chat",
         "intro": "chat",
     }.get(route, "fallback")
+
+
+def to_bcp47(language: str | None) -> str:
+    base = (language or "en").strip().lower().split("-", 1)[0]
+    if base == "od":
+        base = "or"
+    return _BCP47.get(base, "en-IN")
+
+
+def normalize_utterance(message: str) -> str:
+    """NFKC + lowercase Roman + strip punctuation noise from STT."""
+    text = unicodedata.normalize("NFKC", message or "")
+    text = text.strip().lower()
+    text = re.sub(r"[.!?,;:\"'`…]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 _WANTS_DOC_RE = (
     r"(i have (a |the )?document|show (you )?(my |the )?document|"
@@ -81,6 +121,20 @@ _LANG_NAME_HINTS: dict[str, tuple[str, ...]] = {
     "pa": ("punjabi", "ਪੰਜਾਬੀ"),
     "or": ("odia", "oriya", "ଓଡ଼ିଆ"),
 }
+
+# Preference / switch cues (Roman + common Indic patterns).
+_LANG_PREF_RE = re.compile(
+    r"(?:\b(?:i\s+speak|i\s+want|speak|talk|switch|change|use|set|prefer|language|"
+    r"matladu|matladutanu|matladutunnanu|matladali|baat|bolo|bolna|mein|me|"
+    r"nenu|lo)\b|"
+    r"में\s*बात|बात\s*करो|లో\s*మాట్లాడ|మాట్లాడు)",
+    re.I,
+)
+_LANG_QUESTION_RE = re.compile(
+    r"\b(what|who|where|when|why|how|which|tell\s+me\s+about|meaning\s+of|"
+    r"difference|history)\b",
+    re.I,
+)
 
 AGENT_TOOLS: list[dict[str, Any]] = [
     {
@@ -191,38 +245,50 @@ class AgentResult:
 
 
 def detect_language_request(message: str) -> str | None:
-    text = (message or "").strip().lower()
+    """Return base language code when the user is selecting/switching spoken language."""
+    text = normalize_utterance(message)
     if not text:
         return None
+
+    # Exact / near-exact name: "Telugu", "తెలుగు.", "English"
     for code, names in _LANG_NAME_HINTS.items():
         for name in names:
-            if name.lower() not in text:
+            n = normalize_utterance(name)
+            if not n:
                 continue
-            if re.fullmatch(rf"[\s.!?]*{re.escape(name.lower())}[\s.!?]*", text):
+            if text == n or text == code:
                 return code
-            if re.search(
-                rf"\b(speak|talk|switch|change|use|set|in|to|language)\b.*{re.escape(name.lower())}"
-                rf"|{re.escape(name.lower())}.*\b(language|లో|में|में)\b",
-                text,
-                re.I,
-            ):
-                return code
-            if len(text.split()) <= 4 and name.lower() in text:
-                return code
+
+    # Natural preference phrases containing a language name.
+    hits: list[tuple[str, str]] = []
+    for code, names in _LANG_NAME_HINTS.items():
+        for name in names:
+            n = normalize_utterance(name)
+            if not n:
+                continue
+            if re.search(rf"(?<!\w){re.escape(n)}(?!\w)", text) or n in text:
+                hits.append((code, n))
+    if not hits:
+        return None
+
+    # Prefer the longest matched name (hindi vs hi edge cases).
+    hits.sort(key=lambda item: len(item[1]), reverse=True)
+    code = hits[0][0]
+
+    # "what is telugu" → not a switch; "i speak telugu" / "telugu lo matladu" → switch.
+    if _LANG_QUESTION_RE.search(text) and not _LANG_PREF_RE.search(text):
+        return None
+    if _LANG_PREF_RE.search(text):
+        return code
+    if len(text.split()) <= 6:
+        return code
     return None
 
 
 def is_language_switch_only(message: str, code: str) -> bool:
-    text = (message or "").strip().lower()
-    names = _LANG_NAME_HINTS.get(code, ())
-    stripped = re.sub(
-        r"\b(can|could|would|will|please|speak|talk|switch|change|use|set|the|language|in|into|to|me)\b",
-        " ",
-        text,
-        flags=re.I,
-    )
-    stripped = re.sub(r"\s+", " ", stripped).strip(" .!?")
-    return stripped in {n.lower() for n in names} or stripped == code
+    """True when the utterance is (only) a language pick/switch for `code`."""
+    detected = detect_language_request(message)
+    return detected == code
 
 
 def wants_document(message: str) -> bool:
@@ -578,9 +644,9 @@ def run_agent_turn(
     """Resolve a transcript into a speakable agent action."""
     history_msgs = history or []
     reply_language = (language or "en").split("-", 1)[0]
+    if reply_language == "od":
+        reply_language = "or"
     requested = detect_language_request(transcript)
-    if requested:
-        reply_language = requested
     route = (force_route or "").strip().lower() or None
     t_route = time.perf_counter()
 
@@ -589,42 +655,35 @@ def run_agent_turn(
             session_id,
             "route_decision",
             path=path,
-            intent=_route_intent_label(result.route),
+            intent=_route_intent_label(result.route, result.intent),
             ms=int((time.perf_counter() - t_route) * 1000),
         )
         return result
 
-    # Deterministic onboarding / language / camera paths (lowest latency, most reliable).
-    if route == "intro" or not onboarded:
-        if requested:
-            reply_language = requested
-        reply = sarvam.intro_for_language(reply_language)
-        return _decided(
-            "regex",
-            AgentResult(
-                route="intro",
-                reply=reply,
-                language=reply_language,
-                max_spoken=160,
-                spoken_parts=[reply],
-            ),
-        )
-
-    if route == "language_switch" or (
-        not route and requested and is_language_switch_only(transcript, requested)
-    ):
-        reply = sarvam.language_switch_for_language(reply_language)
+    # 1) Language pick/switch BEFORE chat/classifier/onboarding catch-alls.
+    if route == "language_switch" or (not route and requested):
+        code = requested or reply_language
+        bcp = to_bcp47(code)
+        # Session language is the selected code; client persists it from this result.
+        if not onboarded:
+            reply = sarvam.intro_for_language(bcp)
+            max_spoken = 220
+        else:
+            reply = sarvam.language_switch_for_language(bcp)
+            max_spoken = 40
         return _decided(
             "regex",
             AgentResult(
                 route="language_switch",
+                intent="language_switch",
                 reply=reply,
-                language=reply_language,
-                max_spoken=40,
+                language=bcp,
+                max_spoken=max_spoken,
                 spoken_parts=[reply],
             ),
         )
 
+    # 2) Explicit scan / open camera — speak guide + open_camera; never auto-OCR.
     if route == "open_camera" or (
         not route and wants_document(transcript) and (not has_document or not doc_id)
     ):
@@ -633,11 +692,27 @@ def run_agent_turn(
             "regex",
             AgentResult(
                 route="open_camera",
+                intent="scan",
                 reply=reply,
-                language=reply_language,
+                language=to_bcp47(reply_language),
                 open_camera=True,
                 continue_listening=False,
-                max_spoken=80,
+                max_spoken=120,
+                spoken_parts=[reply],
+            ),
+        )
+
+    # Forced intro (client/onboarding helpers); language pick already handled above.
+    if route == "intro":
+        reply = sarvam.intro_for_language(reply_language)
+        return _decided(
+            "regex",
+            AgentResult(
+                route="intro",
+                intent="chat",
+                reply=reply,
+                language=to_bcp47(reply_language),
+                max_spoken=220,
                 spoken_parts=[reply],
             ),
         )
@@ -726,8 +801,10 @@ def run_agent_turn(
     except Exception as exc:
         _voice_log(session_id, "error", stage="llm", detail=str(exc))
         raise
-    reply = chat.get("reply", "")
+    reply = (chat.get("reply") or "").strip()
     intent = chat.get("intent", "chat")
+    if not reply:
+        reply = sarvam.brief_ack_for_language(reply_language)
     _voice_log(
         session_id,
         "llm_done",
@@ -739,8 +816,8 @@ def run_agent_turn(
         return AgentResult(
             route="open_camera",
             reply=cam,
-            language=reply_language,
-            intent=intent,
+            language=to_bcp47(reply_language),
+            intent="scan",
             open_camera=True,
             continue_listening=False,
             model_used="sarvam-105b",
@@ -749,8 +826,8 @@ def run_agent_turn(
     return AgentResult(
         route="converse",
         reply=reply,
-        language=reply_language,
-        intent=intent,
+        language=to_bcp47(reply_language),
+        intent="chat",
         model_used="sarvam-105b",
         spoken_parts=_split_spoken_parts(reply),
     )

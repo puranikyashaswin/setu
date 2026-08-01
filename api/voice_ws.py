@@ -15,6 +15,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import agent
 import auth
+import db
 import rate_limit
 import sarvam
 
@@ -86,7 +87,6 @@ async def voice_socket(websocket: WebSocket):
         return
 
     await websocket.accept()
-    conn_id = uuid.uuid4().hex[:12]
     session: dict[str, Any] = {
         "language": "en",
         "has_document": False,
@@ -97,14 +97,63 @@ async def voice_socket(websocket: WebSocket):
         "onboarded": False,
         "pace": 1.0,
     }
+
+    def _history_from_turns(turns: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for turn in turns or []:
+            role = turn.get("role")
+            text = (turn.get("text") or "").strip()
+            if not text:
+                continue
+            if role in ("setu", "assistant"):
+                out.append({"role": "assistant", "content": text, "language": turn.get("language")})
+            elif role == "user":
+                out.append({"role": "user", "content": text, "language": turn.get("language")})
+        return out[-12:]
+
+    def _hydrate_from_db(session_id: str) -> bool:
+        loaded = db.get_session(session_id, user_id)
+        if not loaded:
+            return False
+        session["session_id"] = loaded["id"]
+        session["language"] = loaded.get("language") or "en"
+        session["doc_id"] = loaded.get("doc_id")
+        session["has_document"] = bool(loaded.get("doc_id"))
+        session["onboarded"] = bool(loaded.get("onboarded"))
+        session["history"] = _history_from_turns(loaded.get("turns") or [])
+        return True
+
+    def _resolve_persisted_session() -> str:
+        """Create/load the real session UUID before any voice_log call."""
+        requested = (websocket.query_params.get("session_id") or "").strip()
+        if requested and _hydrate_from_db(requested):
+            return str(session["session_id"])
+        created = db.upsert_session(
+            {
+                "id": requested or None,
+                "user_id": user_id,
+                "title": "New chat",
+                "language": "en",
+                "onboarded": False,
+                "turns": [],
+            }
+        )
+        sid_value = str(created.get("id") or uuid.uuid4())
+        session["session_id"] = sid_value
+        return sid_value
+
+    persisted_session_id = _resolve_persisted_session()
     cancel_event = asyncio.Event()
     turn_lock = asyncio.Lock()
 
     def sid() -> str:
-        return str(session.get("session_id") or conn_id)
+        return str(session.get("session_id") or persisted_session_id)
 
     voice_log(sid(), "ws_connect")
-    await _send(websocket, {"type": "ready", "user_id": user_id})
+    await _send(
+        websocket,
+        {"type": "ready", "user_id": user_id, "session_id": sid()},
+    )
 
     async def run_turn(audio_b64: str, force_route: str | None = None) -> None:
         cancel_event.clear()
@@ -204,9 +253,23 @@ async def voice_socket(websocket: WebSocket):
         if result.tools_used:
             await _send(websocket, {"type": "tool", "name": result.tools_used[0], "status": "done"})
 
-        session["language"] = result.language
-        if result.route == "intro":
+        # Persist language from the agent result first (language_switch / intro / chat).
+        session["language"] = (result.language or session.get("language") or "en").split("-", 1)[0]
+        if result.route in ("intro", "language_switch"):
             session["onboarded"] = True
+        try:
+            db.upsert_session(
+                {
+                    "id": sid(),
+                    "user_id": user_id,
+                    "title": "Chat",
+                    "language": session["language"],
+                    "doc_id": session.get("doc_id"),
+                    "onboarded": session["onboarded"],
+                }
+            )
+        except Exception:
+            logger.warning("voice session persist failed", exc_info=True)
 
         await _send(
             websocket,
@@ -312,13 +375,16 @@ async def voice_socket(websocket: WebSocket):
                 await _send(websocket, {"type": "cancelled"})
                 continue
             if msg_type == "session.update":
+                incoming_sid = (msg.get("session_id") or "").strip()
+                if incoming_sid and incoming_sid != session.get("session_id"):
+                    if not _hydrate_from_db(incoming_sid):
+                        session["session_id"] = incoming_sid
                 for key in (
                     "language",
                     "has_document",
                     "doc_id",
                     "history",
                     "memory",
-                    "session_id",
                     "onboarded",
                     "pace",
                 ):

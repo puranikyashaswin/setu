@@ -52,7 +52,7 @@ export class VoiceSession {
     return Boolean(this.socket && this.socket.readyState === WebSocket.OPEN && this.ready);
   }
 
-  async connect(): Promise<boolean> {
+  async connect(sessionId?: string | null): Promise<boolean> {
     if (this.isOpen) return true;
     if (this.connecting) {
       await this.connecting;
@@ -66,8 +66,11 @@ export class VoiceSession {
       voiceClientLog("ws_reconnect_attempt", { attempt: this.connectGeneration });
     }
 
+    const sid = (sessionId || this.config?.sessionId || "").trim();
     this.connecting = new Promise<void>((resolve) => {
-      const url = `${wsBaseUrl()}/ws/voice?user_id=${encodeURIComponent(userId)}`;
+      const params = new URLSearchParams({ user_id: userId });
+      if (sid) params.set("session_id", sid);
+      const url = `${wsBaseUrl()}/ws/voice?${params.toString()}`;
       const socket = new WebSocket(url);
       this.socket = socket;
       let settled = false;
@@ -145,7 +148,7 @@ export class VoiceSession {
 
   async updateSession(config: VoiceSessionConfig): Promise<void> {
     this.config = config;
-    if (!(await this.connect())) return;
+    if (!(await this.connect(config.sessionId))) return;
     this.send({
       type: "session.update",
       language: config.language,
@@ -182,12 +185,15 @@ export class VoiceSession {
       this.pending = null;
     }
 
+    // Browser STT is display-only early feedback; server Saaras remains authoritative.
+    // Do not send browser transcript on the WS turn (avoids duplicate / conflicting text).
     const browserText = transcript?.trim() || "";
     if (browserText) {
       voiceClientLog("transcript", {
         source: "browser-stt",
         text: browserText.slice(0, 120),
         chars: browserText.length,
+        display_only: true,
       });
     }
 
@@ -197,7 +203,6 @@ export class VoiceSession {
         type: "audio.utterance",
         audio_base64: audioBase64,
         force_route: forceRoute ?? null,
-        transcript: browserText || null,
       });
     });
   }

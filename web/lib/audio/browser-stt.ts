@@ -1,4 +1,4 @@
-/** Browser Web Speech API — free Indic STT (Chrome). OpenRouter Whisper needs credits. */
+/** Browser Web Speech API — optional early feedback. Server Saaras STT is authoritative. */
 
 import { debugLog, voiceClientLog } from "@/lib/debug";
 import type { Language } from "@/lib/types";
@@ -40,6 +40,20 @@ const BCP47: Record<Language, string> = {
   or: "or-IN",
 };
 
+const UNAVAILABLE_ERRORS = new Set([
+  "service-not-allowed",
+  "not-allowed",
+  "network",
+  "aborted",
+]);
+
+/** Soft-disable after a fatal browser-STT failure for this page load. */
+let browserSttDisabled = false;
+
+export function isBrowserSttUnavailableError(error?: string | null): boolean {
+  return UNAVAILABLE_ERRORS.has((error || "").toLowerCase());
+}
+
 function recognitionCtor(): SpeechRecognitionCtor | null {
   if (typeof window === "undefined") return null;
   const w = window as Window & {
@@ -50,22 +64,26 @@ function recognitionCtor(): SpeechRecognitionCtor | null {
 }
 
 export function browserSttSupported(): boolean {
-  return Boolean(recognitionCtor());
+  return !browserSttDisabled && Boolean(recognitionCtor());
 }
 
 export type BrowserSttSession = {
   stop: () => Promise<string>;
   abort: () => void;
+  /** True when browser STT hit a non-fatal-for-pipeline unavailable error. */
+  unavailable: () => boolean;
 };
 
 /** Start continuous recognition for the active language; call stop() when mic ends. */
 export function startBrowserStt(language: Language): BrowserSttSession | null {
+  if (browserSttDisabled) return null;
   const Ctor = recognitionCtor();
   if (!Ctor) return null;
 
   let finalText = "";
   let interim = "";
   let settled = false;
+  let unavailable = false;
   let resolveStop: ((text: string) => void) | null = null;
 
   const recognition = new Ctor();
@@ -75,6 +93,7 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
   recognition.maxAlternatives = 1;
 
   recognition.onresult = (event) => {
+    if (unavailable) return;
     let interimChunk = "";
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       const piece = event.results[i]?.[0]?.transcript || "";
@@ -88,14 +107,33 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
   };
 
   recognition.onerror = (event) => {
-    debugLog("[browser-stt] error", event.error);
-    voiceClientLog("ws_error", { detail: `browser_stt:${event.error || "unknown"}` });
+    const err = event.error || "unknown";
+    debugLog("[browser-stt] error", err);
+    if (isBrowserSttUnavailableError(err)) {
+      unavailable = true;
+      browserSttDisabled = true;
+      finalText = "";
+      interim = "";
+      voiceClientLog("ws_error", { detail: `browser_stt_unavailable:${err}` });
+      try {
+        recognition.abort();
+      } catch {
+        /* ignore */
+      }
+      if (!settled) {
+        settled = true;
+        resolveStop?.("");
+        resolveStop = null;
+      }
+      return;
+    }
+    voiceClientLog("ws_error", { detail: `browser_stt:${err}` });
   };
 
   recognition.onend = () => {
     if (settled) return;
     settled = true;
-    const text = (finalText || interim).trim();
+    const text = unavailable ? "" : (finalText || interim).trim();
     resolveStop?.(text);
     resolveStop = null;
   };
@@ -104,14 +142,22 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
     recognition.start();
   } catch (error) {
     debugLog("[browser-stt] start failed", error);
+    browserSttDisabled = true;
+    voiceClientLog("ws_error", { detail: "browser_stt_unavailable:start_failed" });
     return null;
   }
 
   return {
+    unavailable: () => unavailable,
     stop: () =>
       new Promise((resolve) => {
         if (settled) {
-          resolve((finalText || interim).trim());
+          resolve(unavailable ? "" : (finalText || interim).trim());
+          return;
+        }
+        if (unavailable) {
+          settled = true;
+          resolve("");
           return;
         }
         resolveStop = resolve;
@@ -119,12 +165,12 @@ export function startBrowserStt(language: Language): BrowserSttSession | null {
           recognition.stop();
         } catch {
           settled = true;
-          resolve((finalText || interim).trim());
+          resolve(unavailable ? "" : (finalText || interim).trim());
         }
         window.setTimeout(() => {
           if (!settled) {
             settled = true;
-            resolve((finalText || interim).trim());
+            resolve(unavailable ? "" : (finalText || interim).trim());
           }
         }, 900);
       }),

@@ -98,6 +98,14 @@ Open [http://localhost:3000](http://localhost:3000) in Chrome. Microphone and ca
 
 Verify the API is running: [http://localhost:8000/health](http://localhost:8000/health) should return `{"status":"ok"}`.
 
+### Run unit tests
+
+```bash
+cd api
+source .venv/bin/activate
+python -m unittest test_agent_routing -v
+```
+
 ## Environment variables
 
 ### Backend (`.env` in repo root)

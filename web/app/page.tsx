@@ -1111,18 +1111,18 @@ export default function Home() {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
-  const cameraText = useState<Record<Language, { hold: string; show: string; reading: string; ready: string; unclear: string }>>({
-    en: { hold: "Hold it steady", show: "Show me", reading: "Reading", ready: "Ready.", unclear: "Couldn’t read that — hold it flat in good light" },
-    te: { hold: "స్థిరంగా పట్టుకోండి", show: "చూపించండి", reading: "చదువుతున్నాను", ready: "సరే.", unclear: "స్పష్టంగా చదవలేకపోయాను" },
-    hi: { hold: "सीधा रखें", show: "दिखाइए", reading: "पढ़ रहा हूँ", ready: "हाँ.", unclear: "साफ़ नहीं पढ़ सका" },
-    mr: { hold: "स्थिर धरा", show: "दाखवा", reading: "वाचत आहे", ready: "होय.", unclear: "स्पष्ट वाचता आले नाही" },
-    ta: { hold: "நிலையாகப் பிடியுங்கள்", show: "காட்டுங்கள்", reading: "படிக்கிறேன்", ready: "ஆம்.", unclear: "தெளிவாகப் படிக்க முடியவில்லை" },
-    kn: { hold: "ಸ್ಥಿರವಾಗಿ ಹಿಡಿಯಿರಿ", show: "ತೋರಿಸಿ", reading: "ಓದುತ್ತಿದ್ದೇನೆ", ready: "ಹೌದು.", unclear: "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ" },
-    bn: { hold: "স্থির করে ধরুন", show: "দেখান", reading: "পড়ছি", ready: "হ্যাঁ.", unclear: "স্পষ্ট পড়তে পারিনি" },
-    gu: { hold: "સ્થિર રાખો", show: "બતાવો", reading: "વાંચું છું", ready: "હા.", unclear: "સ્પષ્ટ વાંચી શક્યો નહીં" },
-    ml: { hold: "സ്ഥിരമായി പിടിക്കുക", show: "കാണിക്കുക", reading: "വായിക്കുന്നു", ready: "അതെ.", unclear: "വ്യക്തമായി വായിക്കാനായില്ല" },
-    pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਦਿਖਾਓ", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ" },
-    or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦେଖାନ୍ତୁ", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ" },
+  const cameraText = useState<Record<Language, { hold: string; show: string; reading: string; ready: string; unclear: string; upload: string }>>({
+    en: { hold: "Hold it steady", show: "Please hold your document up to the camera so I can read it.", reading: "Reading", ready: "Ready.", unclear: "Couldn’t read that — hold it flat in good light", upload: "Camera is unavailable. Please upload a photo of the document instead." },
+    te: { hold: "స్థిరంగా పట్టుకోండి", show: "దయచేసి పత్రాన్ని కెమెరా ముందు చూపించండి, నేను చదువుతాను.", reading: "చదువుతున్నాను", ready: "సరే.", unclear: "స్పష్టంగా చదవలేకపోయాను", upload: "కెమెరా లేదు. దయచేసి పత్రం ఫోటో అప్‌లోడ్ చేయండి." },
+    hi: { hold: "सीधा रखें", show: "कृपया दस्तावेज़ कैमरे के सामने दिखाइए, मैं पढ़ूँगा.", reading: "पढ़ रहा हूँ", ready: "हाँ.", unclear: "साफ़ नहीं पढ़ सका", upload: "कैमरा उपलब्ध नहीं है. कृपया दस्तावेज़ की फ़ोटो अपलोड करें." },
+    mr: { hold: "स्थिर धरा", show: "कृपया कागद कॅमेऱ्यासमोर दाखवा, मी वाचेन.", reading: "वाचत आहे", ready: "होय.", unclear: "स्पष्ट वाचता आले नाही", upload: "कॅमेरा उपलब्ध नाही. कृपया कागदाचा फोटो अपलोड करा." },
+    ta: { hold: "நிலையாகப் பிடியுங்கள்", show: "தயவுசெய்து ஆவணத்தை கேமராவுக்குக் காட்டுங்கள், நான் படிப்பேன்.", reading: "படிக்கிறேன்", ready: "ஆம்.", unclear: "தெளிவாகப் படிக்க முடியவில்லை", upload: "கேமரா இல்லை. ஆவணப் படத்தைப் பதிவேற்றுங்கள்." },
+    kn: { hold: "ಸ್ಥಿರವಾಗಿ ಹಿಡಿಯಿರಿ", show: "ದಯವಿಟ್ಟು ದಾಖಲೆಯನ್ನು ಕ್ಯಾಮೆರಾಗೆ ತೋರಿಸಿ, ನಾನು ಓದುತ್ತೇನೆ.", reading: "ಓದುತ್ತಿದ್ದೇನೆ", ready: "ಹೌದು.", unclear: "ಸ್ಪಷ್ಟವಾಗಿ ಓದಲಾಗಲಿಲ್ಲ", upload: "ಕ್ಯಾಮೆರಾ ಇಲ್ಲ. ದಾಖಲೆಯ ಫೋಟೋ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ." },
+    bn: { hold: "স্থির করে ধরুন", show: "দয়া করে নথি ক্যামেরার সামনে ধরুন.", reading: "পড়ছি", ready: "হ্যাঁ.", unclear: "স্পষ্ট পড়তে পারিনি", upload: "ক্যামেরা নেই. নথির ছবি আপলোড করুন." },
+    gu: { hold: "સ્થિર રાખો", show: "કૃપા કરીને દસ્તાવેજ કેમેરા સામે બતાવો.", reading: "વાંચું છું", ready: "હા.", unclear: "સ્પષ્ટ વાંચી શક્યો નહીં", upload: "કેમેરા નથી. દસ્તાવેજનો ફોટો અપલોડ કરો." },
+    ml: { hold: "സ്ഥിരമായി പിടിക്കുക", show: "ദയവായി രേഖ ക്യാമറയ്ക്ക് മുന്നിൽ കാണിക്കുക.", reading: "വായിക്കുന്നു", ready: "അതെ.", unclear: "വ്യക്തമായി വായിക്കാനായില്ല", upload: "ക്യാമറയില്ല. രേഖയുടെ ഫോട്ടോ അപ്‌ലോഡ് ചെയ്യുക." },
+    pa: { hold: "ਸਿੱਧਾ ਰੱਖੋ", show: "ਕਿਰਪਾ ਕਰਕੇ ਦਸਤਾਵੇਜ਼ ਕੈਮਰੇ ਅੱਗੇ ਵਿਖਾਓ.", reading: "ਪੜ੍ਹ ਰਿਹਾ ਹਾਂ", ready: "ਹਾਂ.", unclear: "ਸਾਫ਼ ਨਹੀਂ ਪੜ੍ਹ ਸਕਿਆ", upload: "ਕੈਮਰਾ ਨਹੀਂ. ਦਸਤਾਵੇਜ਼ ਦੀ ਫੋਟੋ ਅੱਪਲੋਡ ਕਰੋ." },
+    or: { hold: "ସିଧା ଧରନ୍ତୁ", show: "ଦୟାକରି ଦଲିଲ କ୍ୟାମେରା ଆଗରେ ଦେଖାନ୍ତୁ.", reading: "ପଢୁଛି", ready: "ହଁ.", unclear: "ସ୍ପଷ୍ଟ ପଢିପାରିଲି ନାହିଁ", upload: "କ୍ୟାମେରା ନାହିଁ. ଦଲିଲ ଫଟୋ ଅପଲୋଡ୍ କରନ୍ତୁ." },
   })[0];
 
   const getAudioContext = useCallback(() => {
@@ -1798,9 +1798,15 @@ export default function Home() {
           if (cameraGoodChecksRef.current >= CAPTURE_STREAK) captureDocument();
         }, 280);
       })
-      .catch(() => { setStatusText("Camera permission is required"); setCameraOpen(false); });
+      .catch(() => {
+        setCameraOpen(false);
+        const lang = languageRef.current;
+        const uploadText = cameraText[lang]?.upload || cameraText.en.upload;
+        setStatusText(uploadText);
+        void playSpeech(uploadText, lang, true, speaker, undefined, undefined, 160);
+      });
     return () => { window.clearInterval(interval); cameraStreamRef.current?.getTracks().forEach((track) => track.stop()); cameraStreamRef.current = null; };
-  }, [cameraOpen, captureDocument]);
+  }, [cameraOpen, cameraText, captureDocument, playSpeech, speaker]);
 
   const finishRecording = useCallback(async (cancelled = false) => {
     setViewMode("voice");
@@ -1829,8 +1835,21 @@ export default function Home() {
       setStatusText("Tap to continue");
       return;
     }
-    const browserTranscript = sttSession ? await sttSession.stop() : "";
-    if (browserTranscript) debugLog("[browser-stt]", { chars: browserTranscript.length, text: browserTranscript.slice(0, 80) });
+    // Browser STT is optional early feedback; failures must not block server Saaras.
+    let browserTranscript = "";
+    if (sttSession) {
+      try {
+        browserTranscript = sttSession.unavailable() ? "" : await sttSession.stop();
+      } catch {
+        browserTranscript = "";
+        sttSession.abort();
+      }
+    }
+    if (browserTranscript) {
+      debugLog("[browser-stt]", { chars: browserTranscript.length, text: browserTranscript.slice(0, 80) });
+      // Display-only; the turn uses server STT transcript from the response.
+      setTranscript(browserTranscript);
+    }
     playCue([660, 440], 0.12, 0.07);
     setOrbState("processing"); setStatusText("Hearing you"); setService("SAARAS");
     turnTimingRef.current = emptyTurnTiming();
@@ -1910,10 +1929,12 @@ export default function Home() {
 
       const requestedLanguage = explicitLanguage(heard);
       const activeLanguage = languageRef.current;
-      const resolvedLanguage = (result.language as Language | undefined)
+      const serverLang = (result.language || "").split("-")[0] as Language | "";
+      const resolvedLanguage = (serverLang || undefined)
         ?? requestedLanguage
         ?? (languageLockedRef.current ? activeLanguage : resolveLanguage(heard, result.language_code));
       debugLog("[lang]", { heard, requested: requestedLanguage, next: resolvedLanguage, route: result.route });
+      // Persist session.language as soon as the server decided it (esp. language_switch).
       setLanguage(resolvedLanguage);
       languageRef.current = resolvedLanguage;
       languageLockedRef.current = true;
@@ -1938,25 +1959,23 @@ export default function Home() {
       }
 
       if (result.route === "language_switch") {
-        // Before onboarding, never play the short switch confirm — deliver full intro instead.
-        if (!activeSession?.onboarded) {
-          const introText = introForLanguage(resolvedLanguage);
-          addTurn({ userText: heard, setuText: introText, language: resolvedLanguage });
-          patchActiveSession({ onboarded: true, language: resolvedLanguage });
-          setHasStarted(true);
-          await playSpeech(introText, resolvedLanguage, true, "shubh", undefined, undefined, 160, undefined, undefined, false);
-          logTurnTiming(turnTimingRef.current);
-          return;
-        }
-        addTurn({ userText: heard, setuText: result.reply, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
-        await playSpeech(result.reply, resolvedLanguage, true, "shubh", undefined, undefined, 200, audioBuffer, audioParts);
+        // Persist language FIRST, then speak server intro (new) or brief ack (existing).
+        languageLockedRef.current = true;
+        setLanguage(resolvedLanguage);
+        languageRef.current = resolvedLanguage;
+        patchActiveSession({ onboarded: true, language: resolvedLanguage });
+        setHasStarted(true);
+        const spoken = result.reply.trim() || introForLanguage(resolvedLanguage);
+        addTurn({ userText: heard, setuText: spoken, language: resolvedLanguage, ...(loadedDocId ? { docId: loadedDocId } : {}) });
+        await playSpeech(spoken, resolvedLanguage, true, "shubh", undefined, undefined, 220, audioBuffer, audioParts, false);
         logTurnTiming(turnTimingRef.current);
         return;
       }
 
-      if (result.open_camera || result.route === "open_camera") {
-        addTurn({ userText: heard, setuText: result.reply || cameraText[resolvedLanguage].show, language: resolvedLanguage });
-        await playSpeech(result.reply || cameraText[resolvedLanguage].show, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true), 200, audioBuffer, audioParts);
+      if (result.open_camera || result.route === "open_camera" || result.intent === "scan") {
+        const guide = result.reply.trim() || cameraText[resolvedLanguage].show;
+        addTurn({ userText: heard, setuText: guide, language: resolvedLanguage });
+        await playSpeech(guide, resolvedLanguage, false, speaker, undefined, () => setCameraOpen(true), 200, audioBuffer, audioParts);
         logTurnTiming(turnTimingRef.current);
         return;
       }

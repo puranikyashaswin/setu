@@ -16,21 +16,21 @@ export const VOICE_LANGUAGE_PROMPT =
   "Hi, welcome to Setu. Which language do you prefer?";
 
 /**
- * After the user picks a language — warm confirm in that language, then keep chatting.
- * Keep these short enough to speak quickly.
+ * After the user picks a language — short onboarding intro in that language.
+ * Keep under ~25 words; server sarvam.intro_for_language is source of truth for TTS.
  */
 export const SETU_INTRO_BY_LANG: Record<PhraseLanguage, string> = {
-  en: "Great. I'm Setu. How can I help you?",
-  te: "సరే. నేను సేతు. మీకు ఎలా సహాయం చేయగలను?",
-  hi: "ठीक है. मैं सेतु हूँ. मैं आपकी कैसे मदद करूँ?",
-  mr: "छान. मी सेतू आहे. मी तुम्हाला कशी मदत करू?",
-  ta: "சரி. நான் சேது. நான் உங்களுக்கு எப்படி உதவட்டும்?",
-  kn: "ಸರಿ. ನಾನು ಸೇತು. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?",
-  bn: "ঠিক আছে. আমি সেতু. আমি কীভাবে সাহায্য করতে পারি?",
-  gu: "સારું. હું સેતુ છું. હું તમારી કેવી રીતે મદદ કરું?",
-  ml: "ശരി. ഞാൻ സേതു. ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
-  pa: "ਠੀਕ ਹੈ. ਮੈਂ ਸੇਤੂ ਹਾਂ. ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
-  or: "ଠିକ୍ ଅଛି. ମୁଁ ସେତୁ. ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
+  en: "Hi. I am Setu. Ask me anything, or show me a document and I will explain it.",
+  te: "నమస్కారం. నేను సేతు. ఏదైనా అడగండి, లేదా పత్రం చూపిస్తే వివరిస్తాను.",
+  hi: "नमस्ते. मैं सेतु हूँ. कुछ भी पूछें, या दस्तावेज़ दिखाएँ — मैं समझाऊँगा.",
+  mr: "नमस्कार. मी सेतू. काहीही विचारा, किंवा कागद दाखवा — मी समजावीन.",
+  ta: "வணக்கம். நான் சேது. எதையும் கேளுங்கள், அல்லது ஆவணம் காட்டுங்கள்.",
+  kn: "ನಮಸ್ಕಾರ. ನಾನು ಸೇತು. ಏನಾದರೂ ಕೇಳಿ, ಅಥವಾ ದಾಖಲೆ ತೋರಿಸಿ.",
+  bn: "নমস্কার. আমি সেতু. যেকোনো প্রশ্ন করুন, বা নথি দেখান.",
+  gu: "નમસ્તે. હું સેતુ. કંઈ પણ પૂછો, અથવા દસ્તાવેજ બતાવો.",
+  ml: "നമസ്കാരം. ഞാൻ സേതു. എന്തും ചോദിക്കൂ, അല്ലെങ്കിൽ രേഖ കാണിക്കൂ.",
+  pa: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ. ਮੈਂ ਸੇਤੂ ਹਾਂ. ਕੁਝ ਵੀ ਪੁੱਛੋ, ਜਾਂ ਦਸਤਾਵੇਜ਼ ਵਿਖਾਓ.",
+  or: "ନମସ୍କାର. ମୁଁ ସେତୁ. କିଛି ପଚାରନ୍ତୁ, କିମ୍ବା ଦଲିଲ ଦେଖାନ୍ତୁ.",
 };
 
 export function introForLanguage(language: PhraseLanguage): string {

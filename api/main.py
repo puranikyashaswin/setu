@@ -39,14 +39,11 @@ SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 # Last request stage timings for GET /debug/last-turn.
 _LAST_TURN: dict = {}
 
-# Demo docs — Vision runs at startup so /ask after pick is instant.
+# Optional sample metadata for /samples UI. OCR runs only when a user selects/uploads.
 _SAMPLE_DEFS: list[dict] = [
     {
-        "name": "Rythu Bharosa 2025",
-        "description": (
-            "Telangana G.O. guidelines for the Rythu Bharosa farmer "
-            "investment support scheme (Telugu)."
-        ),
+        "name": "Sample notice",
+        "description": "Optional demo document (OCR only after you select it).",
         "file": "notice.jpg",
         "language": "te-IN",
         "doc_id": None,
@@ -165,34 +162,8 @@ def _warm_client() -> None:
     logger.info("Warm-up complete: converse client in %.3fs", time.perf_counter() - t0)
 
 
-def _warm_samples() -> None:
-    for sample in _SAMPLE_DEFS:
-        path = SAMPLES_DIR / sample["file"]
-        if not path.exists():
-            logger.warning("Sample missing: %s", path)
-            continue
-        try:
-            result = ocr.extract_document(
-                path.read_bytes(),
-                sample["file"],
-                language=sample["language"],
-            )
-            if result.get("status") == "unclear_scan":
-                logger.warning("Sample OCR unclear: %s", sample["file"])
-                continue
-            sample["doc_id"] = result["doc_id"]
-            logger.info(
-                "Warm-up complete: sample OCR %s -> %s (cached=%s)",
-                sample["file"],
-                sample["doc_id"][:12],
-                result.get("cached"),
-            )
-        except Exception:
-            logger.exception("Failed to pre-cache sample %s", sample["file"])
-
-
 def _hydrate_sample_ids_from_cache() -> None:
-    """Instant sample doc_ids from OCR disk cache — no Vision wait on boot."""
+    """Bind sample doc_ids from existing OCR disk/db cache only — never call Vision."""
     import hashlib
 
     for sample in _SAMPLE_DEFS:
@@ -211,7 +182,7 @@ def _hydrate_sample_ids_from_cache() -> None:
 
 
 async def _warmup_background() -> None:
-    """Sample OCR + intro TTS + converse client — never raises; runs off the event loop."""
+    """Intro TTS + converse client only — never OCR/Vision. Failures log only."""
     loop = asyncio.get_running_loop()
 
     async def _one(label: str, fn) -> None:
@@ -220,7 +191,6 @@ async def _warmup_background() -> None:
         except Exception:
             logger.warning("Warm-up failed: %s", label, exc_info=True)
 
-    await _one("sample OCR", _warm_samples)
     await _one("intro-TTS", _warm_fixed_tts)
     await _one("converse client", _warm_client)
     logger.info("Warm-up complete: all items")
