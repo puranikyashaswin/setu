@@ -1,4 +1,7 @@
 import type { NextConfig } from "next";
+import { assertProductionApiUrl } from "./lib/env";
+
+assertProductionApiUrl(process.env.NEXT_PUBLIC_API_URL ?? "");
 
 const securityHeaders = [
   { key: "X-Frame-Options", value: "DENY" },
