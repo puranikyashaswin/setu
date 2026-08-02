@@ -9,6 +9,8 @@ import { API_URL, deleteAccount, postScan, postSpeak, postVoiceTurn, type VoiceT
 import { bannerForApiFailure, classifyApiFailure } from "@/lib/api-failure";
 import { shouldPromptStillHere, stillHerePhrase } from "@/lib/still-here";
 import { APP_VERSION } from "@/lib/app-version";
+import { useEscapeClose } from "@/lib/use-escape-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
@@ -1090,6 +1092,8 @@ export default function Home() {
   /** Fresh voice session id each page load — independent of chat history id. */
   const voiceSessionIdRef = useRef<string>("");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const settingsDrawerRef = useRef<HTMLElement | null>(null);
+  useFocusTrap(isSettingsOpen, settingsDrawerRef);
   const [viewMode, setViewMode] = useState<"voice" | "history">("voice");
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
@@ -2808,16 +2812,10 @@ export default function Home() {
     };
   }, []);
 
-  // Escape closes settings / chat picker drawers.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (isSettingsOpen) setIsSettingsOpen(false);
-      if (sessionPickerOpen) setSessionPickerOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [isSettingsOpen, sessionPickerOpen]);
+  useEscapeClose(isSettingsOpen || sessionPickerOpen, () => {
+    setIsSettingsOpen(false);
+    setSessionPickerOpen(false);
+  });
 
   // Soft “I'm still here” after ~30s of continuous listening with no turn submit.
   useEffect(() => {
@@ -3194,6 +3192,7 @@ export default function Home() {
         {isSettingsOpen && (
           <motion.aside
             key="settings-drawer"
+            ref={settingsDrawerRef}
             className="absolute inset-y-0 right-0 z-10 flex w-full max-w-none flex-col border-l border-slate-200/70 bg-white/90 p-6 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] shadow-[-16px_0_48px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:w-[86%] sm:max-w-sm"
             initial={{ x: "100%" }}
             animate={{ x: 0 }}
