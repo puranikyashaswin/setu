@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import agent
 import auth
@@ -224,6 +225,8 @@ if _allow_vercel_preview_cors():
     _cors_kwargs["allow_origin_regex"] = r"https://.*\.vercel\.app"
 
 app.add_middleware(CORSMiddleware, **_cors_kwargs)
+# Trust X-Forwarded-* from Render's reverse proxy (scheme/host for redirects & cookies).
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 app.include_router(voice_ws.router)
 
