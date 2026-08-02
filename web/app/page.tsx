@@ -7,6 +7,7 @@ import { authHeaders, clearStoredUser, ensureGuestUser, getStoredUserId, request
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
 import { API_URL, deleteAccount, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
 import { bannerForApiFailure, classifyApiFailure } from "@/lib/api-failure";
+import { shouldPromptStillHere, stillHerePhrase } from "@/lib/still-here";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
@@ -2805,6 +2806,25 @@ export default function Home() {
       previewCacheRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
+
+  // Soft “I'm still here” after ~30s of continuous listening with no turn submit.
+  useEffect(() => {
+    if (!isRecording) return;
+    const startedAt = Date.now();
+    let prompted = false;
+    const id = window.setInterval(() => {
+      const decision = shouldPromptStillHere({
+        listening: true,
+        idleMs: Date.now() - startedAt,
+        alreadyPrompted: prompted,
+      });
+      if (!decision.prompt) return;
+      prompted = true;
+      setStatusText(stillHerePhrase(language));
+      voiceClientLog("still_here_prompt", { language });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [isRecording, language]);
 
   // Hold a wake lock while the conversation is live so the phone cannot lock mid-answer.
   useEffect(() => {
