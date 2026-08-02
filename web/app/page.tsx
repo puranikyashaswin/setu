@@ -3205,6 +3205,16 @@ export default function Home() {
             <div className="mt-8 min-h-0 flex-1">
               <p className="text-xs font-semibold tracking-[0.14em] text-slate-400">VOICE</p>
               <p className="mt-3 text-sm text-slate-600">Locked to <span className="font-medium text-slate-800">shubh</span> for a consistent demo voice.</p>
+              <a
+                href="/voice-check"
+                className="mt-4 flex min-h-11 items-center justify-between rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-800"
+              >
+                <span>Voice Health check</span>
+                <span className="text-xs font-semibold text-[#ff6b00]">Anywhere →</span>
+              </a>
+              <p className="mt-2 text-xs text-slate-400">
+                Test mic, VAD, API, and WebSocket on this phone before a demo.
+              </p>
             </div>
           </motion.aside>
         )}
