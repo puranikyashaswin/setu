@@ -49,13 +49,23 @@ export function debugLog(...args: unknown[]) {
   if (isDebugAudio()) console.info(...args);
 }
 
-/** Always records; prints when debug mode is on. */
+function shouldKeepVoiceEvent(event: string): boolean {
+  if (isDebugAudio()) return true;
+  if (process.env.NODE_ENV !== "production") return true;
+  // Production: keep errors/health + a sample of routine events (not unbounded spam).
+  if (/error|fail|timeout|still_here|voice_health|fallback|mode_mismatch/i.test(event)) return true;
+  return Math.random() < 0.15;
+}
+
+/** Records (sampled in production); prints when debug mode is on. */
 export function voiceClientLog(event: string, data?: Record<string, unknown>) {
   if (typeof window !== "undefined" && ring.length === 0) loadRingFromStorage();
-  const entry: VoiceClientEvent = { t: Date.now(), event, ...(data || {}) };
-  ring.push(entry);
-  if (ring.length > RING_MAX) ring = ring.slice(-RING_MAX);
-  persistRing();
+  if (shouldKeepVoiceEvent(event)) {
+    const entry: VoiceClientEvent = { t: Date.now(), event, ...(data || {}) };
+    ring.push(entry);
+    if (ring.length > RING_MAX) ring = ring.slice(-RING_MAX);
+    persistRing();
+  }
   debugLog(`[voice] event=${event}`, data ?? "");
 }
 
