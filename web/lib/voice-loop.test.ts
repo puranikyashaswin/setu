@@ -20,7 +20,6 @@ describe("voice-loop single-flight", () => {
     if (!b.ok) assert.equal(b.reason, "already_listening");
     if (!c.ok) assert.equal(c.reason, "already_listening");
 
-    const micOpens = events.filter((e) => e.event === "mic_open");
     // mic_open is logged from noteMicOpen, not tryResume — only one listening claim.
     assert.equal(loop.state, "listening");
     const skips = events.filter((e) => e.event === "mic_open_skipped");
