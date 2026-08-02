@@ -20,7 +20,7 @@ import threading
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import agent
@@ -326,10 +326,29 @@ def warm():
         return {"status": "ok", "warmed": False, "tts_skipped": True}
 
 
+def _session_cookie_response(payload: dict, user_id: str) -> JSONResponse:
+    """Attach HttpOnly signed session cookie alongside the JSON body."""
+    response = JSONResponse(payload)
+    secure = db.is_production()
+    response.set_cookie(
+        key=auth.SESSION_COOKIE,
+        value=auth.sign_session_token(user_id),
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 180,
+        path="/",
+    )
+    return response
+
+
 @app.post("/auth/guest")
 def auth_guest(body: GuestBody):
     user = auth.resolve_user(body.user_id)
-    return {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 1))}
+    return _session_cookie_response(
+        {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 1))},
+        user["id"],
+    )
 
 
 @app.post("/auth/magic-link")
@@ -345,7 +364,10 @@ def auth_magic_verify(body: MagicVerifyBody):
     user = auth.verify_magic_link(body.token)
     if not user:
         raise HTTPException(400, "Invalid or expired sign-in link")
-    return {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 0))}
+    return _session_cookie_response(
+        {"user_id": user["id"], "email": user.get("email"), "is_guest": bool(user.get("is_guest", 0))},
+        user["id"],
+    )
 
 
 @app.post("/intro")
