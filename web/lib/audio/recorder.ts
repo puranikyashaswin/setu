@@ -333,7 +333,7 @@ export async function startVoiceRecorder(
       const gapMs = Math.round(recorder.controller.sinceLastMeaningfulSpeechMs(now));
       const onsetFloor = recorder.controller.onsetFloor;
       console.info(
-        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.controller.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.controller.smoothedRms.toFixed(4)} quiet_ceiling=${recorder.controller.quietCeiling.toFixed(4)} onset_floor=${onsetFloor.toFixed(4)} confirmed_speech=${recorder.controller.confirmedSpeech} onset_rejected=${recorder.controller.lastOnsetRejectedReason ?? "none"} quiet_ms=${quietMs} since_last_meaningful_speech_ms=${gapMs}`,
+        `[audio] vad_endpoint_state turn_id=${recorder.turnId} ambient_rms=${recorder.controller.ambientBaseline.toFixed(4)} smoothed_rms=${recorder.controller.smoothedRms.toFixed(4)} quiet_ceiling=${recorder.controller.quietCeiling.toFixed(4)} onset_floor=${onsetFloor.toFixed(4)} speech_peak=${recorder.controller.speechPeakRms.toFixed(4)} confirmed_speech=${recorder.controller.confirmedSpeech} onset_rejected=${recorder.controller.lastOnsetRejectedReason ?? "none"} quiet_ms=${quietMs} since_last_meaningful_speech_ms=${gapMs}`,
       );
       voiceClientLog("vad_endpoint_state", {
         turn_id: recorder.turnId,
@@ -341,6 +341,7 @@ export async function startVoiceRecorder(
         vad_noise_floor: Number(recorder.controller.ambientBaseline.toFixed(4)),
         smoothed_rms: Number(recorder.controller.smoothedRms.toFixed(4)),
         quiet_ceiling: recorder.controller.quietCeiling,
+        speech_peak: Number(recorder.controller.speechPeakRms.toFixed(4)),
         confirmed_speech: recorder.controller.confirmedSpeech,
         onset_snr: recorder.controller.lastOnsetSnr,
         onset_rejected_reason: recorder.controller.lastOnsetRejectedReason,

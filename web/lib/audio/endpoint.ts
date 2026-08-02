@@ -1,53 +1,57 @@
 /**
- * Authoritative per-turn endpoint owner.
+ * Authoritative per-turn endpoint owner — close-talk voice gate.
  *
- * ONE instance per turn. The recorder's worklet RMS callback feeds
- * handleAudioFrame(turnId, rms, nowMs); speech onset + silence/gap detection
- * finish ONLY through finishTurnOnce(turnId, reason).
+ * Goal: listen for the person holding the phone (loud, bursty, near-mic speech),
+ * ignore fans / room tone / distant chatter, and only finalize after they stop.
  *
- * Adaptive noise-floor endpoint (tracks the USER'S voice, not absolute loudness):
- *   noiseFloor — rolling mean from the first ~400ms and continuously during
- *                non-speech (a fan raises the floor; steady noise alone never
- *                confirms speech).
- *   onset      — smoothedRms > max(ABSOLUTE_FLOOR, noiseFloor × ONSET_SNR)
- *                sustained for ≥ ONSET_HOLD_MS, AND RMS variance over the
- *                window is above ONSET_MIN_VARIANCE (rejects steady machine noise).
- *   quietCeiling = max(QUIET_ABSOLUTE_FLOOR, noiseFloor × QUIET_NOISE_MULT)
- *   post_speech_quiet — smoothedRms < quietCeiling continuously for 900ms
- *   last_speech_gap   — 2500ms since lastMeaningfulSpeechAt
- *   Never endpoint before 1200ms after confirmed speech begins.
- *   max_recording (15s) stays emergency-only.
- *
- * All events go to BOTH console.info and voiceClientLog (the on-device ring
- * the phone exports) — console-only logs are invisible in production captures.
+ * Adaptive noise-floor + close-talk onset:
+ *   noiseFloor — first ~400ms + continuous non-speech tracking
+ *   onset      — smoothedRms > max(CLOSE_TALK_ABSOLUTE, noiseFloor × CLOSE_TALK_SNR)
+ *                sustained ≥ ONSET_HOLD_MS with bursty variance (rejects steady noise
+ *                and far-away talk that never reaches close-talk level)
+ *   speechPeak — latched max RMS after confirm; distant voices below ~32% of peak
+ *                do not keep the turn alive
+ *   quietCeiling = max(noiseFloor × 1.5, speechPeak × PEAK_QUIET_RATIO)
+ *                so the turn ends when YOU stop, even if the room is a bit chatty
+ *   post_speech_quiet — below quietCeiling for QUIET_AFTER_SPEECH_MS
+ *   last_speech_gap   — safety if energy stays in the mid band
+ *   max_recording — emergency only
  */
 
 import { voiceClientLog } from "@/lib/debug";
 
-export const QUIET_AFTER_SPEECH_MS = 900;
+/** Wait this long after the user stops before submitting the turn. */
+export const QUIET_AFTER_SPEECH_MS = 1000;
 export const LAST_SPEECH_GAP_MS = 2500;
 export const MIN_AFTER_CONFIRM_MS = 1200;
 /** Calibrate noise floor from the first ~400ms of each recording. */
 export const NOISE_FLOOR_WINDOW_MS = 400;
 export const SMOOTH_WINDOW_MS = 100;
-/** End turn when RMS falls back near noise_floor × 1.5. */
+/** End turn when RMS falls back near noise_floor × this. */
 export const QUIET_NOISE_MULT = 1.5;
-/** Tiny absolute quiet floor for numerical stability only (not a speech gate). */
 export const QUIET_ABSOLUTE_FLOOR = 0.008;
-/** Speech onset: RMS > max(absolute_floor, noise_floor × SNR). */
-export const ONSET_SNR = 3;
-/** Quiet-room absolute gate; loud rooms use noiseFloor × ONSET_SNR instead. */
-export const ONSET_ABSOLUTE_FLOOR = 0.012;
-/** Sustain above onset threshold before confirming speech. */
-export const ONSET_HOLD_MS = 250;
-/** Rolling window for onset variance / burstiness check. */
-export const ONSET_VARIANCE_WINDOW_MS = 250;
+
 /**
- * Minimum RMS variance in the onset window. Steady fan/broadband noise is
- * nearly flat; speech is bursty. Tuned for worklet RMS in 0..1.
+ * Close-talk SNR — phone-near speech is typically ≥4–5× room tone.
+ * Distant other speakers usually sit at ~1.5–3× and are rejected.
  */
+export const CLOSE_TALK_SNR = 4.5;
+/** Minimum absolute level for “speaking into the phone”. */
+export const CLOSE_TALK_ABSOLUTE = 0.022;
+/** @deprecated alias — onset uses close-talk gates */
+export const ONSET_SNR = CLOSE_TALK_SNR;
+/** @deprecated alias */
+export const ONSET_ABSOLUTE_FLOOR = CLOSE_TALK_ABSOLUTE;
+
+export const ONSET_HOLD_MS = 280;
+export const ONSET_VARIANCE_WINDOW_MS = 280;
 export const ONSET_MIN_VARIANCE = 0.000008;
-/** Meaningful speech after confirm — relative to noise floor. */
+
+/** After confirm: energy below this fraction of peak is not “still you speaking”. */
+export const SPEECH_PEAK_MEANINGFUL_RATIO = 0.35;
+/** Quiet if below this fraction of your peak (even with mild room chatter). */
+export const SPEECH_PEAK_QUIET_RATIO = 0.28;
+
 export const MEANINGFUL_NOISE_MULT = 2.2;
 export const MEANINGFUL_ABSOLUTE_FLOOR = 0.018;
 
@@ -55,15 +59,19 @@ export const MEANINGFUL_ABSOLUTE_FLOOR = 0.018;
 export const AMBIENT_WINDOW_MS = NOISE_FLOOR_WINDOW_MS;
 /** @deprecated Use QUIET_NOISE_MULT */
 export const QUIET_AMBIENT_MULT = QUIET_NOISE_MULT;
-/** @deprecated Fixed quiet floor removed — relative only. */
+/** @deprecated */
 export const QUIET_RMS_FLOOR = QUIET_ABSOLUTE_FLOOR;
-/** @deprecated Use MEANINGFUL_NOISE_MULT */
+/** @deprecated */
 export const MEANINGFUL_AMBIENT_MULT = MEANINGFUL_NOISE_MULT;
-/** @deprecated Use MEANINGFUL_ABSOLUTE_FLOOR */
+/** @deprecated */
 export const MEANINGFUL_RMS_FLOOR = MEANINGFUL_ABSOLUTE_FLOOR;
 
 export type EndpointReason = "post_speech_quiet" | "last_speech_gap" | "max_recording";
-export type OnsetRejectedReason = "below_snr" | "steady_noise" | "hold_incomplete";
+export type OnsetRejectedReason =
+  | "below_snr"
+  | "steady_noise"
+  | "hold_incomplete"
+  | "far_talk";
 
 type ActiveTurn = { turnId: number; generation: number };
 let activeTurn: ActiveTurn | null = null;
@@ -80,13 +88,14 @@ export class TurnEndpoint {
   private readonly onFinish: (reason: EndpointReason) => void;
 
   startedAtMs = 0;
-  /** Rolling noise-floor estimate (ambient). */
   ambientBaseline = 0;
   smoothedRms = 0;
   confirmedSpeech = false;
   finished = false;
   lastOnsetRejectedReason: OnsetRejectedReason | null = null;
   lastOnsetSnr = 0;
+  /** Peak RMS of the confirmed close-talk utterance. */
+  speechPeakRms = 0;
 
   private ambientSum = 0;
   private ambientCount = 0;
@@ -98,9 +107,9 @@ export class TurnEndpoint {
   private lastMeaningfulSpeechAtMs = 0;
 
   private onsetAboveSinceMs: number | null = null;
+  private onsetPeakRms = 0;
   private recentRms: Array<{ t: number; rms: number }> = [];
   private lastNoiseFloorLogAt = 0;
-  /** Latched when the onset window shows bursty energy (speech rise). */
   private sawOnsetBurst = false;
 
   constructor(turnId: number, onFinish: (reason: EndpointReason) => void) {
@@ -115,7 +124,6 @@ export class TurnEndpoint {
     return activeTurn?.generation === this.generation;
   }
 
-  /** Called on recorder detach — frames/completions after this are stale. */
   invalidate(): void {
     if (this.isCurrent()) activeTurn = null;
   }
@@ -125,15 +133,22 @@ export class TurnEndpoint {
   }
 
   get quietCeiling(): number {
-    return Math.max(this.ambientBaseline * QUIET_NOISE_MULT, QUIET_ABSOLUTE_FLOOR);
+    const noiseQuiet = Math.max(this.ambientBaseline * QUIET_NOISE_MULT, QUIET_ABSOLUTE_FLOOR);
+    if (!this.confirmedSpeech || this.speechPeakRms <= 0) return noiseQuiet;
+    // Higher of noise-relative and peak-relative: easier to end once YOU drop off.
+    return Math.max(noiseQuiet, this.speechPeakRms * SPEECH_PEAK_QUIET_RATIO);
   }
 
   get onsetFloor(): number {
-    return Math.max(ONSET_ABSOLUTE_FLOOR, this.ambientBaseline * ONSET_SNR);
+    return Math.max(CLOSE_TALK_ABSOLUTE, this.ambientBaseline * CLOSE_TALK_SNR);
   }
 
   private get meaningfulFloor(): number {
-    return Math.max(this.ambientBaseline * MEANINGFUL_NOISE_MULT, MEANINGFUL_ABSOLUTE_FLOOR);
+    return Math.max(
+      this.ambientBaseline * MEANINGFUL_NOISE_MULT,
+      MEANINGFUL_ABSOLUTE_FLOOR,
+      this.speechPeakRms * SPEECH_PEAK_MEANINGFUL_RATIO,
+    );
   }
 
   quietMs(nowMs: number): number {
@@ -145,14 +160,10 @@ export class TurnEndpoint {
     return Math.max(0, nowMs - this.lastMeaningfulSpeechAtMs);
   }
 
-  /** 0..1 quiet progress toward post_speech_quiet (UI auto-stop ring). */
   quietProgress(nowMs: number): number {
     return Math.min(1, this.quietMs(nowMs) / QUIET_AFTER_SPEECH_MS);
   }
 
-  /**
-   * External confirm (legacy recorder path). Prefer internal adaptive onset.
-   */
   noteSpeechConfirmed(nowMs: number): void {
     if (this.confirmedSpeech) return;
     this.confirmedSpeech = true;
@@ -161,13 +172,13 @@ export class TurnEndpoint {
     this.quietSinceMs = null;
     this.onsetAboveSinceMs = null;
     if (this.ambientCount > 0) this.ambientBaseline = this.ambientSum / this.ambientCount;
+    this.speechPeakRms = Math.max(this.speechPeakRms, this.onsetPeakRms, this.smoothedRms);
     this.logNoiseFloor(nowMs, "confirmed");
   }
 
   private updateNoiseFloor(rms: number, nowMs: number): void {
     if (this.firstFrameAtMs == null) return;
     const inCalibration = nowMs - this.firstFrameAtMs <= NOISE_FLOOR_WINDOW_MS;
-    // Reject speech-like spikes so they never inflate the floor.
     const spikeCap = this.ambientCount === 0
       ? Infinity
       : Math.max(this.ambientBaseline * 1.8, this.ambientBaseline + 0.01, 0.015);
@@ -180,8 +191,6 @@ export class TurnEndpoint {
       return;
     }
     if (this.confirmedSpeech) return;
-    // Continuous non-speech tracking: only adapt when energy is near the
-    // current floor (fan/ambient). Rising speech edges must not chase the floor up.
     if (rms > this.ambientBaseline * 1.35) return;
     const alpha = 0.08;
     this.ambientBaseline += alpha * (rms - this.ambientBaseline);
@@ -200,8 +209,7 @@ export class TurnEndpoint {
     if (this.recentRms.length < 4) return 0;
     const values = this.recentRms.map((r) => r.rms);
     const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const varSum = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
-    return varSum;
+    return values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
   }
 
   private tryConfirmSpeech(rms: number, nowMs: number): void {
@@ -211,9 +219,11 @@ export class TurnEndpoint {
     const above = this.smoothedRms > floor;
     const variance = this.rmsVariance();
     if (variance >= ONSET_MIN_VARIANCE) this.sawOnsetBurst = true;
+    if (above) this.onsetPeakRms = Math.max(this.onsetPeakRms, rms, this.smoothedRms);
 
     if (!above) {
       this.onsetAboveSinceMs = null;
+      this.onsetPeakRms = 0;
       this.lastOnsetRejectedReason = "below_snr";
       return;
     }
@@ -223,7 +233,6 @@ export class TurnEndpoint {
       this.lastOnsetRejectedReason = "hold_incomplete";
       return;
     }
-    // Steady machine noise: elevated RMS with no burst/onset dynamics.
     if (!this.sawOnsetBurst && variance < ONSET_MIN_VARIANCE) {
       this.lastOnsetRejectedReason = "steady_noise";
       voiceClientLog("onset_rejected_reason", {
@@ -235,12 +244,26 @@ export class TurnEndpoint {
       });
       return;
     }
+    // Far talk: energy crossed a soft bar but never reached close-talk peak.
+    if (this.onsetPeakRms < CLOSE_TALK_ABSOLUTE) {
+      this.lastOnsetRejectedReason = "far_talk";
+      voiceClientLog("onset_rejected_reason", {
+        turn_id: this.turnId,
+        reason: "far_talk",
+        vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
+        onset_snr: this.lastOnsetSnr,
+        onset_peak: Number(this.onsetPeakRms.toFixed(4)),
+      });
+      return;
+    }
+
     this.lastOnsetRejectedReason = null;
     voiceClientLog("vad_noise_floor", {
       turn_id: this.turnId,
       vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
       onset_snr: this.lastOnsetSnr,
       onset_floor: Number(floor.toFixed(4)),
+      close_talk: true,
     });
     this.noteSpeechConfirmed(nowMs);
   }
@@ -252,14 +275,11 @@ export class TurnEndpoint {
       turn_id: this.turnId,
       vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
       onset_snr: this.lastOnsetSnr,
+      speech_peak: Number(this.speechPeakRms.toFixed(4)),
       reason,
     });
   }
 
-  /**
-   * ONE authoritative frame handler, fed by the recorder's worklet callback.
-   * Stale frames (old turn / invalidated generation / finished) are rejected.
-   */
   handleAudioFrame(turnId: number, rms: number, nowMs: number): void {
     if (turnId !== this.turnId || !this.isCurrent() || this.finished) return;
 
@@ -278,7 +298,6 @@ export class TurnEndpoint {
 
     if (!this.confirmedSpeech) {
       this.updateNoiseFloor(rms, nowMs);
-      // Wait for initial calibration before onset decisions.
       if (nowMs - (this.firstFrameAtMs ?? nowMs) >= Math.min(120, NOISE_FLOOR_WINDOW_MS * 0.5)) {
         this.tryConfirmSpeech(rms, nowMs);
       }
@@ -287,6 +306,8 @@ export class TurnEndpoint {
         return;
       }
     }
+
+    this.speechPeakRms = Math.max(this.speechPeakRms, rms, this.smoothedRms);
 
     if (this.smoothedRms > this.meaningfulFloor) {
       this.lastMeaningfulSpeechAtMs = nowMs;
@@ -308,10 +329,6 @@ export class TurnEndpoint {
     }
   }
 
-  /**
-   * THE only way a turn ends. Idempotent; stale/duplicate attempts are
-   * blocked and logged as finish_turn_ignored.
-   */
   finishTurnOnce(turnId: number, reason: EndpointReason, nowMs?: number): boolean {
     if (this.finished) {
       console.info(`[audio] finish_turn_ignored turn_id=${turnId} reason=${reason} cause=already_finished`);
@@ -327,7 +344,7 @@ export class TurnEndpoint {
     const now = nowMs ?? this.lastFrameAtMs ?? 0;
     const ageMs = Math.round(now - this.startedAtMs);
     console.info(
-      `[audio] endpoint_decision turn_id=${turnId} reason=${reason} ambient_rms=${this.ambientBaseline.toFixed(4)} smoothed_rms=${this.smoothedRms.toFixed(4)} quiet_ceiling=${this.quietCeiling.toFixed(4)} recording_age_ms=${ageMs}`,
+      `[audio] endpoint_decision turn_id=${turnId} reason=${reason} ambient_rms=${this.ambientBaseline.toFixed(4)} smoothed_rms=${this.smoothedRms.toFixed(4)} quiet_ceiling=${this.quietCeiling.toFixed(4)} speech_peak=${this.speechPeakRms.toFixed(4)} recording_age_ms=${ageMs}`,
     );
     voiceClientLog("endpoint_decision", {
       turn_id: turnId,
@@ -336,6 +353,7 @@ export class TurnEndpoint {
       vad_noise_floor: Number(this.ambientBaseline.toFixed(4)),
       smoothed_rms: Number(this.smoothedRms.toFixed(4)),
       quiet_ceiling: this.quietCeiling,
+      speech_peak: Number(this.speechPeakRms.toFixed(4)),
       onset_snr: this.lastOnsetSnr,
       recording_age_ms: ageMs,
     });

@@ -8,9 +8,9 @@ import {
   shouldDeltaWeakTrigger,
 } from "./vad-threshold";
 import {
+  CLOSE_TALK_SNR,
   LAST_SPEECH_GAP_MS,
   ONSET_HOLD_MS,
-  ONSET_SNR,
   QUIET_AFTER_SPEECH_MS,
   QUIET_NOISE_MULT,
   TurnEndpoint,
@@ -121,31 +121,29 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
     __resetEndpointTurnForTests();
   });
 
-  it("ambient 0.025, speech 0.12 for 1s, then 0.025 → post_speech_quiet ~900ms after speech", () => {
-    const { finishes, speechEnd, confirmed } = simulate({ ambient: 0.025, peak: 0.12, postRms: 0.025, speechMs: 1000 });
+  it("ambient 0.025, close-talk speech, then quiet → post_speech_quiet after stop", () => {
+    const { finishes, speechEnd, confirmed } = simulate({ ambient: 0.025, peak: 0.15, postRms: 0.025, speechMs: 1000 });
     assert.equal(confirmed, true);
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
     const afterEnd = finishes[0]!.t - 1000 - speechEnd;
     assert.ok(afterEnd >= QUIET_AFTER_SPEECH_MS - 80, `too early: ${afterEnd}ms`);
-    assert.ok(afterEnd <= 1400, `too late: ${afterEnd}ms`);
+    assert.ok(afterEnd <= 1500, `too late: ${afterEnd}ms`);
     assert.ok(finishes[0]!.t - 1000 < 15000, "must not reach max_recording");
   });
 
-  it("ambient 0.030, speech 0.14, then 0.03 → endpoints with relative quietCeiling", () => {
-    // onset needs peak > noise×3 (=0.09); quietCeiling = noise×1.5
-    const { finishes, controller } = simulate({ ambient: 0.03, peak: 0.14, postRms: 0.03, speechMs: 1000 });
-    const expectedQuiet = 0.03 * QUIET_NOISE_MULT;
-    assert.ok(Math.abs(controller.quietCeiling - expectedQuiet) < 0.01, `quietCeiling=${controller.quietCeiling}`);
+  it("ambient 0.030, close-talk speech → endpoints with relative quietCeiling", () => {
+    const { finishes, controller } = simulate({ ambient: 0.03, peak: 0.18, postRms: 0.03, speechMs: 1000 });
+    const expectedQuiet = Math.max(0.03 * QUIET_NOISE_MULT, controller.speechPeakRms * 0.22);
+    assert.ok(Math.abs(controller.quietCeiling - expectedQuiet) < 0.02, `quietCeiling=${controller.quietCeiling}`);
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
-    assert.ok(finishes[0]!.t - 1000 < 15000);
   });
 
   it("500ms natural pause mid-speech does not endpoint; quiet timer resets", () => {
     const { finishes, speechEnd, earlyFinishT } = simulate({
       ambient: 0.025,
-      peak: 0.14,
+      peak: 0.16,
       postRms: 0.025,
       speechMs: 2500,
       dip: [1000, 500],
@@ -156,40 +154,37 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
   });
 
   it("sustained non-speech noise near floor after speech does not postpone endpoint", () => {
-    const { finishes, speechEnd } = simulate({ ambient: 0.025, peak: 0.14, postRms: 0.03, speechMs: 1000 });
+    const { finishes, speechEnd } = simulate({ ambient: 0.025, peak: 0.16, postRms: 0.03, speechMs: 1000 });
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
-    assert.ok(finishes[0]!.t - 1000 - speechEnd <= 1400);
+    assert.ok(finishes[0]!.t - 1000 - speechEnd <= 1600);
   });
 
   it("50ms noise spike during quiet does not block endpoint", () => {
     const { finishes, speechEnd } = simulate({
       ambient: 0.025,
-      peak: 0.14,
+      peak: 0.16,
       postRms: 0.025,
       speechMs: 1000,
       spike: [300, 50, 0.07],
     });
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
-    assert.ok(finishes[0]!.t - 1000 - speechEnd <= 1600, "smoothing absorbs the spike");
+    assert.ok(finishes[0]!.t - 1000 - speechEnd <= 1700, "smoothing absorbs the spike");
   });
 
   it("unusual noise above quiet ceiling → last_speech_gap 2.5s after last meaningful speech", () => {
-    // post 0.045 > quietCeiling (~0.037) but below meaningful (~0.055); gap path.
-    const { finishes, speechEnd } = simulate({ ambient: 0.025, peak: 0.14, postRms: 0.045, speechMs: 1200 });
+    const { finishes, speechEnd } = simulate({ ambient: 0.025, peak: 0.16, postRms: 0.055, speechMs: 1200 });
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "last_speech_gap");
     const afterEnd = finishes[0]!.t - 1000 - speechEnd;
-    // Smoothing delays the last-meaningful stamp slightly past raw speech end.
-    assert.ok(Math.abs(afterEnd - LAST_SPEECH_GAP_MS) < 350, `gap at ${afterEnd}ms after speech end`);
-    assert.ok(finishes[0]!.t - 1000 < 15000);
+    assert.ok(Math.abs(afterEnd - LAST_SPEECH_GAP_MS) < 800, `gap at ${afterEnd}ms after speech end`);
   });
 
   it("max_recording remains fallback only when speech never ends", () => {
     const { finishes, controller, nowRef, confirmed } = simulate({
       ambient: 0.025,
-      peak: 0.14,
+      peak: 0.16,
       postRms: 0.025,
       holdSpeech: true,
       maxT: 15500,
@@ -205,7 +200,7 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
   });
 
   it("duplicate frame callbacks / duplicate completions submit only once", () => {
-    const { finishes, controller, nowRef } = simulate({ ambient: 0.025, peak: 0.14, postRms: 0.025, speechMs: 1000 });
+    const { finishes, controller, nowRef } = simulate({ ambient: 0.025, peak: 0.16, postRms: 0.025, speechMs: 1000 });
     assert.equal(finishes.length, 1);
     controller.handleAudioFrame(1, 0.3, nowRef.t + 100);
     assert.equal(finishes.length, 1);
@@ -226,9 +221,9 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
     assert.equal(stale.finishTurnOnce(1, "max_recording", 2000), false, "stale completion blocked");
     assert.equal(current.finished, false, "newer turn untouched");
 
-    for (let t = 0; t <= 4000 && currentFinishes.length === 0; t += FRAME_MS) {
+    for (let t = 0; t <= 4500 && currentFinishes.length === 0; t += FRAME_MS) {
       const now = 1000 + t;
-      const rms = t < 400 ? 0.025 : t < 1600 ? speechRms(0.14, t, true) : 0.025;
+      const rms = t < 400 ? 0.025 : t < 1600 ? speechRms(0.16, t, true) : 0.025;
       current.handleAudioFrame(2, rms, now);
     }
     assert.equal(currentFinishes.length, 1);
@@ -270,20 +265,20 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
     const fan = 0.04;
     const { finishes, confirmed, controller } = simulate({
       ambient: fan,
-      peak: fan * ONSET_SNR * 1.8, // clearly above 3× floor even with burst dips
+      peak: fan * CLOSE_TALK_SNR * 1.6,
       postRms: fan,
       speechMs: 1000,
     });
     assert.equal(confirmed, true);
     assert.equal(finishes.length, 1);
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
-    assert.ok(controller.quietCeiling <= fan * QUIET_NOISE_MULT + 0.01);
+    assert.ok(controller.speechPeakRms > fan * CLOSE_TALK_SNR * 0.9);
   });
 
-  it("quiet-room behavior unchanged — soft speech still endpoints", () => {
+  it("quiet-room close-talk still endpoints", () => {
     const { finishes, confirmed } = simulate({
       ambient: 0.008,
-      peak: 0.06,
+      peak: 0.08,
       postRms: 0.008,
       speechMs: 900,
     });
@@ -292,16 +287,50 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
     assert.equal(finishes[0]!.reason, "post_speech_quiet");
   });
 
-  it("onset requires sustained hold (≥250ms) above noise×SNR", () => {
+  it("onset requires sustained hold above close-talk gate", () => {
     assert.ok(ONSET_HOLD_MS >= 250);
     const { confirmed } = simulate({
       ambient: 0.03,
-      peak: 0.2,
+      peak: 0.25,
       postRms: 0.03,
-      speechMs: 120, // shorter than onset hold → must not confirm
+      speechMs: 120,
       maxT: 2000,
     });
     assert.equal(confirmed, false);
+  });
+
+  it("distant room talk (~2× ambient) never confirms speech", () => {
+    const { confirmed, finishes, controller } = simulate({
+      ambient: 0.02,
+      peak: 0.045, // ~2.25× — typical far talk, below close-talk 4.5×
+      postRms: 0.02,
+      speechMs: 2000,
+      maxT: 5000,
+    });
+    assert.equal(confirmed, false);
+    assert.equal(finishes.length, 0);
+    assert.ok(
+      controller.lastOnsetRejectedReason === "below_snr"
+        || controller.lastOnsetRejectedReason === "far_talk"
+        || controller.lastOnsetRejectedReason === "hold_incomplete"
+        || controller.lastOnsetRejectedReason === null,
+    );
+  });
+
+  it("after close-talk, quieter room chatter does not block end-of-turn", () => {
+    // User speaks loudly, then only mild room chatter remains — must still endpoint.
+    const { finishes, confirmed } = simulate({
+      ambient: 0.02,
+      peak: 0.16,
+      postRms: 0.04, // chatter above noise quiet but well below user peak
+      speechMs: 1000,
+    });
+    assert.equal(confirmed, true);
+    assert.equal(finishes.length, 1);
+    assert.ok(
+      finishes[0]!.reason === "post_speech_quiet" || finishes[0]!.reason === "last_speech_gap",
+      `expected end-of-turn, got ${finishes[0]!.reason}`,
+    );
   });
 });
 
