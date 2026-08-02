@@ -60,12 +60,13 @@ def request_magic_link(email: str, user_id: str | None = None) -> dict:
     frontend = (os.getenv("FRONTEND_ORIGIN") or "http://localhost:3000").rstrip("/")
     link = f"{frontend}/?{urlencode({'magic': token})}"
     sent = _send_email(email, link)
+    # Default off — only expose the raw link when explicitly enabled (local demos).
+    expose = os.getenv("EXPOSE_MAGIC_LINK", "0") == "1"
     return {
         "ok": True,
         "email": email,
         "sent": sent,
-        # Returned so hackathon demos work without an email provider.
-        "magic_link": link if not sent or os.getenv("EXPOSE_MAGIC_LINK", "1") == "1" else None,
+        "magic_link": link if expose else None,
         "user_id": user["id"],
     }
 
