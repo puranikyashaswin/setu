@@ -21,6 +21,10 @@ import rate_limit
 import sarvam
 import server_vad
 
+# Hard caps for a single client turn (bytes already enforced via rate_limit).
+MAX_TURN_AUDIO_MS = 60_000
+MAX_WS_TEXT_CHARS = 32_000
+
 logger = logging.getLogger("setu")
 
 router = APIRouter()
@@ -494,6 +498,9 @@ async def voice_socket(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > MAX_WS_TEXT_CHARS:
+                await _send(websocket, {"type": "error", "message": "Message too large"})
+                continue
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
