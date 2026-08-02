@@ -13,7 +13,7 @@ describe("AudioWorklet URL / CDN safety", () => {
 
   it("service worker bypasses vad-processor and _next (no cache-first)", () => {
     const sw = readFileSync(join(process.cwd(), "public/sw.js"), "utf8");
-    assert.match(sw, /setu-shell-v3/);
+    assert.match(sw, /setu-shell-v4/);
     assert.match(sw, /mustBypassCache/);
     assert.match(sw, /vad-processor\.js/);
     assert.match(sw, /_next\//);
