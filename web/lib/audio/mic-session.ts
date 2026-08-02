@@ -17,10 +17,14 @@ export const GUM_OPEN_TIMEOUT_MS = 8000;
 
 type AudioSessionSetter = (type: "playback" | "play-and-record" | "auto") => boolean;
 
+/**
+ * Speakerphone-safe defaults. echoCancellation must be ON for iPhone —
+ * otherwise TTS bleeds into the mic and VAD / turns look "dead" or loop.
+ */
 export const PREFERRED_MIC_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
-    echoCancellation: false,
-    noiseSuppression: false,
+    echoCancellation: true,
+    noiseSuppression: true,
     autoGainControl: true,
     channelCount: 1,
   },

@@ -6,6 +6,7 @@ import {
   getSharedAudioElement,
   installSharedAudioUnlockListener,
   isSharedAudioUnlocked,
+  pauseSharedAudioElement,
   unlockSharedAudioElement,
 } from "./shared-audio-element";
 
@@ -67,12 +68,21 @@ describe("shared HTMLAudioElement", () => {
     assert.equal(getSharedAudioElement(), a);
   });
 
-  it("unlock calls load then play then pause once", async () => {
+  it("unlock plays silent src then pause without load() reset", async () => {
     unlockSharedAudioElement();
     await new Promise((r) => setTimeout(r, 0));
     assert.equal(isSharedAudioUnlocked(), true);
-    assert.equal(audioInstances[0]!.loadCalls >= 1, true);
     assert.equal(audioInstances[0]!.playCalls, 1);
+    // iOS: load() after unlock revokes media engagement — must stay 0.
+    assert.equal(audioInstances[0]!.loadCalls, 0);
+  });
+
+  it("pauseSharedAudioElement does not call load()", async () => {
+    unlockSharedAudioElement();
+    await new Promise((r) => setTimeout(r, 0));
+    const before = audioInstances[0]!.loadCalls;
+    pauseSharedAudioElement();
+    assert.equal(audioInstances[0]!.loadCalls, before);
   });
 
   it("installSharedAudioUnlockListener unlocks on pointerdown", async () => {

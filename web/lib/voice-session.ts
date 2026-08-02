@@ -32,11 +32,44 @@ type PendingTurn = {
   handlers: VoiceSessionHandlers;
 };
 
+/** Render free-tier cold start often exceeds 4s — give the socket room to land. */
+export const WS_CONNECT_TIMEOUT_MS = 25000;
+export const WS_CONNECT_MAX_ATTEMPTS = 2;
+export const API_WAKE_TIMEOUT_MS = 20000;
+
 function wsBaseUrl(): string {
   const http = API_URL.replace(/\/$/, "");
   if (http.startsWith("https://")) return `wss://${http.slice("https://".length)}`;
   if (http.startsWith("http://")) return `ws://${http.slice("http://".length)}`;
   return `ws://${http}`;
+}
+
+/** Ping /health before opening the voice WebSocket (wakes Render). */
+export async function wakeApiForVoice(
+  apiUrl: string = API_URL,
+  timeoutMs: number = API_WAKE_TIMEOUT_MS,
+): Promise<{ ok: boolean; ms: number }> {
+  const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${apiUrl.replace(/\/$/, "")}/health`, {
+      method: "GET",
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    return {
+      ok: res.ok,
+      ms: Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0),
+    };
+  } catch {
+    return {
+      ok: false,
+      ms: Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export class VoiceSession {
@@ -76,7 +109,26 @@ export class VoiceSession {
     }
 
     const sid = (sessionId || this.config?.sessionId || "").trim();
-    this.connecting = new Promise<void>((resolve) => {
+    this.connecting = (async () => {
+      const wake = await wakeApiForVoice();
+      voiceClientLog("api_wake", { ok: wake.ok, ms: wake.ms });
+      for (let attempt = 1; attempt <= WS_CONNECT_MAX_ATTEMPTS; attempt += 1) {
+        const ok = await this.openSocketOnce(userId, sid, attempt);
+        if (ok) return;
+        voiceClientLog("ws_connect_retry", { attempt, max: WS_CONNECT_MAX_ATTEMPTS });
+      }
+    })();
+
+    try {
+      await this.connecting;
+    } finally {
+      this.connecting = null;
+    }
+    return this.isOpen;
+  }
+
+  private openSocketOnce(userId: string, sid: string, attempt: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
       const params = new URLSearchParams({ user_id: userId });
       if (sid) params.set("session_id", sid);
       const url = `${wsBaseUrl()}/ws/voice?${params.toString()}`;
@@ -84,23 +136,22 @@ export class VoiceSession {
       this.socket = socket;
       let settled = false;
 
-      const finish = () => {
+      const finish = (ok: boolean) => {
         if (settled) return;
         settled = true;
-        this.connecting = null;
-        resolve();
+        resolve(ok);
       };
 
       const timer = window.setTimeout(() => {
         debugLog("[voice-session] connect timeout");
-        voiceClientLog("ws_error", { detail: "connect_timeout" });
+        voiceClientLog("ws_error", { detail: "connect_timeout", attempt, ms: WS_CONNECT_TIMEOUT_MS });
         try {
           socket.close();
         } catch {
           /* ignore */
         }
-        finish();
-      }, 4000);
+        finish(false);
+      }, WS_CONNECT_TIMEOUT_MS);
 
       socket.onopen = () => {
         debugLog("[voice-session] open");
@@ -119,9 +170,9 @@ export class VoiceSession {
           this.everConnected = true;
           this.serverTurnMode = typeof msg.voice_turn_mode === "string" ? msg.voice_turn_mode : null;
           this.vadEngine = typeof msg.vad_engine === "string" ? msg.vad_engine : null;
-          voiceClientLog("ws_connect", { voice_turn_mode: this.serverTurnMode });
+          voiceClientLog("ws_connect", { voice_turn_mode: this.serverTurnMode, attempt });
           window.clearTimeout(timer);
-          finish();
+          finish(true);
           return;
         }
         if (type === "voice_v2_ready") {
@@ -152,41 +203,54 @@ export class VoiceSession {
       };
 
       socket.onerror = () => {
+        if (this.socket !== socket) return;
         debugLog("[voice-session] error");
-        voiceClientLog("ws_error", { detail: "socket_error" });
+        voiceClientLog("ws_error", { detail: "socket_error", attempt });
         window.clearTimeout(timer);
         this.ready = false;
-        finish();
+        finish(false);
       };
 
       socket.onclose = (ev) => {
+        // Superseded by a retry — ignore.
+        if (this.socket !== socket && !settled) {
+          window.clearTimeout(timer);
+          finish(false);
+          return;
+        }
+        if (this.socket !== socket) return;
+
         debugLog("[voice-session] close");
+        // Mid-session drop after a successful ready handshake.
+        if (settled && this.ready) {
+          this.ready = false;
+          this.socket = null;
+          const wasVadReady = this.vadReady;
+          this.vadReady = false;
+          if (wasVadReady || this.vadReadyWaiter) {
+            const waiter = this.vadReadyWaiter;
+            this.vadReadyWaiter = null;
+            waiter?.(false);
+            this.lifecycleHandler?.onSocketDrop?.();
+          }
+          if (this.pending) {
+            this.pending.reject(new Error("Voice session disconnected"));
+            this.pending = null;
+          }
+          return;
+        }
         voiceClientLog("ws_error", {
           detail: "socket_close",
           code: ev.code,
           reason: ev.reason || "",
+          attempt,
         });
         window.clearTimeout(timer);
         this.ready = false;
         this.socket = null;
-        const wasVadReady = this.vadReady;
-        this.vadReady = false;
-        if (wasVadReady || this.vadReadyWaiter) {
-          const waiter = this.vadReadyWaiter;
-          this.vadReadyWaiter = null;
-          waiter?.(false);
-          this.lifecycleHandler?.onSocketDrop?.();
-        }
-        if (this.pending) {
-          this.pending.reject(new Error("Voice session disconnected"));
-          this.pending = null;
-        }
-        finish();
+        finish(false);
       };
     });
-
-    await this.connecting;
-    return this.isOpen;
   }
 
   async updateSession(config: VoiceSessionConfig): Promise<void> {

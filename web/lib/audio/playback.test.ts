@@ -13,6 +13,7 @@ import {
   ttsUsesWebAudioGraph,
 } from "./playback";
 import { __resetAudioOwnerForTests, isAssistantSpeaking } from "./audio-owner";
+import { __resetSharedAudioForTests } from "./shared-audio-element";
 import { createVoiceLoop } from "../voice-loop";
 
 const webRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -25,6 +26,7 @@ describe("html_audio TTS route", () => {
   beforeEach(() => {
     __resetPlaybackForTests();
     __resetAudioOwnerForTests();
+    __resetSharedAudioForTests();
     (globalThis as unknown as { URL: unknown }).URL = class extends originalURL {
       static createObjectURL() {
         return "blob:test";
@@ -38,6 +40,7 @@ describe("html_audio TTS route", () => {
 
   afterEach(() => {
     stopAllPlayback("cancelled");
+    __resetSharedAudioForTests();
     __resetPlaybackForTests();
     (globalThis as unknown as { URL: unknown }).URL = originalURL;
     globalThis.requestAnimationFrame = originalRAF;

@@ -231,7 +231,7 @@ async function playOnePart(
         audio.onerror = null;
         audio.pause();
         audio.removeAttribute("src");
-        audio.load();
+        // Never audio.load() here — resets iOS Safari media engagement.
       } catch {
         /* ignore */
       }
@@ -259,7 +259,7 @@ async function playOnePart(
         audio.onerror = null;
         audio.pause();
         audio.removeAttribute("src");
-        audio.load();
+        // Never audio.load() here — resets iOS Safari media engagement.
       } catch {
         /* ignore */
       }

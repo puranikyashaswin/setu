@@ -1,5 +1,14 @@
-const CACHE_NAME = "setu-shell-v2";
+/** Setu PWA service worker — shell cache only. Never pin voice-critical assets. */
+const CACHE_NAME = "setu-shell-v3";
 const APP_SHELL = ["/", "/logo.png", "/favicon.png", "/apple-touch-icon.png", "/bg-waves.png"];
+
+/** Paths that must always hit the network (AudioWorklet / SW / hashed Next assets). */
+function mustBypassCache(pathname) {
+  if (pathname === "/sw.js") return true;
+  if (pathname === "/vad-processor.js" || pathname.startsWith("/vad-processor.js")) return true;
+  if (pathname.startsWith("/_next/")) return true;
+  return false;
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -26,6 +35,15 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // iPhone Safari + AudioWorklet: a cache-first SW is the #1 reason voice dies
+  // after a Vercel deploy (stale /vad-processor.js). Always network these.
+  if (mustBypassCache(url.pathname)) {
+    event.respondWith(
+      fetch(request, { cache: "no-store" }).catch(() => caches.match(request)),
+    );
+    return;
+  }
+
   const cachePut = (response) => {
     if (!response.ok || response.type === "opaque") return response;
     const copy = response.clone();
@@ -44,7 +62,10 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // Other same-origin GETs: network-first (was cache-first — pinned broken voice JS).
   event.respondWith(
-    caches.match(request).then((cached) => cached || fetch(request).then(cachePut)),
+    fetch(request)
+      .then(cachePut)
+      .catch(() => caches.match(request)),
   );
 });

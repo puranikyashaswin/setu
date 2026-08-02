@@ -2,9 +2,16 @@
  * Single persistent HTMLAudioElement for all TTS turns.
  * iOS Safari only allows programmatic play() on elements blessed by a user gesture
  * that remain alive — never create new Audio() per turn.
+ *
+ * Critical: do NOT call audio.load() after clearing src — that resets Safari's
+ * media engagement and makes later TTS play() fail with NotAllowedError.
  */
 
 type SharedAudioLog = (event: string, data?: Record<string, unknown>) => void;
+
+/** Tiny silent WAV — used only to unlock the element inside a user gesture. */
+const SILENT_WAV =
+  "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 
 let sessionLog: SharedAudioLog = () => undefined;
 let sharedAudio: HTMLAudioElement | null = null;
@@ -19,6 +26,15 @@ export function ensureSharedAudioElement(): HTMLAudioElement {
     sharedAudio = new Audio();
     sharedAudio.preload = "auto";
     sharedAudio.volume = 1;
+    // iOS: keep playback inline (never force fullscreen video-style audio).
+    try {
+      sharedAudio.setAttribute?.("playsinline", "true");
+      sharedAudio.setAttribute?.("webkit-playsinline", "true");
+      // @ts-expect-error playsInline exists on HTMLMediaElement in WebKit
+      sharedAudio.playsInline = true;
+    } catch {
+      /* ignore */
+    }
   }
   return sharedAudio;
 }
@@ -32,7 +48,7 @@ export function unlockSharedAudioElement(): void {
   if (unlocked) return;
   const audio = ensureSharedAudioElement();
   try {
-    audio.load();
+    audio.src = SILENT_WAV;
   } catch {
     /* ignore */
   }
@@ -41,9 +57,9 @@ export function unlockSharedAudioElement(): void {
     .then(() => {
       audio.pause();
       audio.currentTime = 0;
-      audio.removeAttribute("src");
+      // Keep engagement: clear src without load() — load() revokes iOS unlock.
       try {
-        audio.load();
+        audio.removeAttribute("src");
       } catch {
         /* ignore */
       }
@@ -56,14 +72,22 @@ export function unlockSharedAudioElement(): void {
     });
 }
 
+/**
+ * Stop current TTS without resetting Safari media engagement.
+ * Never call load() here.
+ */
 export function pauseSharedAudioElement(): void {
   if (!sharedAudio) return;
   try {
     sharedAudio.onended = null;
     sharedAudio.onerror = null;
     sharedAudio.pause();
+    try {
+      sharedAudio.currentTime = 0;
+    } catch {
+      /* ignore */
+    }
     sharedAudio.removeAttribute("src");
-    sharedAudio.load();
   } catch {
     /* ignore */
   }
@@ -86,7 +110,14 @@ export function installSharedAudioUnlockListener(root: Document | HTMLElement = 
 
 /** Test helper */
 export function __resetSharedAudioForTests(): void {
-  pauseSharedAudioElement();
+  if (sharedAudio) {
+    try {
+      sharedAudio.pause();
+      sharedAudio.removeAttribute("src");
+    } catch {
+      /* ignore */
+    }
+  }
   sharedAudio = null;
   unlocked = false;
 }
