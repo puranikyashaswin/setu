@@ -229,9 +229,36 @@ git push origin main
 4. Deploy and copy your API URL, e.g. `https://setu-api.onrender.com`.
 5. Confirm [https://setu-api.onrender.com/health](https://setu-api.onrender.com/health) returns `{"status":"ok"}`.
 
-**Free tier note:** Render sleeps after about 15 minutes of idle time. The first request after sleep can take 30 to 60 seconds. Before a live demo, open `/health` once and wait for a response.
+**Cold start note:** If the API sleeps, the first request can take 30 to 60 seconds. Before a live demo, open `/health` once and wait for a response.
 
-**Free tier limitations:** On the free plan the filesystem is ephemeral — the SQLite database and OCR/TTS caches under `./cache/` reset on every restart or redeploy (scanned docs and chat history on the server are lost). Persistence requires either the Starter plan (uncomment the `disk` block and `DB_PATH` / `CACHE_PATH` env vars in `render.yaml`) or a hosted Postgres later.
+**Persistent storage:** `render.yaml` uses the Starter plan with a `/data` disk. Production requires:
+
+| Key | Value |
+|-----|-------|
+| `DB_PATH` | `/data/setu.db` |
+| `CACHE_PATH` | `/data/cache` |
+
+Without those, the API refuses to start on Render (avoids silent data loss on ephemeral disk).
+
+#### Backup and restore (SQLite on `/data`)
+
+**Backup** (from a shell with the DB file, or a one-off Render job):
+
+```bash
+DB_PATH=/data/setu.db BACKUP_DIR=/data/backups ./scripts/backup_sqlite.sh
+```
+
+**Restore** after a bad deploy or accidental wipe:
+
+1. Stop or suspend the API service so nothing is writing to the DB.
+2. Copy a known-good backup over the live file:
+   ```bash
+   cp /data/backups/setu-YYYYMMDDTHHMMSSZ.db /data/setu.db
+   # remove stale WAL if you replaced the main file outside sqlite3:
+   rm -f /data/setu.db-wal /data/setu.db-shm
+   ```
+3. Restart the API. Confirm `GET /health` returns `{"status":"ok","db":"ok",...}`.
+4. Open the app, load an old chat — transcript + document text should restore without re-OCR.
 
 ### Step 3: Frontend on Vercel
 
