@@ -261,11 +261,27 @@ class SpeakBody(BaseModel):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
+    """Liveness. Includes db flag — degraded when SQLite is unusable."""
+    db_ok = True
+    db_error: str | None = None
+    try:
+        db.check_writable()
+    except Exception as exc:  # noqa: BLE001 — surface any disk/SQLite failure
+        db_ok = False
+        db_error = type(exc).__name__
+        logger.error("health db check failed: %s", exc)
+    status = "ok" if db_ok else "degraded"
+    body = {
+        "status": status,
+        "db": "ok" if db_ok else "error",
         "ocr_provider": ocr.resolve_ocr_provider(),
         "openrouter_configured": bool((os.getenv("OPENROUTER_API_KEY") or "").strip()),
     }
+    if db_error:
+        body["db_error"] = db_error
+    if not db_ok:
+        raise HTTPException(status_code=503, detail=body)
+    return body
 
 
 @app.get("/debug/last-turn")

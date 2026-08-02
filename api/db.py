@@ -81,6 +81,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def check_writable() -> None:
+    """Open DB and run a trivial write/read — raises if the disk/DB is broken."""
+    with _connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS _healthcheck (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT OR REPLACE INTO _healthcheck(id) VALUES (1)")
+        conn.execute("SELECT id FROM _healthcheck WHERE id = 1").fetchone()
+        conn.commit()
+
+
 def init_db() -> None:
     require_db_path_configured()
     with _connect() as conn:
@@ -150,6 +159,7 @@ def init_db() -> None:
             """
         )
         _apply_migrations(conn)
+    check_writable()
 
 
 def ensure_user(user_id: str | None = None, *, email: str | None = None, is_guest: bool = True) -> dict:
