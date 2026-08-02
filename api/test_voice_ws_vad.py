@@ -25,7 +25,7 @@ import main
 import sarvam
 import server_vad
 import voice_ws
-from test_ws_helpers import voice_ws_path
+from ws_test_helpers import voice_ws_path
 
 
 class EnergyEngine:

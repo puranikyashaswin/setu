@@ -219,12 +219,16 @@ class AgentFailureFallbackTests(unittest.TestCase):
         import base64
         import json
         import os
+        import tempfile
+        from pathlib import Path
         from unittest import mock
 
         from fastapi.testclient import TestClient
 
+        import db
         import main
         import voice_ws
+        from ws_test_helpers import voice_ws_path
 
         wav = b"RIFF" + b"\x00" * 40
         logs: list[tuple] = []
@@ -232,34 +236,42 @@ class AgentFailureFallbackTests(unittest.TestCase):
         def capture_log(session_id, event, **fields):
             logs.append((event, fields))
 
-        with mock.patch.object(sarvam, "listen", return_value={"transcript": "hello", "language_code": "en-IN"}):
-            with mock.patch.object(agent, "run_agent_turn", side_effect=NameError("_is_mostly_latin")):
-                with mock.patch.object(sarvam, "speak", return_value=wav) as speak_mock:
-                    with mock.patch.object(voice_ws, "voice_log", side_effect=capture_log):
-                        with mock.patch.dict(
-                            os.environ,
-                            {
-                                "VOICE_TURN_MODE": "legacy_client",
-                                "RENDER": "",
-                                "SETU_ENV": "test",
-                                "ENV": "",
-                            },
-                            clear=False,
-                        ):
-                            from test_ws_helpers import voice_ws_path
-
-                            client = TestClient(main.app)
-                            with client.websocket_connect(voice_ws_path("agent-fail-1")) as ws:
-                                ready = json.loads(ws.receive_text())
-                                self.assertEqual(ready["type"], "ready")
-                                audio_b64 = base64.b64encode(wav).decode("ascii")
-                                ws.send_text(json.dumps({"type": "audio.utterance", "audio_base64": audio_b64}))
-                                messages = []
-                                for _ in range(30):
-                                    msg = json.loads(ws.receive_text())
-                                    messages.append(msg)
-                                    if msg.get("type") in ("turn.done", "error"):
-                                        break
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "agent-fail.db")
+            cache_path = str(Path(tmp) / "cache")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VOICE_TURN_MODE": "legacy_client",
+                    "RENDER": "",
+                    "SETU_ENV": "test",
+                    "ENV": "",
+                    "DB_PATH": db_path,
+                    "CACHE_PATH": cache_path,
+                    "SARVAM_API_KEY": "test-key",
+                },
+                clear=False,
+            ):
+                db.init_db()
+                with mock.patch.object(sarvam, "listen", return_value={"transcript": "hello", "language_code": "en-IN"}):
+                    with mock.patch.object(agent, "run_agent_turn", side_effect=NameError("_is_mostly_latin")):
+                        with mock.patch.object(sarvam, "speak", return_value=wav) as speak_mock:
+                            with mock.patch.object(voice_ws, "voice_log", side_effect=capture_log):
+                                # Context manager runs FastAPI lifespan (required on clean CI runners).
+                                with TestClient(main.app) as client:
+                                    with client.websocket_connect(voice_ws_path("agent-fail-1")) as ws:
+                                        ready = json.loads(ws.receive_text())
+                                        self.assertEqual(ready["type"], "ready")
+                                        audio_b64 = base64.b64encode(wav).decode("ascii")
+                                        ws.send_text(
+                                            json.dumps({"type": "audio.utterance", "audio_base64": audio_b64})
+                                        )
+                                        messages = []
+                                        for _ in range(30):
+                                            msg = json.loads(ws.receive_text())
+                                            messages.append(msg)
+                                            if msg.get("type") in ("turn.done", "error"):
+                                                break
         agent_logs = [f for e, f in logs if e == "agent_error"]
         self.assertTrue(agent_logs, "expected agent_error log")
         self.assertEqual(agent_logs[0].get("exception"), "NameError")
