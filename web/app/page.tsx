@@ -8,6 +8,7 @@ import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions 
 import { API_URL, deleteAccount, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
 import { bannerForApiFailure, classifyApiFailure } from "@/lib/api-failure";
 import { shouldPromptStillHere, stillHerePhrase } from "@/lib/still-here";
+import { APP_VERSION } from "@/lib/app-version";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
@@ -3264,9 +3265,10 @@ export default function Home() {
                 <a href="/privacy" className="underline-offset-2 hover:underline">Privacy</a>
                 <a href="/terms" className="underline-offset-2 hover:underline">Terms</a>
               </div>
+              <p className="mt-6 text-[11px] text-slate-400">Setu v{APP_VERSION}</p>
               <button
                 type="button"
-                className="mt-6 w-full rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800"
+                className="mt-3 w-full rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800"
                 onClick={() => {
                   void (async () => {
                     if (!window.confirm("Delete all Setu chats and documents for this account on the server?")) return;
