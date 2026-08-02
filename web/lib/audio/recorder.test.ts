@@ -20,7 +20,6 @@ import {
 import {
   MIN_SPEECH_MS,
   NO_SPEECH_MS,
-  SILENCE_MS,
   claimMicTurn,
   isMicTurnCurrent,
   releaseMicTurn,
@@ -106,8 +105,9 @@ describe("authoritative turn endpoint (TurnEndpoint — same code as production)
         rms = inDip ? opts.ambient : speechRms(opts.peak, t, bursty);
       } else {
         const post = t - speechEnd;
-        const inSpike = opts.spike && post >= opts.spike[0] && post < opts.spike[0] + opts.spike[1];
-        rms = inSpike ? opts.spike[2] : opts.postRms;
+        const spike = opts.spike;
+        const inSpike = Boolean(spike && post >= spike[0] && post < spike[0] + spike[1]);
+        rms = inSpike && spike ? spike[2] : opts.postRms;
       }
 
       controller.handleAudioFrame(1, rms, now);

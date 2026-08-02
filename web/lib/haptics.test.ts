@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { HAPTIC_PATTERNS, canVibrate, vibratePattern } from "./haptics";
