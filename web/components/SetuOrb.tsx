@@ -62,8 +62,9 @@ export function SetuOrb({
 
   return (
     <button
+      type="button"
+      aria-label="Start or stop talking with Setu"
       onClick={onClick}
-      aria-label="Start or stop voice recording"
       className="relative grid aspect-square w-[min(60vw,45vh)] max-h-[45vh] max-w-[300px] place-items-center rounded-full focus:outline-none focus-visible:ring-4 focus-visible:ring-[#4f46e5]/30"
     >
       <AnimatePresence>
