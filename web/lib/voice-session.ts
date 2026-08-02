@@ -1,7 +1,7 @@
 /** Persistent voice WebSocket client with progressive audio + cancel (barge-in). */
 
 import { API_URL, type ApiHistoryMessage, type VoiceTurnResponse } from "@/lib/api";
-import { getStoredUserId } from "@/lib/auth";
+import { getStoredSessionToken, getStoredUserId } from "@/lib/auth";
 import { debugLog, installDebugHelpers, voiceClientLog } from "@/lib/debug";
 
 installDebugHelpers();
@@ -130,6 +130,8 @@ export class VoiceSession {
   private openSocketOnce(userId: string, sid: string, attempt: number): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       const params = new URLSearchParams({ user_id: userId });
+      const sessionToken = getStoredSessionToken();
+      if (sessionToken) params.set("token", sessionToken);
       if (sid) params.set("session_id", sid);
       const url = `${wsBaseUrl()}/ws/voice?${params.toString()}`;
       const socket = new WebSocket(url);
