@@ -11,7 +11,6 @@ import { shouldPromptStillHere, stillHerePhrase } from "@/lib/still-here";
 import { APP_VERSION } from "@/lib/app-version";
 import { useEscapeClose } from "@/lib/use-escape-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
   micOpenBlockReason,
@@ -1753,9 +1752,10 @@ export default function Home() {
     let documentImage: string | undefined;
     let uploadBlob = blob;
     try {
+      const { preprocessScanImage } = await import("@/lib/preprocess-scan");
       uploadBlob = await preprocessScanImage(blob);
-    } catch (error) {
-      const msg = error instanceof ScanImageTooLargeError ? timeoutMsg : timeoutMsg;
+    } catch {
+      const msg = timeoutMsg;
       setService(null);
       setOrbState("idle");
       setStatusText(msg);
