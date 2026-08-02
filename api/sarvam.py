@@ -897,7 +897,10 @@ def intro_for_language(language: str) -> str:
     return SETU_INTRO_BY_LANG.get(base, SETU_INTRO_EN)
 
 
-VOICE_LANGUAGE_PROMPT = "Hi, welcome to Setu. Which language do you prefer?"
+VOICE_LANGUAGE_PROMPT = (
+    "Hi, welcome to Setu. I need the microphone to hear you, and the camera only "
+    "when you show a document. Which language do you prefer?"
+)
 
 BRIEF_ACK_BY_LANG: dict[str, str] = {
     "te": "సరే.",
