@@ -1,11 +1,16 @@
+/// <reference types="node" />
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  HEALTH_STEPS,
+  autorunVoiceCheckPath,
   buildHealthReport,
   formatHealthReportText,
+  parseAutorunFlag,
   scoreApiUrlConfig,
   scoreMicSample,
   scoreOverall,
+  stripAutorunFromSearch,
 } from "./voice-health";
 
 describe("voice health scoring", () => {
@@ -44,5 +49,34 @@ describe("voice health scoring", () => {
     assert.equal(report.overall, "fail");
     assert.ok(report.tips.some((t) => /Wake the API|Render/i.test(t)));
     assert.match(formatHealthReportText(report), /FAIL\s+API/);
+  });
+
+  it("includes env block when snapshot is present", () => {
+    const report = buildHealthReport(
+      [{ id: "api", label: "API", status: "pass", detail: "ok" }],
+      {
+        ua: "TestUA",
+        platform: "iPhone",
+        secure: true,
+        sw: "controlled",
+        viewport: "390x844",
+        apiUrl: "https://api.example.com",
+      },
+    );
+    const text = formatHealthReportText(report);
+    assert.match(text, /Env:/);
+    assert.match(text, /iPhone/);
+    assert.match(text, /TestUA/);
+    assert.ok(HEALTH_STEPS.length >= 6);
+  });
+
+  it("parses autorun deep-link and strips the flag", () => {
+    assert.equal(parseAutorunFlag("?autorun=1"), true);
+    assert.equal(parseAutorunFlag("autorun=true&x=1"), true);
+    assert.equal(parseAutorunFlag("?autorun=0"), false);
+    assert.equal(parseAutorunFlag(""), false);
+    assert.equal(autorunVoiceCheckPath(), "/voice-check?autorun=1");
+    assert.equal(stripAutorunFromSearch("?autorun=1&lang=hi"), "?lang=hi");
+    assert.equal(stripAutorunFromSearch("?autorun=1"), "");
   });
 });

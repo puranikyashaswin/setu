@@ -13,12 +13,54 @@ export type HealthCheckResult = {
   ms?: number;
 };
 
+export type EnvSnapshot = {
+  ua: string;
+  platform: string;
+  secure: boolean;
+  sw: "controlled" | "uncontrolled" | "unsupported";
+  viewport: string;
+  apiUrl: string;
+};
+
 export type HealthReport = {
   overall: CheckStatus;
   checks: HealthCheckResult[];
   tips: string[];
   at: number;
+  env?: EnvSnapshot;
 };
+
+/** Ordered steps shown in the Voice Health UI while a run is in progress. */
+export const HEALTH_STEPS = [
+  { id: "config", label: "Config" },
+  { id: "api", label: "API" },
+  { id: "tts", label: "Speaker" },
+  { id: "mic", label: "Mic" },
+  { id: "worklet", label: "Worklet" },
+  { id: "vad", label: "Voice" },
+  { id: "ws", label: "Socket" },
+] as const;
+
+/** Deep-link flag: /voice-check?autorun=1 (Notes / QR → one tap to start). */
+export function parseAutorunFlag(search: string): boolean {
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const v = new URLSearchParams(raw).get("autorun");
+  if (!v) return false;
+  const n = v.trim().toLowerCase();
+  return n === "1" || n === "true" || n === "yes";
+}
+
+export function autorunVoiceCheckPath(path = "/voice-check"): string {
+  return `${path}?autorun=1`;
+}
+
+export function stripAutorunFromSearch(search: string): string {
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const params = new URLSearchParams(raw);
+  params.delete("autorun");
+  const next = params.toString();
+  return next ? `?${next}` : "";
+}
 
 /** Close-talk VAD expects near-mic speech; room tone alone should not pass mic liveliness. */
 export const MIC_LIVE_RMS_MIN = 0.01;
@@ -60,12 +102,42 @@ export function tipsForReport(checks: HealthCheckResult[]): string[] {
   return tips;
 }
 
-export function buildHealthReport(checks: HealthCheckResult[]): HealthReport {
+export function collectEnvSnapshot(apiUrl: string): EnvSnapshot {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return {
+      ua: "ssr",
+      platform: "ssr",
+      secure: true,
+      sw: "unsupported",
+      viewport: "0x0",
+      apiUrl,
+    };
+  }
+  const controlled = "serviceWorker" in navigator;
+  let sw: EnvSnapshot["sw"] = "unsupported";
+  if (controlled) {
+    sw = navigator.serviceWorker.controller ? "controlled" : "uncontrolled";
+  }
+  return {
+    ua: navigator.userAgent.slice(0, 160),
+    platform: navigator.platform || "unknown",
+    secure: window.isSecureContext,
+    sw,
+    viewport: `${window.innerWidth}x${window.innerHeight}`,
+    apiUrl,
+  };
+}
+
+export function buildHealthReport(
+  checks: HealthCheckResult[],
+  env?: EnvSnapshot,
+): HealthReport {
   return {
     overall: scoreOverall(checks),
     checks,
     tips: tipsForReport(checks),
     at: Date.now(),
+    env,
   };
 }
 
@@ -124,10 +196,17 @@ export function formatHealthReportText(report: HealthReport): string {
     ...report.checks.map(
       (c) => `${c.status.toUpperCase()}  ${c.label}: ${c.detail}${c.ms != null ? ` (${c.ms}ms)` : ""}`,
     ),
-    "",
-    "Tips:",
-    ...report.tips.map((t) => `• ${t}`),
   ];
+  if (report.env) {
+    lines.push(
+      "",
+      "Env:",
+      `• ${report.env.platform} · ${report.env.viewport} · secure=${report.env.secure} · sw=${report.env.sw}`,
+      `• ${report.env.apiUrl}`,
+      `• ${report.env.ua}`,
+    );
+  }
+  lines.push("", "Tips:", ...report.tips.map((t) => `• ${t}`));
   return lines.join("\n");
 }
 
