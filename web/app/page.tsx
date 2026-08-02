@@ -2957,7 +2957,7 @@ export default function Home() {
                   </p>
                 </div>
               )}
-              <AnimatePresence mode="wait"><motion.p key={displayStatus || "status"} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.22 }} className={`${isRecording ? "mt-4" : "mt-8"} text-center text-sm font-medium tracking-[-0.01em] text-slate-700`}>{displayStatus}</motion.p></AnimatePresence>
+              <AnimatePresence mode="wait"><motion.p key={displayStatus || "status"} role="status" aria-live="polite" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.22 }} className={`${isRecording ? "mt-4" : "mt-8"} text-center text-sm font-medium tracking-[-0.01em] text-slate-700`}>{displayStatus}</motion.p></AnimatePresence>
               <CorrectionsStrip corrections={activeCorrections} language={actionSheetLanguage} className="mt-2 max-w-xs w-full" />
               {transcript && <motion.p variants={{ show: { transition: { staggerChildren: 0.03 } } }} initial="hidden" animate="show" className="mt-2 max-w-xs text-center text-xs leading-5 text-slate-500">Heard: {transcript.split(/\s+/).filter(Boolean).map((word, index) => <motion.span key={`heard-${index}`} variants={{ hidden: { opacity: 0, y: 4 }, show: { opacity: 1, y: 0 } }} className="mr-1 inline-block">{word}</motion.span>)}</motion.p>}
               {(activeSession?.turns.length ?? 0) > 0 && (
