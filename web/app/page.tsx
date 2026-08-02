@@ -80,6 +80,7 @@ setMicSessionAudioSession(setAudioSession);
 setPlaybackLogger(voiceClientLog);
 setSharedAudioLogger(voiceClientLog);
 import { VOICE_LANGUAGE_PROMPT, introForLanguage } from "@/lib/voice-phrases";
+import { CameraOverlay } from "@/components/CameraOverlay";
 import { SetuOrb } from "@/components/SetuOrb";
 import type {
   AnswerSheet,
@@ -1733,6 +1734,9 @@ export default function Home() {
 
   const openCamera = useCallback(() => {
     voiceLoopRef.current.transition("scanning", "camera_open");
+    cameraCapturedRef.current = false;
+    cameraGoodChecksRef.current = 0;
+    setCameraReadiness(0);
     setCameraOpen(true);
   }, []);
 
@@ -1934,9 +1938,6 @@ export default function Home() {
 
   useEffect(() => {
     if (!cameraOpen) return;
-    cameraCapturedRef.current = false;
-    cameraGoodChecksRef.current = 0;
-    setCameraReadiness(0);
     let interval = 0;
     let lastEdge = -1;
     const openedAt = performance.now();
@@ -2317,7 +2318,9 @@ export default function Home() {
   }, [finishRecording]);
 
   const fallbackServerVadRef = useRef<typeof fallbackServerVadTurnToLegacy | null>(null);
-  fallbackServerVadRef.current = fallbackServerVadTurnToLegacy;
+  useEffect(() => {
+    fallbackServerVadRef.current = fallbackServerVadTurnToLegacy;
+  }, [fallbackServerVadTurnToLegacy]);
 
   const finishServerVadTurn = useCallback(async (turn: number, reason: string) => {
     const active = teardownServerVadTurn(turn);
@@ -3130,7 +3133,19 @@ export default function Home() {
           </div>
         )}
       </div>
-      <AnimatePresence>{cameraOpen && <motion.section key="camera-overlay" className="absolute inset-0 z-20 bg-black" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}><video ref={cameraVideoRef} autoPlay playsInline muted className="h-full w-full object-cover" /><canvas ref={cameraCanvasRef} className="hidden" /><div className="absolute inset-0 flex flex-col items-center justify-between bg-gradient-to-b from-black/45 via-transparent to-black/60 p-6 text-center text-white"><p className="mt-4 max-w-xs text-lg font-medium">{cameraText[language].hold}</p><div className="grid h-16 w-16 place-items-center rounded-full border-2 border-white/80" style={{ background: `conic-gradient(#ff6b00 ${(cameraReadiness / CAPTURE_STREAK) * 100}%, rgba(255,255,255,.22) 0)` }}><span className="grid h-12 w-12 place-items-center rounded-full bg-black/55 text-xs">{cameraReadiness}/{CAPTURE_STREAK}</span></div><div className="flex w-full justify-between"><button onClick={closeCamera} className="rounded-full bg-black/45 px-5 py-3 text-sm backdrop-blur">Cancel</button><button onClick={captureDocument} className="rounded-full bg-[#ff6b00] px-5 py-3 text-sm font-medium">Capture now</button></div></div></motion.section>}</AnimatePresence>
+      <AnimatePresence>
+        {cameraOpen && (
+          <CameraOverlay
+            videoRef={cameraVideoRef}
+            canvasRef={cameraCanvasRef}
+            copy={cameraText[language]}
+            readiness={cameraReadiness}
+            captureStreak={CAPTURE_STREAK}
+            onClose={closeCamera}
+            onCapture={captureDocument}
+          />
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {sessionPickerOpen && (
           <>

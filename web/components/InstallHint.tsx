@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 const KEY = "setu-install-hint-dismissed";
 
@@ -19,19 +19,18 @@ function isStandalone(): boolean {
   return window.matchMedia("(display-mode: standalone)").matches || Boolean(nav.standalone);
 }
 
-export function InstallHint() {
-  const [text, setText] = useState<string | null>(null);
+function initialHint(): string | null {
+  if (typeof window === "undefined") return null;
+  if (isStandalone()) return null;
+  if (localStorage.getItem(KEY) === "1") return null;
+  if (isIosSafari()) {
+    return "Add Setu to your Home Screen: Share → Add to Home Screen";
+  }
+  return "Install Setu from the browser menu for a full-screen voice app";
+}
 
-  useEffect(() => {
-    if (isStandalone()) return;
-    if (localStorage.getItem(KEY) === "1") return;
-    if (isIosSafari()) {
-      setText("Add Setu to your Home Screen: Share → Add to Home Screen");
-      return;
-    }
-    // Chromium installability varies; soft hint only.
-    setText("Install Setu from the browser menu for a full-screen voice app");
-  }, []);
+export function InstallHint() {
+  const [text, setText] = useState<string | null>(initialHint);
 
   if (!text) return null;
 
