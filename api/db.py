@@ -81,6 +81,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def check_readable() -> None:
+    """Open DB and run a trivial read — raises if SQLite cannot be opened."""
+    with _connect() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+
 def check_writable() -> None:
     """Open DB and run a trivial write/read — raises if the disk/DB is broken."""
     with _connect() as conn:

@@ -265,7 +265,8 @@ def health():
     db_ok = True
     db_error: str | None = None
     try:
-        db.check_writable()
+        # Read-only on the hot keep-warm path; writable check runs at boot + /ready.
+        db.check_readable()
     except Exception as exc:  # noqa: BLE001 — surface any disk/SQLite failure
         db_ok = False
         db_error = type(exc).__name__
