@@ -12,8 +12,17 @@
 
 import { voiceClientLog } from "@/lib/debug";
 
-export const VOICE_TURN_MODE: "legacy_client" | "server_vad_v1" =
-  process.env.NEXT_PUBLIC_VOICE_TURN_MODE === "server_vad_v1" ? "server_vad_v1" : "legacy_client";
+function resolveVoiceTurnMode(): "legacy_client" | "server_vad_v1" {
+  const raw = (process.env.NEXT_PUBLIC_VOICE_TURN_MODE || "legacy_client").trim();
+  // live_v2 is unimplemented — never activate it from the client.
+  if (raw === "live_v2") {
+    console.warn("[audio] live_v2 is unimplemented; using legacy_client");
+    return "legacy_client";
+  }
+  return raw === "server_vad_v1" ? "server_vad_v1" : "legacy_client";
+}
+
+export const VOICE_TURN_MODE: "legacy_client" | "server_vad_v1" = resolveVoiceTurnMode();
 export const BARGE_IN_ENABLED = process.env.NEXT_PUBLIC_VOICE_BARGE_IN_ENABLED === "true";
 
 export const VAD_READY_TIMEOUT_MS = 1000;
