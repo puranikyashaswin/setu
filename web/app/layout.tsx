@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { InstallHint } from "@/components/InstallHint";
 import { PwaRegister } from "./pwa-register";
+import { SentryInit } from "./sentry-init";
 
 export const metadata: Metadata = {
   title: "Setu",
@@ -35,6 +36,7 @@ export default function RootLayout({
       className="h-full antialiased"
     >
       <body className="min-h-full flex flex-col">
+        <SentryInit />
         <PwaRegister />
         <InstallHint />
         {children}
