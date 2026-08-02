@@ -10,11 +10,38 @@ import uuid
 from pathlib import Path
 
 # Prefer DB_PATH (Render disk: /data/setu.db). SETU_DB_PATH kept as legacy alias.
+_DEFAULT_LOCAL_DB = Path("./cache/setu.db")
 _DB_PATH = Path(
     os.getenv("DB_PATH")
     or os.getenv("SETU_DB_PATH")
-    or "./cache/setu.db"
+    or str(_DEFAULT_LOCAL_DB)
 )
+
+
+def is_production() -> bool:
+    """True on Render / explicit prod — local and pytest stay permissive."""
+    if os.getenv("SETU_ENV", "").lower() in {"prod", "production"}:
+        return True
+    if os.getenv("ENV", "").lower() in {"prod", "production"}:
+        return True
+    # Render sets RENDER=true on all services.
+    return os.getenv("RENDER", "").lower() in {"true", "1"}
+
+
+def db_path() -> Path:
+    return _DB_PATH
+
+
+def require_db_path_configured() -> None:
+    """Fail loud in production if DB_PATH was not set (ephemeral disk = data loss)."""
+    if not is_production():
+        return
+    configured = (os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "").strip()
+    if not configured:
+        raise RuntimeError(
+            "DB_PATH must be set in production (e.g. /data/setu.db on the Render disk). "
+            "Refusing to start with the local ./cache default."
+        )
 
 
 def _connect() -> sqlite3.Connection:
@@ -27,6 +54,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    require_db_path_configured()
     with _connect() as conn:
         conn.executescript(
             """
