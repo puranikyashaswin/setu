@@ -55,6 +55,8 @@ def request_magic_link(email: str, user_id: str | None = None) -> dict:
     email = email.strip().lower()
     if "@" not in email or "." not in email.split("@")[-1]:
         raise ValueError("Valid email required")
+    if db.is_production() and not (os.getenv("RESEND_API_KEY") or "").strip():
+        raise ValueError("Email sign-in is not configured (RESEND_API_KEY missing)")
     user = db.ensure_user(user_id, email=None, is_guest=True)
     token = db.create_magic_link(email, user_id=user["id"])
     frontend = (os.getenv("FRONTEND_ORIGIN") or "http://localhost:3000").rstrip("/")
