@@ -37,11 +37,25 @@ export const WS_CONNECT_TIMEOUT_MS = 25000;
 export const WS_CONNECT_MAX_ATTEMPTS = 2;
 export const API_WAKE_TIMEOUT_MS = 20000;
 
-function wsBaseUrl(): string {
-  const http = API_URL.replace(/\/$/, "");
+export function wsBaseUrl(apiUrl: string = API_URL): string {
+  const http = apiUrl.replace(/\/$/, "");
   if (http.startsWith("https://")) return `wss://${http.slice("https://".length)}`;
   if (http.startsWith("http://")) return `ws://${http.slice("http://".length)}`;
   return `ws://${http}`;
+}
+
+/** Build /ws/voice URL with optional signed token (production auth). */
+export function buildVoiceWsUrl(options: {
+  userId: string;
+  sessionId?: string | null;
+  token?: string | null;
+  apiUrl?: string;
+}): string {
+  const params = new URLSearchParams({ user_id: options.userId });
+  if (options.token) params.set("token", options.token);
+  const sid = (options.sessionId || "").trim();
+  if (sid) params.set("session_id", sid);
+  return `${wsBaseUrl(options.apiUrl)}/ws/voice?${params.toString()}`;
 }
 
 /** Ping /health before opening the voice WebSocket (wakes Render). */
@@ -129,11 +143,11 @@ export class VoiceSession {
 
   private openSocketOnce(userId: string, sid: string, attempt: number): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
-      const params = new URLSearchParams({ user_id: userId });
-      const sessionToken = getStoredSessionToken();
-      if (sessionToken) params.set("token", sessionToken);
-      if (sid) params.set("session_id", sid);
-      const url = `${wsBaseUrl()}/ws/voice?${params.toString()}`;
+      const url = buildVoiceWsUrl({
+        userId,
+        sessionId: sid,
+        token: getStoredSessionToken(),
+      });
       const socket = new WebSocket(url);
       this.socket = socket;
       let settled = false;
