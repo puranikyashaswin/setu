@@ -56,11 +56,41 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+# Bump when adding a migration step in _apply_migrations.
+SCHEMA_VERSION = 1
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    return int(row["version"]) if row else 0
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent migrate-on-boot. Add new steps when SCHEMA_VERSION increases."""
+    current = schema_version(conn)
+    if current >= SCHEMA_VERSION:
+        return
+    # v1: baseline tables already created via CREATE IF NOT EXISTS above.
+    if current < 1:
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (1, time.time()),
+        )
+    conn.commit()
+
+
 def init_db() -> None:
     require_db_path_configured()
     with _connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+              version INTEGER PRIMARY KEY,
+              applied_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS users (
               id TEXT PRIMARY KEY,
               email TEXT UNIQUE,
@@ -119,6 +149,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, created_at);
             """
         )
+        _apply_migrations(conn)
 
 
 def ensure_user(user_id: str | None = None, *, email: str | None = None, is_guest: bool = True) -> dict:
