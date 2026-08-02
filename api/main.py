@@ -31,6 +31,7 @@ import ocr
 import paths
 import rate_limit
 import sarvam
+import settings
 import voice_ws
 
 logging.basicConfig(level=logging.INFO)
@@ -170,6 +171,7 @@ async def _warmup_background() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    settings.require_production_settings()
     db_path, cache_dir = paths.ensure_data_dirs()
     logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
     db.init_db()
