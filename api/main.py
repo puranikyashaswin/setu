@@ -811,11 +811,18 @@ def ask(body: AskBody, user_id: str = Depends(_require_ai_user)):
     if not body.question.strip():
         raise HTTPException(400, "question required")
     t0 = time.perf_counter()
-    _ = user_id
     route_ms = 0
     llm_ms = 0
     status = 200
     t_route = time.perf_counter()
+    if not db.user_owns_document(body.doc_id, user_id):
+        # Fall through to in-memory/sample docs that are not yet in SQLite.
+        stored = db.get_document_text(body.doc_id)
+        if stored is not None:
+            route_ms = _ms_since(t_route)
+            status = 403
+            _record_timing("/ask", status, route_ms=route_ms, llm_ms=0, total_ms=_ms_since(t0))
+            raise HTTPException(403, "Document belongs to another user")
     doc = sarvam.get_document(body.doc_id)
     if not doc:
         route_ms = _ms_since(t_route)

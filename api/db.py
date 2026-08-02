@@ -430,6 +430,17 @@ def get_document_text(doc_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+def user_owns_document(doc_id: str, user_id: str) -> bool:
+    """True if the document is owned by user_id, or has no owner (legacy/sample)."""
+    row = get_document_text(doc_id)
+    if not row:
+        return False
+    owner = row.get("user_id")
+    if owner is None or owner == "":
+        return True
+    return owner == user_id
+
+
 def _turn_from_row(row: sqlite3.Row) -> dict:
     turn = {
         "id": row["id"],
