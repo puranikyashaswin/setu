@@ -24,6 +24,9 @@ jobs:
         run: python -m unittest discover -s . -p 'test_*.py' -v
       - name: Persistence smoke
         run: python ../scripts/smoke_persist.py
+      - name: Dependency audit
+        run: pip install pip-audit && pip-audit -r requirements.txt
+        continue-on-error: true
 
   web:
     runs-on: ubuntu-latest
@@ -49,3 +52,16 @@ jobs:
         run: npm run build
         env:
           NEXT_PUBLIC_API_URL: https://example.com
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject committed local env files
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then echo ".env is tracked"; exit 1; fi
+          if git ls-files --error-unmatch web/.env.local >/dev/null 2>&1; then echo "web/.env.local is tracked"; exit 1; fi
+          echo "ok: env files not tracked"
