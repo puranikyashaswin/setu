@@ -341,6 +341,30 @@ def delete_session(session_id: str, user_id: str) -> None:
         conn.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id))
 
 
+def delete_user_data(user_id: str) -> dict:
+    """Delete all sessions/turns/docs owned by user. Returns counts."""
+    with _connect() as conn:
+        session_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+        ]
+        turns = 0
+        for sid in session_ids:
+            cur = conn.execute("DELETE FROM turns WHERE session_id = ?", (sid))
+            turns += cur.rowcount
+        sessions = conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,)).rowcount
+        documents = conn.execute("DELETE FROM documents WHERE user_id = ?", (user_id,)).rowcount
+        conn.execute("DELETE FROM magic_links WHERE user_id = ?", (user_id,))
+        users = conn.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount
+        conn.commit()
+    return {
+        "sessions": sessions,
+        "turns": turns,
+        "documents": documents,
+        "users": users,
+    }
+
+
 def recent_session_summaries(user_id: str, exclude_session_id: str | None = None, limit: int = 5) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(

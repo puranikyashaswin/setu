@@ -497,6 +497,16 @@ def sessions_delete(session_id: str, x_user_id: str | None = Header(default=None
     return {"ok": True}
 
 
+@app.delete("/auth/account")
+def auth_delete_account(x_user_id: str | None = Header(default=None)):
+    """Delete the caller's account data (sessions, turns, owned documents)."""
+    user = _user_from_header(x_user_id)
+    counts = db.delete_user_data(user["id"])
+    response = JSONResponse({"ok": True, "deleted": counts})
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return response
+
+
 @app.get("/voices")
 def voices(user_id: str = Depends(_require_ai_user)):
     _ = user_id
