@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import logging
 import os
 import time
@@ -291,14 +292,28 @@ def health():
     return body
 
 
+def _require_debug_access(x_debug_token: str | None) -> None:
+    """Gate /debug in production with DEBUG_TOKEN; open locally when unset."""
+    expected = (os.getenv("DEBUG_TOKEN") or "").strip()
+    if db.is_production():
+        if not expected:
+            raise HTTPException(404, "Not found")
+        if not x_debug_token or not hmac.compare_digest(x_debug_token, expected):
+            raise HTTPException(404, "Not found")
+        return
+    if expected and (not x_debug_token or not hmac.compare_digest(x_debug_token, expected)):
+        raise HTTPException(401, "X-Debug-Token required")
+
+
 @app.get("/debug/last-turn")
-def debug_last_turn():
+def debug_last_turn(x_debug_token: str | None = Header(default=None, alias="X-Debug-Token")):
     """Last REST stage timings + last WS voice event ring (up to 50).
 
     Survives client disconnect for the life of the process. Right after boot
     (no voice activity yet) returns note=server_restarted so null is not
-    confused with a client mic bug.
+    confused with a client mic bug. Production requires DEBUG_TOKEN.
     """
+    _require_debug_access(x_debug_token)
     payload = dict(_LAST_TURN) if _LAST_TURN else {}
     payload["voice_session_id"] = voice_ws.last_voice_session_id()
     payload["voice_events"] = voice_ws.get_voice_events()
