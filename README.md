@@ -105,7 +105,10 @@ Verify the API is running: [http://localhost:8000/health](http://localhost:8000/
 ```bash
 cd api
 source .venv/bin/activate
-python -m unittest test_agent_routing test_ocr_timeout test_tts_rate_limit -v
+python -m unittest discover -s . -p 'test_*.py' -v
+# Focused examples:
+# python -m unittest test_agent_routing test_ocr_timeout test_tts_rate_limit \
+#   test_server_vad test_voice_ws_vad test_debug_last_turn test_health_ready test_ws_auth -v
 
 cd ../web
 npm test
