@@ -327,12 +327,14 @@ def warm():
 
 
 def _session_cookie_response(payload: dict, user_id: str) -> JSONResponse:
-    """Attach HttpOnly signed session cookie alongside the JSON body."""
-    response = JSONResponse(payload)
+    """Attach HttpOnly signed session cookie + body token (for cross-origin WS)."""
+    token = auth.sign_session_token(user_id)
+    body = {**payload, "session_token": token}
+    response = JSONResponse(body)
     secure = db.is_production()
     response.set_cookie(
         key=auth.SESSION_COOKIE,
-        value=auth.sign_session_token(user_id),
+        value=token,
         httponly=True,
         secure=secure,
         samesite="lax",
