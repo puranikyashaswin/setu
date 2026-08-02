@@ -2807,6 +2807,17 @@ export default function Home() {
     };
   }, []);
 
+  // Escape closes settings / chat picker drawers.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (isSettingsOpen) setIsSettingsOpen(false);
+      if (sessionPickerOpen) setSessionPickerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isSettingsOpen, sessionPickerOpen]);
+
   // Soft “I'm still here” after ~30s of continuous listening with no turn submit.
   useEffect(() => {
     if (!isRecording) return;
