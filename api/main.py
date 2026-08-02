@@ -27,6 +27,7 @@ import agent
 import auth
 import db
 import ocr
+import paths
 import rate_limit
 import sarvam
 import voice_ws
@@ -60,15 +61,6 @@ def _frontend_origins() -> list[str]:
             if part and part not in origins:
                 origins.append(part)
     return origins
-
-
-def _ensure_data_dirs() -> None:
-    """Create DB parent + CACHE_PATH so SQLite/OCR/TTS survive on a mounted disk."""
-    cache_dir = Path(os.getenv("CACHE_PATH") or "./cache/")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    db_path = Path(os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "./cache/setu.db")
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
 
 
 def _ms_since(t0: float) -> int:
@@ -161,7 +153,8 @@ async def _warmup_background() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    _ensure_data_dirs()
+    db_path, cache_dir = paths.ensure_data_dirs()
+    logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
     db.init_db()
     sarvam.load_ocr_cache()
     sarvam.load_session_corrections()
