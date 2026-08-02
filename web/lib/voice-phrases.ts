@@ -11,9 +11,11 @@ export type PhraseLanguage =
   | "pa"
   | "or";
 
+import { MIC_CAMERA_CONSENT_PHRASE } from "./consent";
+
 /** Spoken on the very first tap (English). Then user picks a language. */
 export const VOICE_LANGUAGE_PROMPT =
-  "Hi, welcome to Setu. I need the microphone to hear you, and the camera only when you show a document. Which language do you prefer?";
+  `Hi, welcome to Setu. ${MIC_CAMERA_CONSENT_PHRASE} Which language do you prefer?`;
 
 /**
  * After the user picks a language — short onboarding intro in that language.
