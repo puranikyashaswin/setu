@@ -1,6 +1,6 @@
 /** Setu PWA service worker — shell cache only. Never pin voice-critical assets. */
 const CACHE_NAME = "setu-shell-v4";
-const APP_SHELL = ["/", "/logo.png", "/favicon.png", "/apple-touch-icon.png", "/bg-waves.png"];
+const APP_SHELL = ["/", "/offline.html", "/logo.png", "/favicon.png", "/apple-touch-icon.png", "/bg-waves.png"];
 
 /** Paths that must always hit the network (AudioWorklet / SW / hashed Next assets). */
 function mustBypassCache(pathname) {
@@ -62,7 +62,9 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       fetch(request)
         .then(cachePut)
-        .catch(() => caches.match(request).then((cached) => cached || caches.match("/"))),
+        .catch(() =>
+          caches.match(request).then((cached) => cached || caches.match("/offline.html") || caches.match("/")),
+        ),
     );
     return;
   }
