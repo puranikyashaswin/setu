@@ -24,7 +24,9 @@ services:
       - key: RESEND_FROM
         sync: false
       - key: EXPOSE_MAGIC_LINK
-        value: "1"
+        value: "0"
+      - key: AUTH_SECRET
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12.8"
       # Voice v2: legacy_client (default) | server_vad_v1. Flip after phone validation.
