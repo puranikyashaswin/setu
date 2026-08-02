@@ -40,17 +40,28 @@ def hydrate_env_from_secret_files() -> None:
 
 
 def apply_render_disk_defaults() -> None:
-    """Fill DB_PATH / CACHE_PATH when Render mounted /data but env was never synced.
+    """Fill DB_PATH / CACHE_PATH for Render when unset.
 
-    Existing services created before render.yaml path vars still need to boot.
+    Prefer the Starter disk at /data. On Free (no disk) fall back to /tmp so the
+    process can boot — data will not survive redeploys.
     AUTH_SECRET is never invented here (would rotate session cookies on every restart).
     """
     if not db.is_production():
         return
-    if not Path("/data").is_dir():
+    if Path("/data").is_dir():
+        os.environ.setdefault("DB_PATH", "/data/setu.db")
+        os.environ.setdefault("CACHE_PATH", "/data/cache")
         return
-    os.environ.setdefault("DB_PATH", "/data/setu.db")
-    os.environ.setdefault("CACHE_PATH", "/data/cache")
+    # Free tier / missing disk: still boot, but warn loudly.
+    if not (os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "").strip():
+        os.environ["DB_PATH"] = "/tmp/setu.db"
+    if not (os.getenv("CACHE_PATH") or "").strip():
+        os.environ["CACHE_PATH"] = "/tmp/setu-cache"
+    print(
+        "[startup] WARNING: /data disk not mounted — using /tmp for DB/cache "
+        "(ephemeral on Free plan). Upgrade to Starter + attach disk at /data.",
+        flush=True,
+    )
 
 
 def env_value(key: str) -> str:

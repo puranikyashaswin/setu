@@ -149,22 +149,36 @@ async def _warmup_background() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Flush every step — Render health waits until this yields.
+    print("[startup] begin", flush=True)
     settings.require_production_settings()
+    print("[startup] settings ok", flush=True)
     observability.init_sentry()
     db_path, cache_dir = paths.ensure_data_dirs()
+    print(f"[startup] data paths db={db_path.resolve()} cache={cache_dir.resolve()}", flush=True)
     logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
     db.init_db()
-    sarvam.load_ocr_cache()
-    sarvam.load_session_corrections()
+    print("[startup] db ready", flush=True)
     origins = _frontend_origins()
     print(f"[startup] CORS allow_origins={origins}", flush=True)
     logger.info("CORS allow_origins=%s", origins)
+    # Yield ASAP so /health can pass; load caches + warm in background.
     warm_task: asyncio.Task | None = None
-    if not os.getenv("SARVAM_API_KEY"):
-        logger.warning("SARVAM_API_KEY not set — API calls will fail")
-    else:
-        # Schedule warm-up then yield immediately so /health is not blocked.
-        warm_task = asyncio.create_task(_warmup_background())
+
+    async def _post_ready() -> None:
+        try:
+            await asyncio.to_thread(sarvam.load_ocr_cache)
+            await asyncio.to_thread(sarvam.load_session_corrections)
+            print("[startup] caches loaded", flush=True)
+        except Exception:
+            logger.warning("Cache load failed", exc_info=True)
+        if os.getenv("SARVAM_API_KEY"):
+            await _warmup_background()
+        else:
+            logger.warning("SARVAM_API_KEY not set — API calls will fail")
+
+    warm_task = asyncio.create_task(_post_ready())
+    print("[startup] ready (serving)", flush=True)
     yield
     if warm_task is not None and not warm_task.done():
         warm_task.cancel()
