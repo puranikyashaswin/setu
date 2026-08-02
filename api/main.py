@@ -64,6 +64,16 @@ def _frontend_origins() -> list[str]:
     return origins
 
 
+def _allow_vercel_preview_cors() -> bool:
+    """Preview wildcard is off in production unless explicitly enabled."""
+    flag = (os.getenv("ALLOW_VERCEL_PREVIEWS") or "").strip().lower()
+    if flag in {"1", "true", "yes"}:
+        return True
+    if flag in {"0", "false", "no"}:
+        return False
+    return not db.is_production()
+
+
 def _ms_since(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
 
@@ -186,14 +196,16 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Setu API", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_frontend_origins(),
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_cors_kwargs: dict = {
+    "allow_origins": _frontend_origins(),
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if _allow_vercel_preview_cors():
+    _cors_kwargs["allow_origin_regex"] = r"https://.*\.vercel\.app"
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 app.include_router(voice_ws.router)
 
@@ -290,6 +302,25 @@ def health():
     if not db_ok:
         raise HTTPException(status_code=503, detail=body)
     return body
+
+
+@app.get("/ready")
+def ready():
+    """Readiness: DB writable + required secrets present (stricter than /health)."""
+    errors: list[str] = []
+    try:
+        db.check_writable()
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"db:{type(exc).__name__}")
+    if not (os.getenv("SARVAM_API_KEY") or "").strip():
+        errors.append("sarvam_api_key")
+    if db.is_production() and not (os.getenv("AUTH_SECRET") or "").strip():
+        errors.append("auth_secret")
+    if db.is_production() and not (os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "").strip():
+        errors.append("db_path")
+    if errors:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "errors": errors})
+    return {"status": "ready", "db": "ok"}
 
 
 def _require_debug_access(x_debug_token: str | None) -> None:
