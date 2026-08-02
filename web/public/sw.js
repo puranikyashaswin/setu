@@ -1,5 +1,5 @@
 /** Setu PWA service worker — shell cache only. Never pin voice-critical assets. */
-const CACHE_NAME = "setu-shell-v3";
+const CACHE_NAME = "setu-shell-v4";
 const APP_SHELL = ["/", "/logo.png", "/favicon.png", "/apple-touch-icon.png", "/bg-waves.png"];
 
 /** Paths that must always hit the network (AudioWorklet / SW / hashed Next assets). */
@@ -11,9 +11,14 @@ function mustBypassCache(pathname) {
 }
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()),
-  );
+  // Do not skipWaiting here — let the app show "Update Setu" then activate.
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener("activate", (event) => {
