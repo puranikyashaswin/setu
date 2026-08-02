@@ -25,8 +25,9 @@ services:
         sync: false
       - key: EXPOSE_MAGIC_LINK
         value: "0"
+      # Auto-generate on first Blueprint sync if unset (do not rotate casually).
       - key: AUTH_SECRET
-        sync: false
+        generateValue: true
       - key: PYTHON_VERSION
         value: "3.12.8"
       # Voice v2: legacy_client (default) | server_vad_v1. Flip after phone validation.
