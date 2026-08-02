@@ -106,7 +106,13 @@ def _memory_context(user_id: str | None, session_id: str | None = None) -> str |
 
 
 def _user_from_header(x_user_id: str | None) -> dict:
-    return auth.resolve_user(x_user_id)
+    """Require an existing client identity — do not mint guests from a missing header.
+
+    Guests are created only via POST /auth/guest (or magic-link verify).
+    """
+    if not x_user_id or not str(x_user_id).strip():
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    return auth.resolve_user(str(x_user_id).strip())
 
 
 def _require_ai_user(user_id: str = Depends(rate_limit.require_user_id)) -> str:
