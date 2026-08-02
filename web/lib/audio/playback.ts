@@ -20,6 +20,9 @@ import {
   type PlaybackOutcome,
 } from "./audio-owner";
 
+/** Cap in-memory TTS chunks so a runaway reply cannot balloon the tab. */
+export const MAX_TTS_PARTS = 24;
+
 type PlaybackLog = (event: string, data?: Record<string, unknown>) => void;
 let playbackLog: PlaybackLog = () => undefined;
 
@@ -334,7 +337,17 @@ async function playOnePart(
 export async function playDecodedBuffersSequential(
   options: Omit<PlayElementOptions, "arrayBuffer"> & { arrayBuffers: ArrayBuffer[]; turnId?: number },
 ): Promise<PlaybackHandles> {
-  const { arrayBuffers, onPlay, onSettled, onEnded, onAmplitude } = options;
+  const { onPlay, onSettled, onEnded, onAmplitude } = options;
+  const arrayBuffers =
+    options.arrayBuffers.length > MAX_TTS_PARTS
+      ? options.arrayBuffers.slice(0, MAX_TTS_PARTS)
+      : options.arrayBuffers;
+  if (options.arrayBuffers.length > MAX_TTS_PARTS) {
+    playbackLog("tts_parts_capped", {
+      received: options.arrayBuffers.length,
+      max: MAX_TTS_PARTS,
+    });
+  }
   const turnId = options.turnId ?? nextPlaybackTurnId();
 
   if (activeTurnId != null || activeQueue || activeElement) {
