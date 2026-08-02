@@ -1,0 +1,21 @@
+name: Nightly smoke
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke health / ready / warm
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "Set repository variable API_URL (e.g. https://setu-api.onrender.com)."
+            exit 1
+          fi
+          python3 scripts/smoke.py
