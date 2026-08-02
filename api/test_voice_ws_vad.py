@@ -25,6 +25,7 @@ import main
 import sarvam
 import server_vad
 import voice_ws
+from test_ws_helpers import voice_ws_path
 
 
 class EnergyEngine:
@@ -129,7 +130,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3 as agent_mock, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-1") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-1")) as ws:
                 ready = json.loads(ws.receive_text())
                 self.assertEqual(ready["type"], "ready")
                 self.assertEqual(ready["voice_turn_mode"], "server_vad_v1")
@@ -165,7 +166,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-2") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-2")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 stream = pcm_chunk(600, 8000) + pcm_chunk(500, 100) + pcm_chunk(600, 8000) + pcm_chunk(1000, 100)
@@ -180,7 +181,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-3") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-3")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 speech = pcm_chunk(800, 8000)
@@ -203,7 +204,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-4") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-4")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 self._send_chunks(ws, 4, pcm_chunk(2000, 100))
@@ -216,7 +217,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-5") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-5")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 self._send_chunks(ws, 5, pcm_chunk(600, 8000))
@@ -233,7 +234,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-6") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-6")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 self._send_chunks(ws, 6, pcm_chunk(800, 8000))
@@ -247,7 +248,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "live_v2"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-7") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-7")) as ws:
                 ready = json.loads(ws.receive_text())
                 self.assertEqual(ready["voice_turn_mode"], "legacy_client")
                 notice = json.loads(ws.receive_text())
@@ -273,7 +274,7 @@ class WsVadTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "server_vad_v1"}),
         ):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-9") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-9")) as ws:
                 ws.receive_text()
                 ws.receive_text()
                 # Speech in irregular pieces: 73ms + 127ms + 31ms + 169ms = 400ms.
@@ -320,7 +321,7 @@ class WsVadTests(unittest.TestCase):
         p1, p2, p3, p4 = self._patches()
         with p1, p2, p3, p4, mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "legacy_client"}):
             client = TestClient(main.app)
-            with client.websocket_connect("/ws/voice?user_id=vad-it-8") as ws:
+            with client.websocket_connect(voice_ws_path("vad-it-8")) as ws:
                 ready = json.loads(ws.receive_text())
                 self.assertEqual(ready["voice_turn_mode"], "legacy_client")
                 self._send_chunks(ws, 8, pcm_chunk(500, 8000))

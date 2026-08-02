@@ -236,9 +236,20 @@ class AgentFailureFallbackTests(unittest.TestCase):
             with mock.patch.object(agent, "run_agent_turn", side_effect=NameError("_is_mostly_latin")):
                 with mock.patch.object(sarvam, "speak", return_value=wav) as speak_mock:
                     with mock.patch.object(voice_ws, "voice_log", side_effect=capture_log):
-                        with mock.patch.dict(os.environ, {"VOICE_TURN_MODE": "legacy_client"}):
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                "VOICE_TURN_MODE": "legacy_client",
+                                "RENDER": "",
+                                "SETU_ENV": "test",
+                                "ENV": "",
+                            },
+                            clear=False,
+                        ):
+                            from test_ws_helpers import voice_ws_path
+
                             client = TestClient(main.app)
-                            with client.websocket_connect("/ws/voice?user_id=agent-fail-1") as ws:
+                            with client.websocket_connect(voice_ws_path("agent-fail-1")) as ws:
                                 ready = json.loads(ws.receive_text())
                                 self.assertEqual(ready["type"], "ready")
                                 audio_b64 = base64.b64encode(wav).decode("ascii")

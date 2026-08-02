@@ -8,6 +8,11 @@ on:
 jobs:
   api:
     runs-on: ubuntu-latest
+    env:
+      # Repo/org vars must not flip production auth guards during unit tests.
+      RENDER: ""
+      SETU_ENV: "test"
+      ENV: "test"
     defaults:
       run:
         working-directory: api
