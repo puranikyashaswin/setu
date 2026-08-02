@@ -17,7 +17,7 @@ jobs:
           API_URL: ${{ vars.API_URL }}
         run: |
           if [ -z "$API_URL" ]; then
-            echo "Set repository variable API_URL to your Render URL (e.g. https://setu-api.onrender.com)."
+            echo "::error title=Missing API_URL::Set repository variable API_URL to your Render URL (for example, https://setu-api.onrender.com)."
             exit 1
           fi
           # Prefer /warm (touches TTS cache / TLS). Fall back to /health.
@@ -27,4 +27,7 @@ jobs:
             code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 120 "$API_URL/health")
           fi
           echo "warm/health -> $code"
-          [ "$code" = "200" ]
+          if [ "$code" != "200" ]; then
+            echo "::error title=API warm check failed::$API_URL returned HTTP $code from /warm and /health."
+            exit 1
+          fi
