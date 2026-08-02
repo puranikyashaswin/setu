@@ -87,8 +87,19 @@ def reset_voice_debug_for_tests() -> None:
 
 
 def _ws_url_user(websocket: WebSocket) -> str | None:
-    user_id = websocket.headers.get("x-user-id") or websocket.query_params.get("user_id")
-    return (user_id or "").strip() or None
+    """Resolve user from signed session cookie/token; legacy naked user_id only in non-prod."""
+    cookie = websocket.cookies.get(auth.SESSION_COOKIE)
+    uid = auth.verify_session_token(cookie)
+    if uid:
+        return uid
+    uid = auth.verify_session_token(websocket.query_params.get("token"))
+    if uid:
+        return uid
+    # Cross-origin demos / local: unsigned user_id still accepted off Render.
+    if not db.is_production():
+        legacy = websocket.headers.get("x-user-id") or websocket.query_params.get("user_id")
+        return (legacy or "").strip() or None
+    return None
 
 
 async def _send(ws: WebSocket, payload: dict[str, Any]) -> None:
