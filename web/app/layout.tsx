@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { InstallHint } from "@/components/InstallHint";
 import { PwaRegister } from "./pwa-register";
 
 export const metadata: Metadata = {
@@ -35,6 +36,7 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         <PwaRegister />
+        <InstallHint />
         {children}
       </body>
     </html>
