@@ -1,5 +1,7 @@
 # Setu
 
+[![CI](https://github.com/puranikyashaswin/setu/actions/workflows/ci.yml/badge.svg)](https://github.com/puranikyashaswin/setu/actions/workflows/ci.yml)
+
 Setu is a voice-first document assistant. Scan a notice or upload a file, ask questions in your language, and hear answers spoken back to you. The stack uses Sarvam for STT, TTS, chat, agent routing, and Vision OCR.
 
 ## Features
@@ -229,7 +231,7 @@ git push origin main
 4. Deploy and copy your API URL, e.g. `https://setu-api.onrender.com`.
 5. Confirm [https://setu-api.onrender.com/health](https://setu-api.onrender.com/health) returns `{"status":"ok"}`.
 
-**Cold start note:** If the API sleeps, the first request can take 30 to 60 seconds. Before a live demo, open `/health` once and wait for a response.
+**Cold start / always-on:** Starter with a disk still may sleep depending on plan settings. If first-turn p95 exceeds ~5s in demos, keep the API always-on (paid) and confirm GitHub `vars.API_URL` powers [.github/workflows/keep-api-warm.yml](.github/workflows/keep-api-warm.yml). Before a live demo, open `/health` (or `/ready`) once and wait for a response.
 
 **Persistent storage:** `render.yaml` uses the Starter plan with a `/data` disk. Production requires:
 
@@ -274,7 +276,7 @@ DB_PATH=/data/setu.db BACKUP_DIR=/data/backups ./scripts/backup_sqlite.sh
 1. Sign in at [vercel.com](https://vercel.com) and import the GitHub repository.
 2. Set **Root Directory** to `web`.
 3. **Framework Preset:** Next.js (auto-detected).
-4. Set environment variable:
+4. Set environment variable (then **Redeploy** — `NEXT_PUBLIC_*` is baked at build time):
 
    | Key | Value |
    |-----|-------|
@@ -296,6 +298,21 @@ DB_PATH=/data/setu.db BACKUP_DIR=/data/backups ./scripts/backup_sqlite.sh
 2. **iPhone (Safari):** Share > Add to Home Screen.
 3. **Android (Chrome):** Menu > Install app, or use the install banner.
 
+### Phone voice DoD (required before shipping)
+
+Run on **iPhone Safari (tab + PWA)** and **Android Chrome (tab + PWA)**:
+
+- [ ] Open `/voice-check?autorun=1` → tap once → speak close → overall Ready or Almost
+- [ ] Main app: first orb tap greets once, then auto-listens
+- [ ] Speak a turn → Setu replies → mic reopens without another tap
+- [ ] Barge-in: speak during TTS → audio stops, new turn starts
+- [ ] Background 30s → return → speak again (AudioContext/mic recover)
+- [ ] After a web deploy: see **Update Setu** or force-quit and reopen PWA
+- [ ] Scan a sample doc → ask a question grounded in the text
+- [ ] Airplane mode offline shell shows network needed (no fake voice)
+
+Demo QR / Notes link: `https://YOUR-APP.vercel.app/voice-check?autorun=1`
+
 ### Keep the API awake
 
 Render's free tier stops the container after 15 minutes idle. To avoid cold starts during demos:
@@ -314,13 +331,15 @@ Render's free tier stops the container after 15 minutes idle. To avoid cold star
 
 ## Authentication
 
-- **Guest mode:** A device ID is created automatically. No sign-up required.
-- **Magic link:** Open Settings, enter your email, and tap Send. If Resend is not configured, the link appears in the UI for demo use.
-- **AI routes** (`/voice`, `/listen`, `/ask`, `/speak`, `/scan`, `/converse`, `/summarize`) require the `X-User-Id` header from `/auth/guest`.
+- **Guest mode:** `POST /auth/guest` returns `user_id` + signed `session_token` and sets an HttpOnly cookie.
+- **Magic link:** Requires `RESEND_API_KEY` in production. Raw links are not returned unless `EXPOSE_MAGIC_LINK=1`.
+- **AI routes** require `X-User-Id`. Voice WebSocket requires signed `token=` (or cookie) in production.
+- Set `AUTH_SECRET` on Render for signing.
 
 ## Data and memory
 
-- Server sessions are stored in SQLite at `api/cache/setu.db`.
+- Server sessions are stored in SQLite at `DB_PATH` (production: `/data/setu.db`).
+- OCR/TTS caches use `CACHE_PATH` (production: `/data/cache`).
 - The browser keeps a local copy in IndexedDB.
 - Recent chat summaries are sent to `/converse` so Setu can recall context across sessions.
 
@@ -328,7 +347,8 @@ Render's free tier stops the container after 15 minutes idle. To avoid cold star
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check |
+| GET | `/health` | Liveness (DB readable) |
+| GET | `/ready` | Readiness (DB writable + secrets) |
 | POST | `/auth/guest` | Create or restore guest session |
 | POST | `/auth/magic-link` | Request email magic link |
 | POST | `/auth/magic-verify` | Verify magic link token |
