@@ -3215,6 +3215,10 @@ export default function Home() {
               <p className="mt-2 text-xs text-slate-400">
                 Opens with autorun armed — tap once to test mic, VAD, API, and WebSocket.
               </p>
+              <div className="mt-6 flex gap-4 text-xs font-semibold text-slate-500">
+                <a href="/privacy" className="underline-offset-2 hover:underline">Privacy</a>
+                <a href="/terms" className="underline-offset-2 hover:underline">Terms</a>
+              </div>
             </div>
           </motion.aside>
         )}
