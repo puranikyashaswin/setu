@@ -35,7 +35,7 @@ class SettingsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=False):
             for key in ("DB_PATH", "CACHE_PATH"):
                 os.environ.pop(key, None)
-            with mock.patch.object(settings.Path, "is_dir", return_value=True):
+            with mock.patch.object(settings, "_data_disk_usable", return_value=True):
                 settings.apply_render_disk_defaults()
             self.assertEqual(os.environ.get("DB_PATH"), "/data/setu.db")
             self.assertEqual(os.environ.get("CACHE_PATH"), "/data/cache")
@@ -44,7 +44,19 @@ class SettingsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=False):
             for key in ("DB_PATH", "CACHE_PATH", "SETU_DB_PATH"):
                 os.environ.pop(key, None)
-            with mock.patch.object(settings.Path, "is_dir", return_value=False):
+            with mock.patch.object(settings, "_data_disk_usable", return_value=False):
+                settings.apply_render_disk_defaults()
+            self.assertEqual(os.environ.get("DB_PATH"), "/tmp/setu.db")
+            self.assertEqual(os.environ.get("CACHE_PATH"), "/tmp/setu-cache")
+
+    def test_overrides_data_paths_when_disk_missing(self) -> None:
+        """Secret-file DB_PATH=/data/... must not crash Free plan with PermissionError."""
+        with mock.patch.dict(
+            os.environ,
+            {"RENDER": "true", "DB_PATH": "/data/setu.db", "CACHE_PATH": "/data/cache"},
+            clear=False,
+        ):
+            with mock.patch.object(settings, "_data_disk_usable", return_value=False):
                 settings.apply_render_disk_defaults()
             self.assertEqual(os.environ.get("DB_PATH"), "/tmp/setu.db")
             self.assertEqual(os.environ.get("CACHE_PATH"), "/tmp/setu-cache")

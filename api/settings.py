@@ -39,23 +39,41 @@ def hydrate_env_from_secret_files() -> None:
             os.environ[key] = value
 
 
-def apply_render_disk_defaults() -> None:
-    """Fill DB_PATH / CACHE_PATH for Render when unset.
+def _data_disk_usable() -> bool:
+    """True when /data exists and is writable (Starter disk mounted)."""
+    root = Path("/data")
+    if not root.is_dir():
+        return False
+    try:
+        probe = root / ".setu_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
-    Prefer the Starter disk at /data. On Free (no disk) fall back to /tmp so the
-    process can boot — data will not survive redeploys.
+
+def apply_render_disk_defaults() -> None:
+    """Fill or relocate DB_PATH / CACHE_PATH for Render.
+
+    Prefer the Starter disk at /data. If env/secret files point at /data but the
+    disk is missing (Free plan), force /tmp so mkdir does not PermissionError.
     AUTH_SECRET is never invented here (would rotate session cookies on every restart).
     """
     if not db.is_production():
         return
-    if Path("/data").is_dir():
+    if _data_disk_usable():
         os.environ.setdefault("DB_PATH", "/data/setu.db")
         os.environ.setdefault("CACHE_PATH", "/data/cache")
         return
-    # Free tier / missing disk: still boot, but warn loudly.
-    if not (os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "").strip():
+
+    db_path = (os.getenv("DB_PATH") or os.getenv("SETU_DB_PATH") or "").strip()
+    cache_path = (os.getenv("CACHE_PATH") or "").strip()
+    # Override /data/* when the mount is absent/unwritable (common Free-plan footgun).
+    if not db_path or db_path.startswith("/data"):
         os.environ["DB_PATH"] = "/tmp/setu.db"
-    if not (os.getenv("CACHE_PATH") or "").strip():
+        os.environ.pop("SETU_DB_PATH", None)
+    if not cache_path or cache_path.startswith("/data"):
         os.environ["CACHE_PATH"] = "/tmp/setu-cache"
     print(
         "[startup] WARNING: /data disk not mounted — using /tmp for DB/cache "

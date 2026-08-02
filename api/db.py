@@ -11,11 +11,6 @@ from pathlib import Path
 
 # Prefer DB_PATH (Render disk: /data/setu.db). SETU_DB_PATH kept as legacy alias.
 _DEFAULT_LOCAL_DB = Path("./cache/setu.db")
-_DB_PATH = Path(
-    os.getenv("DB_PATH")
-    or os.getenv("SETU_DB_PATH")
-    or str(_DEFAULT_LOCAL_DB)
-)
 
 
 def is_production() -> bool:
@@ -29,7 +24,12 @@ def is_production() -> bool:
 
 
 def db_path() -> Path:
-    return _DB_PATH
+    """Resolve DB path from current env (after Render defaults may rewrite it)."""
+    return Path(
+        os.getenv("DB_PATH")
+        or os.getenv("SETU_DB_PATH")
+        or str(_DEFAULT_LOCAL_DB)
+    )
 
 
 def require_db_path_configured() -> None:
@@ -45,9 +45,10 @@ def require_db_path_configured() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     # timeout: wait on locks instead of failing immediately under concurrent requests
-    conn = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=30.0)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
