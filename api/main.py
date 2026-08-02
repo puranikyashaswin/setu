@@ -19,7 +19,7 @@ import json
 import queue
 import threading
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -32,6 +32,7 @@ import paths
 import rate_limit
 import sarvam
 import settings
+import structlog
 import voice_ws
 
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +89,13 @@ def _record_timing(route: str, status: int, **stages_ms: int) -> None:
             parts.append(f"{key}={int(stages_ms[key])}")
     parts.append(f"status={status}")
     logger.info("[timing] %s", " ".join(parts))
+    structlog.log_event(
+        "timing",
+        request_id=structlog.new_request_id(),
+        route=route,
+        status=status,
+        **{k: int(v) for k, v in stages_ms.items()},
+    )
     global _LAST_TURN
     _LAST_TURN = {"route": route, "status": status, **{k: int(v) for k, v in stages_ms.items()}}
 
@@ -196,7 +204,15 @@ async def lifespan(_app: FastAPI):
             pass
 
 
-app = FastAPI(title="Setu API", lifespan=lifespan)
+_docs_url = None if db.is_production() else "/docs"
+_redoc_url = None if db.is_production() else "/redoc"
+app = FastAPI(
+    title="Setu API",
+    lifespan=lifespan,
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
+    openapi_url=None if db.is_production() else "/openapi.json",
+)
 
 _cors_kwargs: dict = {
     "allow_origins": _frontend_origins(),
@@ -402,7 +418,10 @@ def auth_guest(body: GuestBody):
 
 
 @app.post("/auth/magic-link")
-def auth_magic_link(body: MagicLinkBody):
+def auth_magic_link(body: MagicLinkBody, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    rate_limit.check_rate_limit(ip, bucket="magic_ip", limit=10, window_s=3600.0)
+    rate_limit.check_rate_limit(body.email.strip().lower(), bucket="magic_email", limit=5, window_s=3600.0)
     try:
         return auth.request_magic_link(body.email, body.user_id)
     except ValueError as exc:
