@@ -260,6 +260,15 @@ DB_PATH=/data/setu.db BACKUP_DIR=/data/backups ./scripts/backup_sqlite.sh
 3. Restart the API. Confirm `GET /health` returns `{"status":"ok","db":"ok",...}`.
 4. Open the app, load an old chat — transcript + document text should restore without re-OCR.
 
+#### Persistence DoD (after every Render restart)
+
+- [ ] `GET /health` → `status=ok` and `db=ok`
+- [ ] Create a guest chat, speak one turn, scan or attach a doc if available
+- [ ] Note `session_id` / chat title
+- [ ] Restart the Render service (or redeploy)
+- [ ] Reopen the same chat — transcript, language, and document text restore
+- [ ] Ask a doc question — answer is grounded; no re-OCR required
+
 ### Step 3: Frontend on Vercel
 
 1. Sign in at [vercel.com](https://vercel.com) and import the GitHub repository.
