@@ -3,9 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronLeft, Download, Menu, MessageSquarePlus, Mic, Plus, Settings2, Square, Trash2, X } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
-import { authHeaders, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
+import { authHeaders, clearStoredUser, ensureGuestUser, getStoredUserId, requestMagicLink, verifyMagicLink } from "@/lib/auth";
 import { readActiveSessionId, readSessions, writeActiveSessionId, writeSessions } from "@/lib/session-storage";
-import { API_URL, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
+import { API_URL, deleteAccount, postScan, postSpeak, postVoiceTurn, type VoiceTurnResponse } from "@/lib/api";
+import { bannerForApiFailure, classifyApiFailure } from "@/lib/api-failure";
 import { preprocessScanImage, ScanImageTooLargeError } from "@/lib/preprocess-scan";
 import type { BargeInMonitor } from "@/lib/audio/barge-in";
 import {
@@ -1075,6 +1076,7 @@ export default function Home() {
   const [micLevel, setMicLevel] = useState(0);
   const [micThreshold, setMicThreshold] = useState(SPEECH_LEVEL);
   const [statusText, setStatusText] = useState("Tap to begin");
+  const [apiBanner, setApiBanner] = useState<string | null>(null);
   const [thinkingStage, setThinkingStage] = useState(0);
   const [answerSheet, setAnswerSheet] = useState<AnswerSheet | null>(null);
   const [transcript, setTranscript] = useState("");
@@ -2275,6 +2277,7 @@ export default function Home() {
       setOrbState("idle");
       const message = error instanceof Error ? error.message : "Something went wrong";
       setStatusText(`${message} — tap to continue`);
+      setApiBanner(bannerForApiFailure(classifyApiFailure(message)));
       logTurnTiming(turnTimingRef.current);
     }
   }, [addTurn, cameraText, getHistoryPayload, getMemoryPayload, mergeSessionCorrections, openCamera, patchActiveSession, playSpeech, processVoiceTurnResult, resumeListening, speaker, pace]);
@@ -2912,6 +2915,17 @@ export default function Home() {
             </>
           )}
         </header>
+        {apiBanner && (
+          <div
+            role="alert"
+            className="mx-1 mb-2 flex items-start justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
+          >
+            <p className="leading-snug">{apiBanner}</p>
+            <button type="button" className="shrink-0 font-semibold" onClick={() => setApiBanner(null)} aria-label="Dismiss">
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {viewMode === "history" ? (
           <div
             aria-label="Conversation transcript"
@@ -3219,6 +3233,24 @@ export default function Home() {
                 <a href="/privacy" className="underline-offset-2 hover:underline">Privacy</a>
                 <a href="/terms" className="underline-offset-2 hover:underline">Terms</a>
               </div>
+              <button
+                type="button"
+                className="mt-6 w-full rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800"
+                onClick={() => {
+                  void (async () => {
+                    if (!window.confirm("Delete all Setu chats and documents for this account on the server?")) return;
+                    try {
+                      await deleteAccount();
+                      clearStoredUser();
+                      setAuthStatus("Account deleted — reopen the app to start fresh");
+                    } catch {
+                      setAuthStatus("Could not delete account");
+                    }
+                  })();
+                }}
+              >
+                Delete my data
+              </button>
             </div>
           </motion.aside>
         )}

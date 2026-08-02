@@ -25,6 +25,12 @@ export function storeUser(userId: string, email?: string | null, sessionToken?: 
   if (sessionToken) localStorage.setItem(SESSION_TOKEN_KEY, sessionToken);
 }
 
+export function clearStoredUser() {
+  localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(EMAIL_KEY);
+  localStorage.removeItem(SESSION_TOKEN_KEY);
+}
+
 type AuthUserResponse = {
   user_id: string;
   email?: string | null;

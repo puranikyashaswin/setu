@@ -99,6 +99,16 @@ export async function postVoiceTurn(params: {
   return response.json() as Promise<VoiceTurnResponse>;
 }
 
+export async function deleteAccount(): Promise<{ ok: boolean; deleted?: Record<string, number> }> {
+  const response = await fetch(`${API_URL}/auth/account`, {
+    method: "DELETE",
+    headers: withAuth(),
+    credentials: "include",
+  });
+  if (!response.ok) throw new Error("Could not delete account");
+  return response.json() as Promise<{ ok: boolean; deleted?: Record<string, number> }>;
+}
+
 export async function postSummarize(docId: string, language: string): Promise<{ summary: string }> {
   const response = await fetch(`${API_URL}/summarize`, {
     method: "POST",
