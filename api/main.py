@@ -29,6 +29,7 @@ import agent
 import auth
 import db
 import ocr
+import observability
 import paths
 import rate_limit
 import sarvam
@@ -181,6 +182,7 @@ async def _warmup_background() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings.require_production_settings()
+    observability.init_sentry()
     db_path, cache_dir = paths.ensure_data_dirs()
     logger.info("Data paths db=%s cache=%s", db_path.resolve(), cache_dir.resolve())
     db.init_db()
