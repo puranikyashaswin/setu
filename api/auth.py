@@ -19,6 +19,14 @@ SESSION_COOKIE = "setu_session"
 
 def _auth_secret() -> str:
     secret = (os.getenv("AUTH_SECRET") or "").strip()
+    if not secret:
+        # Render Secret Files land at /etc/secrets/<name>, not as env vars.
+        try:
+            from pathlib import Path
+
+            secret = Path("/etc/secrets/AUTH_SECRET").read_text(encoding="utf-8").strip()
+        except OSError:
+            secret = ""
     if secret:
         return secret
     # Local/dev fallback only — production should set AUTH_SECRET explicitly.

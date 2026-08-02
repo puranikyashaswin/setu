@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import settings
@@ -20,12 +22,14 @@ class SettingsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=False):
             for key in ("SARVAM_API_KEY", "DB_PATH", "CACHE_PATH", "AUTH_SECRET", "FRONTEND_ORIGIN"):
                 os.environ.pop(key, None)
-            missing = settings.validate_production_settings()
+            with mock.patch.object(settings, "read_secret_file", return_value=""):
+                missing = settings.validate_production_settings()
             self.assertIn("SARVAM_API_KEY", missing)
             self.assertIn("AUTH_SECRET", missing)
             with mock.patch.object(settings.Path, "is_dir", return_value=False):
-                with self.assertRaises(settings.SettingsError):
-                    settings.require_production_settings()
+                with mock.patch.object(settings, "read_secret_file", return_value=""):
+                    with self.assertRaises(settings.SettingsError):
+                        settings.require_production_settings()
 
     def test_render_disk_defaults_fill_paths(self) -> None:
         with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=False):
@@ -35,6 +39,19 @@ class SettingsTests(unittest.TestCase):
                 settings.apply_render_disk_defaults()
             self.assertEqual(os.environ.get("DB_PATH"), "/data/setu.db")
             self.assertEqual(os.environ.get("CACHE_PATH"), "/data/cache")
+
+    def test_hydrate_from_secret_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets = Path(tmp)
+            (secrets / "AUTH_SECRET").write_text("from-file-secret\n", encoding="utf-8")
+            (secrets / "DB_PATH").write_text("/data/setu.db\n", encoding="utf-8")
+            with mock.patch.object(settings, "_RENDER_SECRETS_DIR", secrets):
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AUTH_SECRET", None)
+                    os.environ.pop("DB_PATH", None)
+                    settings.hydrate_env_from_secret_files()
+                    self.assertEqual(os.environ.get("AUTH_SECRET"), "from-file-secret")
+                    self.assertEqual(os.environ.get("DB_PATH"), "/data/setu.db")
 
 
 if __name__ == "__main__":

@@ -2,19 +2,23 @@
 
 Blueprint: [`render.yaml`](../render.yaml) (Starter + `/data` disk).
 
-| Variable | Source | Notes |
-|----------|--------|-------|
-| `DB_PATH` | `/data/setu.db` in blueprint | Also auto-defaulted at boot if `/data` exists |
-| `CACHE_PATH` | `/data/cache` in blueprint | Same auto-default |
-| `AUTH_SECRET` | `generateValue: true` | Set once in dashboard if Blueprint never synced |
-| `FRONTEND_ORIGIN` | Dashboard (`sync: false`) | e.g. `https://setu-vert.vercel.app` |
-| `SARVAM_API_KEY` | Dashboard (`sync: false`) | Required |
-| `RESEND_*` | Dashboard | Optional until magic-link email is used |
+## Critical: Environment Variables ≠ Secret Files
 
-If deploy fails with `Missing required production env: … AUTH_SECRET`:
+| Feature | What it does | App sees it as |
+|---------|----------------|----------------|
+| **Environment Variables** | Key/value pairs | `os.getenv("AUTH_SECRET")` ✅ |
+| **Secret Files** | Files under `/etc/secrets/<filename>` | Not env vars unless we copy them |
 
-1. Open Render → `setu-api` → Environment
-2. Add `AUTH_SECRET` (long random string) if missing
-3. Confirm `DB_PATH=/data/setu.db` and `CACHE_PATH=/data/cache`
-4. Confirm the disk is mounted at `/data`
-5. Manual Deploy
+Put `AUTH_SECRET`, `DB_PATH`, and `CACHE_PATH` under **Environment Variables**.
+
+## Required env vars
+
+| Key | Value |
+|-----|--------|
+| `AUTH_SECRET` | Long random string (`openssl rand -hex 32`) |
+| `DB_PATH` | `/data/setu.db` |
+| `CACHE_PATH` | `/data/cache` |
+| `FRONTEND_ORIGIN` | `https://your-app.vercel.app` |
+| `SARVAM_API_KEY` | Your Sarvam key |
+
+Also: **Disks** → mount path `/data` (Starter plan).
