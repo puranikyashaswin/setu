@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 from urllib.parse import urlencode
@@ -11,6 +13,38 @@ import httpx
 import db
 
 logger = logging.getLogger("setu")
+
+SESSION_COOKIE = "setu_session"
+
+
+def _auth_secret() -> str:
+    secret = (os.getenv("AUTH_SECRET") or "").strip()
+    if secret:
+        return secret
+    # Local/dev fallback only — production should set AUTH_SECRET explicitly.
+    if db.is_production():
+        raise RuntimeError("AUTH_SECRET must be set in production")
+    return "setu-dev-insecure-auth-secret"
+
+
+def sign_session_token(user_id: str) -> str:
+    """HMAC-signed token: user_id.signature (URL-safe for cookies/WS)."""
+    uid = user_id.strip()
+    digest = hmac.new(_auth_secret().encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{uid}.{digest}"
+
+
+def verify_session_token(token: str | None) -> str | None:
+    """Return user_id if the signed token is valid; else None."""
+    if not token or "." not in token:
+        return None
+    uid, _, sig = token.partition(".")
+    if not uid or not sig:
+        return None
+    expected = hmac.new(_auth_secret().encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    return uid
 
 
 def resolve_user(user_id: str | None, email: str | None = None) -> dict:
