@@ -84,14 +84,18 @@ class RecordingEngine:
 
 class WsVadTests(unittest.TestCase):
     def setUp(self):
-        self._old_db = db._DB_PATH
         self._tmp = tempfile.mkdtemp()
-        db._DB_PATH = Path(self._tmp) / "test.db"
+        self._db_env = mock.patch.dict(
+            os.environ,
+            {"DB_PATH": str(Path(self._tmp) / "test.db")},
+            clear=False,
+        )
+        self._db_env.start()
         db.init_db()
         voice_ws.reset_voice_debug_for_tests()
 
     def tearDown(self):
-        db._DB_PATH = self._old_db
+        self._db_env.stop()
 
     def _patches(self):
         return (
