@@ -388,7 +388,8 @@ def auth_magic_verify(body: MagicVerifyBody):
 
 
 @app.post("/intro")
-def intro(body: IntroBody):
+def intro(body: IntroBody, user_id: str = Depends(_require_ai_user)):
+    _ = user_id
     try:
         text = sarvam.intro_for_language(body.language)
         return {"text": text, "language": body.language}
@@ -464,12 +465,14 @@ def sessions_delete(session_id: str, x_user_id: str | None = Header(default=None
 
 
 @app.get("/voices")
-def voices():
+def voices(user_id: str = Depends(_require_ai_user)):
+    _ = user_id
     return sarvam.v3_speakers()
 
 
 @app.get("/samples")
-def samples():
+def samples(user_id: str = Depends(_require_ai_user)):
+    _ = user_id
     return [
         {
             "doc_id": s["doc_id"],
