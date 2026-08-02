@@ -40,7 +40,8 @@ function scrub(value: unknown): unknown {
   return value;
 }
 
-function scrubEvent(event: SentryEvent): SentryEvent {
+/** Exported for unit tests — strips voice/document fields before Sentry upload. */
+export function scrubEvent(event: SentryEvent): SentryEvent {
   return {
     ...event,
     request: scrub(event.request) as Record<string, unknown>,
