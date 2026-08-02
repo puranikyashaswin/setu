@@ -1144,12 +1144,10 @@ export default function Home() {
   const deadMicRecoveryUsedRef = useRef(false);
   const previewCacheRef = useRef(new Map<string, string>());
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
-  const [sampleNames, setSampleNames] = useState<Record<string, string>>({});
   const [actionSheetExportModel, setActionSheetExportModel] = useState<ActionSheetExportModel | null>(null);
   const [isExportingActionSheet, setIsExportingActionSheet] = useState(false);
   const actionSheetExportRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
-  const sampleNamesRef = useRef<Record<string, string>>({});
   const languageRef = useRef<Language>("en");
   const languageLockedRef = useRef(false);
   /** Consecutive turns thrown away as noise — stops a hot re-listen loop in a loud room. */
@@ -1177,20 +1175,6 @@ export default function Home() {
   useEffect(() => {
     isRecordingFlagRef.current = isRecording;
   }, [isRecording]);
-
-  useEffect(() => {
-    sampleNamesRef.current = sampleNames;
-  }, [sampleNames]);
-
-  useEffect(() => {
-    void fetch(`${API_URL}/samples`)
-      .then((response) => (response.ok ? response.json() as Promise<Array<{ doc_id: string; name: string }>> : []))
-      .then((samples) => {
-        const mapped = Object.fromEntries(samples.map((sample) => [sample.doc_id, sample.name]));
-        setSampleNames(mapped);
-      })
-      .catch(() => {});
-  }, []);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -1882,7 +1866,7 @@ export default function Home() {
       const spoken = summary || readyText;
       patchActiveSession({
         docId: result.doc_id,
-        documentName: sampleNamesRef.current[result.doc_id] ?? "Scanned document",
+        documentName: "Scanned document",
         summary: summary || (result.preview || "").slice(0, 280) || null,
       });
       console.info("[Setu document] stored docId on session after /scan", {
@@ -2869,7 +2853,6 @@ export default function Home() {
     if (!collectAskExchanges(session).some((exchange) => !exchange.abstain && (exchange.evidence?.length ?? 0) > 0)) return;
 
     const documentName =
-      sampleNamesRef.current[session.docId] ??
       session.documentName ??
       ACTION_SHEET_LABELS[session.language].documentFallback;
     const model = buildActionSheetExportModel(session, documentName, session.language);

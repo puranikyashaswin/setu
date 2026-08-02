@@ -40,21 +40,8 @@ import voice_ws
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("setu")
 
-SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
-
 # Last request stage timings for GET /debug/last-turn.
 _LAST_TURN: dict = {}
-
-# Optional sample metadata for /samples UI. OCR runs only when a user selects/uploads.
-_SAMPLE_DEFS: list[dict] = [
-    {
-        "name": "Sample notice",
-        "description": "Optional demo document (OCR only after you select it).",
-        "file": "notice.jpg",
-        "language": "te-IN",
-        "doc_id": None,
-    },
-]
 
 
 def _frontend_origins() -> list[str]:
@@ -149,25 +136,6 @@ def _warm_client() -> None:
     logger.info("Warm-up complete: converse client in %.3fs", time.perf_counter() - t0)
 
 
-def _hydrate_sample_ids_from_cache() -> None:
-    """Bind sample doc_ids from existing OCR disk/db cache only — never call Vision."""
-    import hashlib
-
-    for sample in _SAMPLE_DEFS:
-        path = SAMPLES_DIR / sample["file"]
-        if not path.exists():
-            continue
-        try:
-            file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-            lang = sample["language"]
-            doc_id = hashlib.sha256(f"{file_hash}:{lang}".encode()).hexdigest()
-            if sarvam.get_document(doc_id):
-                sample["doc_id"] = doc_id
-                logger.info("Hydrated sample %s from cache -> %s", sample["file"], doc_id[:12])
-        except Exception:
-            logger.warning("Sample cache hydrate failed for %s", sample["file"], exc_info=True)
-
-
 async def _warmup_background() -> None:
     """No TTS at startup (avoids 429). Optional LLM client warm only."""
     logger.info("[warmup] tts_skipped=true reason=avoid_rate_limit")
@@ -188,7 +156,6 @@ async def lifespan(_app: FastAPI):
     db.init_db()
     sarvam.load_ocr_cache()
     sarvam.load_session_corrections()
-    _hydrate_sample_ids_from_cache()
     origins = _frontend_origins()
     print(f"[startup] CORS allow_origins={origins}", flush=True)
     logger.info("CORS allow_origins=%s", origins)
@@ -535,20 +502,6 @@ def auth_delete_account(x_user_id: str | None = Header(default=None)):
 def voices(user_id: str = Depends(_require_ai_user)):
     _ = user_id
     return sarvam.v3_speakers()
-
-
-@app.get("/samples")
-def samples(user_id: str = Depends(_require_ai_user)):
-    _ = user_id
-    return [
-        {
-            "doc_id": s["doc_id"],
-            "name": s["name"],
-            "description": s["description"],
-        }
-        for s in _SAMPLE_DEFS
-        if s.get("doc_id")
-    ]
 
 
 @app.post("/scan")

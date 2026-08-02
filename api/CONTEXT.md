@@ -27,7 +27,6 @@ This is no longer a hackathon demo — it is being built for real users.
 - `web/` — Next.js PWA: app/page.tsx (whole UI — KEEP the design), SetuOrb,
   lib/voice-session.ts (WS client), lib/audio/* (recorder, browser-stt, playback,
   barge-in, wav, worklet-vad), lib/session-storage.ts (IndexedDB history).
-- `samples/` — demo documents (currently only Rythu Bharosa — must generalize).
 - Root: render.yaml, .env, keep-api-warm cron workflow.
 
 ## Hard requirements (priority order)
@@ -91,8 +90,7 @@ fallback) → playback → auto-relisten. Barge-in cancels in-flight audio anyti
 
 ## Document flow
 - Scan once per document: store doc_id, OCR text, pages, content hash, owner.
-- Rythu Bharosa is REMOVED as a special case. /samples = configurable generic set
-  (govt notice, bank letter, prescription), same pre-cache mechanism.
+- Users scan their own documents via camera/upload — no bundled demo sample set.
 - After scan: SPEAK a 2-sentence summary (what it is, one key fact, "what would
   you like to know?"), then continue the normal voice loop with doc context.
 

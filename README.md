@@ -19,7 +19,6 @@ Setu is a voice-first document assistant. Scan a notice or upload a file, ask qu
 setu/
 ├── api/          FastAPI backend (Sarvam STT/TTS/chat/Vision OCR)
 ├── web/          Next.js PWA frontend
-├── samples/      Demo documents for testing
 ├── render.yaml   Render deployment blueprint
 └── .env.example  Backend environment template
 ```
@@ -361,7 +360,6 @@ Render's free tier stops the container after 15 minutes idle. To avoid cold star
 | PUT | `/sessions/{id}` | Update session |
 | DELETE | `/sessions/{id}` | Delete session |
 | GET | `/voices` | List available TTS voices |
-| GET | `/samples` | List demo documents |
 | POST | `/scan` | OCR a document image or PDF |
 | POST | `/voice` | One-shot STT → agent tools → LLM → TTS (HTTP fallback) |
 | WS | `/ws/voice` | Persistent voice session (progressive TTS, cancel/barge-in) |
