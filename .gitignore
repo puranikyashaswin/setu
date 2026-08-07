@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 !**/.env.example
+!**/.env.staging.example
 
 # OS
 .DS_Store
@@ -22,6 +23,7 @@ api/.venv/
 api/cache/
 api/cache/setu.db
 api/cache/setu.db-*
+cache/
 
 api/__pycache__/
 **/__pycache__/
@@ -36,6 +38,21 @@ htmlcov/
 
 # Node / Next.js (web)
 web/node_modules/
+mobile/node_modules/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/app/debug.keystore
+mobile/android/app/release.keystore
+**/*.keystore
+**/*.jks
+**/*.p12
+**/*.mobileprovision
+**/google-services.json
+mobile/ios/Pods/
+mobile/ios/build/
+mobile/ios/*.xcworkspace/
+mobile/ios/.xcode.env.local
 web/.next/
 web/out/
 web/build/

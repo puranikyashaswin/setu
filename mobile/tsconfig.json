@@ -1,0 +1,12 @@
+{
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "moduleResolution": "bundler",
+    "allowJs": false,
+    "types": ["jest", "node"],
+    "lib": ["es2020", "dom"]
+  },
+  "include": ["App.tsx", "index.js", "app/**/*.ts", "app/**/*.tsx"]
+}

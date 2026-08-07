@@ -1,0 +1,35 @@
+{
+  "name": "setu-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native React Native clients for Setu",
+  "scripts": {
+    "start": "react-native start",
+    "ios": "react-native run-ios",
+    "android": "react-native run-android",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test app/features/voice/voiceMachine.test.ts"
+  },
+  "dependencies": {
+    "@livekit/react-native": "^2.9.6",
+    "@livekit/react-native-webrtc": "^144.1.2",
+    "@react-native-async-storage/async-storage": "^2.2.0",
+    "@react-navigation/native": "^7.1.18",
+    "@react-navigation/native-stack": "^7.3.26",
+    "react": "19.1.0",
+    "react-native": "0.81.0",
+    "react-native-safe-area-context": "^5.5.2",
+    "react-native-screens": "^4.13.1",
+    "livekit-client": "^2.21.0"
+  },
+  "devDependencies": {
+    "@react-native-community/cli": "20.0.0",
+    "@react-native/typescript-config": "0.81.0",
+    "@types/react": "^19.1.10",
+    "@types/node": "^22.10.2",
+    "@types/jest": "^29.5.14",
+    "@types/react-native": "^0.73.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
