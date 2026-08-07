@@ -19,9 +19,17 @@ Setu is a voice-first document assistant. Scan a notice or upload a file, ask qu
 setu/
 ├── api/          FastAPI backend (Sarvam STT/TTS/chat/Vision OCR)
 ├── web/          Next.js PWA frontend
+├── mobile/       React Native bare client (iOS + Android)
+├── backend/      Versioned native-client backend boundary
+├── design/       Shared visual tokens
+├── infrastructure/ Deployment and media-service seams
 ├── render.yaml   Render deployment blueprint
 └── .env.example  Backend environment template
 ```
+
+The native rebuild is additive. See [`docs/MOBILE_REBUILD.md`](docs/MOBILE_REBUILD.md)
+for the migration boundary and current production gaps; `api/` and `web/`
+remain the compatibility path until those gaps are closed.
 
 ## Prerequisites
 

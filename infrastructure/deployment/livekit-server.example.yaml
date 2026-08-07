@@ -1,0 +1,11 @@
+# Self-hosted LiveKit template. Pin and validate the LiveKit server version
+# before deployment; config keys can change between server releases.
+port: 7880
+rtc:
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: true
+turn:
+  enabled: true
+  domain: turn.example.com
+  tls_port: 5349
